@@ -1,0 +1,51 @@
+BlendCap - NOTICE
+=================
+
+BlendCap - video to BVH performance capture for Blender
+Copyright (C) 2026 Arcomade
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation, either version 3 of the License, or (at your
+option) any later version (SPDX identifier: GPL-3.0-or-later).
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+Public License (the LICENSE file in this folder) for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+BlendCap bundles, depends on, or redistributes third-party software and
+model assets under their own licenses. The full inventory is in
+THIRD_PARTY.txt. The license-significant ones:
+
+  - Ultralytics YOLO11 (AGPL-3.0). BlendCap incorporates YOLO11 as a
+    core, always-loaded component. Under section 13 of the GNU GPL v3,
+    this GPL-licensed work may be combined with that AGPL-3.0 component
+    and distributed; the AGPL's terms (including its network-use clause)
+    continue to apply to the YOLO portion. Source availability is
+    satisfied by the public BlendCap repository
+    (https://github.com/Arcomade/BlendCap).
+
+  - Meta SAM 3D Body model weights - Meta SAM License (SAM_LICENSE.txt).
+    Redistributed from the BlendCap Hugging Face mirror; a copy of that
+    license travels with the product as the SAM License requires.
+
+  - Meta DINOv3 backbone - Meta DINOv3 License (DINOV3_LICENSE.txt).
+    BlendCap redistributes a DINOv3-derived ONNX export; a copy of that
+    license travels with the product as the DINOv3 License requires.
+
+  - Fast-SAM-3D-Body inference library - MIT
+    (models/fast-sam-3d-body/LICENSE).
+
+  - MoGe (Microsoft) - MIT; MediaPipe (Google) - Apache 2.0; PyTorch -
+    BSD-3-Clause; ONNX Runtime - MIT; plus other permissive
+    dependencies. See THIRD_PARTY.txt for the complete list.
+
+This NOTICE is informational and does not modify any license.
