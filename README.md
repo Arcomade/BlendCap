@@ -1,13 +1,3 @@
-<!--
-  README for github.com/Arcomade/BlendCap — the PUBLIC SOURCE repo's landing
-  page. Not the marketplace docs (../documentation/) and not the in-product help.
-  Images in assets/ are copies of the product-page assets (same filenames as
-  superhive-page/images — update both when a render changes). Before
-  publishing: fill the social placeholder, and paste the
-  documentation pages + their images/ folder from ../documentation/ into a
-  docs/ folder in the repo (the README links there; no staged copy is kept
-  in this folder by choice).
--->
 
 <div align="center">
 
@@ -104,10 +94,7 @@ The easiest way to use BlendCap is the **paid build**: install it in Blender and
 <div align="center">
 
 ### → [**Get BlendCap on Gumroad**][store-link] ←
-
-<!-- Superhive (Blender Market) listing is under review. When it goes live,
-     uncomment the next line to add a second button: -->
-<!-- ### → [**Also on Superhive (Blender Market)**][superhive-link] ← -->
+### → [**Also on Superhive (Blender Market)**][superhive-link] ←
 
 </div>
 
@@ -117,10 +104,6 @@ The easiest way to use BlendCap is the **paid build**: install it in Blender and
 ## Documentation
 
 Full documentation, installation, a first-capture quick start, every setting, and filming tips, lives in [`docs/`](docs/) in this repository, start at the [table of contents](docs/README.md).
-
-<!-- docs/ = paste ../documentation/'s pages + images/ here when publishing
-     (relative links render on GitHub as-is). When the website goes live,
-     point this section there instead. -->
 
 ## How it works
 
