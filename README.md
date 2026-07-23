@@ -112,7 +112,7 @@ The easiest way to use BlendCap is the **paid build**: install it in Blender and
 </div>
 
 [store-link]: https://arcomade.gumroad.com/l/BlendCap
-<!-- [superhive-link]: https://superhivemarket.com/products/blendcap -->
+[superhive-link]: https://superhivemarket.com/products/blendcap
 
 ## Documentation
 
