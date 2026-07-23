@@ -1,0 +1,12 @@
+# BlendCap public source repo — keep the paid/heavy/private parts out even if
+# someone copies a full working tree in here by accident.
+installer/
+_offline_stash/
+venv/
+checkpoints/
+__pycache__/
+*.pyc
+install_marker.json
+install.log
+.DS_Store
+Thumbs.db

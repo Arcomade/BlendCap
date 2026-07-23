@@ -1,0 +1,53 @@
+schema_version = "1.0.0"
+
+# Unique add-on id (lowercase). Becomes the module name bl_ext.<repo>.blendcap.
+id = "blendcap"
+version = "1.0.4"
+name = "BlendCap"
+tagline = "Markerless video-to-BVH performance capture"
+maintainer = "Arcomade <arcomade@users.noreply.github.com>"
+type = "add-on"
+
+website = "https://github.com/Arcomade/BlendCap"
+
+# First Blender version with the extension/manifest system. BlendCap's code
+# also uses Blender 5.x APIs with 4.3/4.4 fallbacks already in place.
+blender_version_min = "4.2.0"
+
+# BlendCap is GPL-3.0-or-later (forced by the always-on AGPL-3.0 YOLO11 dep;
+# GPL v3 sec.13 bridges to AGPL). The bundled model weights and third-party
+# code ship under their own terms - full texts in LICENSE + NOTICE.txt at
+# the root and in licenses/.
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+copyright = [
+  "2026 Arcomade",
+]
+
+tags = [
+  "Animation",
+  "Rigging",
+  "Pipeline",
+]
+
+[permissions]
+network = "Download the AI model weights and Python dependencies on first install."
+files = "Read input video and write capture caches, BVH files, and the bundled Python environment."
+
+[build]
+# Only consulted by `blender --command extension build`. Keeps runtime
+# artifacts out of a built zip - especially venv/ and checkpoints/, which
+# the installer rebuilds/downloads on the user's machine. Release zips are
+# assembled by hand; this list also serves anyone building from a source
+# checkout.
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  "/.git/",
+  "/venv/",
+  "/checkpoints/",
+  "*.blend1",
+  "/installer/install.log",
+  "/installer/install_marker.json",
+]

@@ -1,0 +1,756 @@
+{
+  "name": "BlendCap → Rigify (New)",
+  "version": 9,
+  "target_kind": "rigify_control",
+  "namespace_strip": "",
+  "auto_bake_ik": false,
+  "face_head_source": "Head",
+  "face_head_target": "head",
+  "face_capture_compensation": false,
+  "face_amplification": {
+    "jaw": 1.0,
+    "gaze": 1.0,
+    "lids": 1.0,
+    "brows": 1.0,
+    "lips": 1.0,
+    "cheeks": 1.0,
+    "nose": 1.0
+  },
+  "_note": "Rigify NEW face rig. Companion to the overhauled flat face BVH (66 face bones, all flat-parented to Head, zero-constraint). Masters-only design: face-anchored target masters driven via BASIS, plus HEAD_LOCAL on bones whose target parent chain rides jaw. The HEAD_LOCAL path uses Blender's pb.matrix setter to back-solve the basis through whatever the target parent did (jaw cascade, constraint blends, anything) — so lip.B can be driven to land at source's exact head-local position without double-counting the parent's contribution. v6 enables HEAD_LOCAL on the LowerLip → lip.B pair (the depth-level view_layer.update() in retarget.py's bake loop makes parent matrices current at the moment of back-solve, so this works correctly). PAIR SELECTION: BASIS for face-anchored masters (jaw_master, jaw.L/R, lip.T, lip_end.L/R.001, eye.L/R, lid.*002, brow endpoints, brow.T.*, cheek.B.*001, cheek.T.*001, nose, nose.002, nose.L/R, forehead.*, temple.*) — these have no parent-cascade contamination. HEAD_LOCAL for LowerLip → lip.B because its target parent chain (MCH-lip_arm.B.L → MCH-jaw_master_bottom_out) rides 100% with jaw. DROPPED still: inner lip tweaks (MCH-lip_offset cascade fills them), jaw chain children (chin / chin.001 / chin.L/R / jaw.L/R.001 — parent ORG-jaw_master 100%, could be re-added as HEAD_LOCAL pairs later if user wants chin articulation), tongue chain (same — could re-add as HEAD_LOCAL), brow ridge middles, brow muscle middle, Nose1/3/4 / nostril ends, ear pairs (source has no ear bones).",
+  "ik_chains": [
+    {
+      "owner": "MCH-shin_ik.L",
+      "ik_control": "foot_ik.L",
+      "pole_control": "thigh_ik_target.L"
+    },
+    {
+      "owner": "MCH-shin_ik.R",
+      "ik_control": "foot_ik.R",
+      "pole_control": "thigh_ik_target.R"
+    },
+    {
+      "owner": "MCH-forearm_ik.L",
+      "ik_control": "hand_ik.L",
+      "pole_control": "upper_arm_ik_target.L"
+    },
+    {
+      "owner": "MCH-forearm_ik.R",
+      "ik_control": "hand_ik.R",
+      "pole_control": "upper_arm_ik_target.R"
+    }
+  ],
+  "pairs": [
+    {
+      "source": "LeftForehead",
+      "target": "forehead.L",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftForehead1",
+      "target": "forehead.L.001",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftForehead2",
+      "target": "forehead.L.002",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightForehead",
+      "target": "forehead.R",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightForehead1",
+      "target": "forehead.R.001",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightForehead2",
+      "target": "forehead.R.002",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftTemple",
+      "target": "temple.L",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightTemple",
+      "target": "temple.R",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftBrow",
+      "target": "brow.B.L",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftBrowInner",
+      "target": "brow.B.L.004",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftBrowMuscle",
+      "target": "brow.T.L",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftBrowMuscle1",
+      "target": "brow.T.L.001",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftBrowMuscle3",
+      "target": "brow.T.L.003",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightBrow",
+      "target": "brow.B.R",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightBrowInner",
+      "target": "brow.B.R.004",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightBrowMuscle",
+      "target": "brow.T.R",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightBrowMuscle1",
+      "target": "brow.T.R.001",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightBrowMuscle3",
+      "target": "brow.T.R.003",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftLowerLid",
+      "target": "lid.B.L.002",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftUpperLid",
+      "target": "lid.T.L.002",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightLowerLid",
+      "target": "lid.B.R.002",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightUpperLid",
+      "target": "lid.T.R.002",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftEye",
+      "target": "eye.L",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightEye",
+      "target": "eye.R",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftCheekLower",
+      "target": "cheek.B.L.001",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightCheekLower",
+      "target": "cheek.B.R.001",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "Nose",
+      "target": "nose",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "Nose2",
+      "target": "nose.002",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftNostril",
+      "target": "nose.L",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightNostril",
+      "target": "nose.R",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LowerLip",
+      "target": "lip.B",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftLowerLip",
+      "target": "lip.B.L.001",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightLowerLip",
+      "target": "lip.B.R.001",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "UpperLip",
+      "target": "lip.T",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftUpperLip",
+      "target": "lip.T.L.001",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightUpperLip",
+      "target": "lip.T.R.001",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftMouthCorner",
+      "target": "lip_end.L.001",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftMouthCorner",
+      "target": "lips.L",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightMouthCorner",
+      "target": "lip_end.R.001",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightMouthCorner",
+      "target": "lips.R",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "Jaw",
+      "target": "jaw_master",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftJawCorner",
+      "target": "jaw.L",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "RightJawCorner",
+      "target": "jaw.R",
+      "channels": "LOC_ROT",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "Chin",
+      "target": "chin",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "Chin1",
+      "target": "chin.001",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "Tongue",
+      "target": "tweak_tongue",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "Tongue1",
+      "target": "tweak_tongue.001",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "Tongue2",
+      "target": "tweak_tongue.002",
+      "channels": "LOC",
+      "axes": "XYZ",
+      "loc_space": "head_local",
+      "influence": 1.0
+    },
+    {
+      "source": "Head",
+      "target": "head",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Neck",
+      "target": "neck",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftShoulder",
+      "target": "shoulder.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftArm",
+      "target": "upper_arm_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftForeArm",
+      "target": "forearm_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHand",
+      "target": "hand_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb1",
+      "target": "thumb.01.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb2",
+      "target": "thumb.02.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb3",
+      "target": "thumb.03.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex1",
+      "target": "f_index.01.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex2",
+      "target": "f_index.02.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex3",
+      "target": "f_index.03.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle1",
+      "target": "f_middle.01.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle2",
+      "target": "f_middle.02.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle3",
+      "target": "f_middle.03.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing1",
+      "target": "f_ring.01.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing2",
+      "target": "f_ring.02.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing3",
+      "target": "f_ring.03.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky1",
+      "target": "f_pinky.01.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky2",
+      "target": "f_pinky.02.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky3",
+      "target": "f_pinky.03.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightShoulder",
+      "target": "shoulder.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightArm",
+      "target": "upper_arm_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightForeArm",
+      "target": "forearm_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHand",
+      "target": "hand_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb1",
+      "target": "thumb.01.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb2",
+      "target": "thumb.02.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb3",
+      "target": "thumb.03.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex1",
+      "target": "f_index.01.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex2",
+      "target": "f_index.02.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex3",
+      "target": "f_index.03.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle1",
+      "target": "f_middle.01.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle2",
+      "target": "f_middle.02.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle3",
+      "target": "f_middle.03.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing1",
+      "target": "f_ring.01.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing2",
+      "target": "f_ring.02.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing3",
+      "target": "f_ring.03.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky1",
+      "target": "f_pinky.01.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky2",
+      "target": "f_pinky.02.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky3",
+      "target": "f_pinky.03.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine3",
+      "target": "spine_fk.003",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine2",
+      "target": "spine_fk.002",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine1",
+      "target": "spine_fk.001",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine",
+      "target": "spine_fk",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Hips",
+      "target": "torso",
+      "channels": "LOC",
+      "axes": "Z",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftUpLeg",
+      "target": "thigh_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftLeg",
+      "target": "shin_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftFoot",
+      "target": "foot_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftToe",
+      "target": "toe_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightUpLeg",
+      "target": "thigh_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightLeg",
+      "target": "shin_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightFoot",
+      "target": "foot_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightToe",
+      "target": "toe_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Root",
+      "target": "root",
+      "channels": "LOC",
+      "axes": "XY",
+      "influence": 1.0
+    }
+  ],
+  "_note_transfer_update": "2026-07-08 transfer-mode update: every face pair is now loc_space=head_local (measured end-to-end on the reference character: smile error 1.75mm RMS/15.8mm max -> 0.34mm/2.3mm). Rigify mouth masters/corners carry LOC_ROT again - the engine now allows rotation alongside head-local LOC, restoring the authored funnel/roll (up to ~29 deg) and corner-tilt (~10 deg) rotations that were previously discarded. Face motion is auto-normalized to the target's face size at bake (eye-distance ratio).",
+  "_note_lips_reverted": "2026-07-09: all lip/mouth pairs reverted to channels=LOC (location only). The LOC_ROT lip rotation required an engine gate-lift that broke CloudRig's face, so the rotation work was pulled. loc_space (head_local) is unchanged."
+}

@@ -1,0 +1,336 @@
+{
+  "name": "BlendCap → Mixamo",
+  "version": 1,
+  "target_kind": "generic",
+  "namespace_strip": "mixamorig:",
+  "auto_bake_ik": false,
+  "_note": "BlendCap BVH → Mixamo. Source = BlendCap's exported BVH bone names (SAM 3D Body: Hips/Spine/.../LeftToe/Root). Target = this rig's actual bone names. Twist bones are not driven — target rig's twist setup (driver, constraint, or auto-twist) handles them from the FK rotation. namespace_strip is set to 'mixamorig:' so the map works on freshly-imported Mixamo FBXs (where bones come in as 'mixamorig:Hips' etc.) without manual renaming. Locomotion: Root→hips LOC XY + Hips→hips LOC Z, both composed per-axis onto the same hips bone (this rig's typical export carries all translation on the hips).",
+  "pairs": [
+    {
+      "source": "Head",
+      "target": "Head",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Neck",
+      "target": "Neck",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftShoulder",
+      "target": "LeftShoulder",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftArm",
+      "target": "LeftArm",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftForeArm",
+      "target": "LeftForeArm",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHand",
+      "target": "LeftHand",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb1",
+      "target": "LeftHandThumb1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb2",
+      "target": "LeftHandThumb2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb3",
+      "target": "LeftHandThumb3",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex1",
+      "target": "LeftHandIndex1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex2",
+      "target": "LeftHandIndex2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex3",
+      "target": "LeftHandIndex3",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle1",
+      "target": "LeftHandMiddle1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle2",
+      "target": "LeftHandMiddle2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle3",
+      "target": "LeftHandMiddle3",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing1",
+      "target": "LeftHandRing1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing2",
+      "target": "LeftHandRing2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing3",
+      "target": "LeftHandRing3",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky1",
+      "target": "LeftHandPinky1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky2",
+      "target": "LeftHandPinky2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky3",
+      "target": "LeftHandPinky3",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightShoulder",
+      "target": "RightShoulder",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightArm",
+      "target": "RightArm",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightForeArm",
+      "target": "RightForeArm",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHand",
+      "target": "RightHand",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb1",
+      "target": "RightHandThumb1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb2",
+      "target": "RightHandThumb2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb3",
+      "target": "RightHandThumb3",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex1",
+      "target": "RightHandIndex1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex2",
+      "target": "RightHandIndex2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex3",
+      "target": "RightHandIndex3",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle1",
+      "target": "RightHandMiddle1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle2",
+      "target": "RightHandMiddle2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle3",
+      "target": "RightHandMiddle3",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing1",
+      "target": "RightHandRing1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing2",
+      "target": "RightHandRing2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing3",
+      "target": "RightHandRing3",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky1",
+      "target": "RightHandPinky1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky2",
+      "target": "RightHandPinky2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky3",
+      "target": "RightHandPinky3",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine3",
+      "target": "Spine2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine2",
+      "target": "Spine1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine1",
+      "target": "Spine",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine",
+      "target": "Hips",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Hips",
+      "target": "Hips",
+      "channels": "LOC",
+      "axes": "Z",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftUpLeg",
+      "target": "LeftUpLeg",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftLeg",
+      "target": "LeftLeg",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftFoot",
+      "target": "LeftFoot",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftToe",
+      "target": "LeftToeBase",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightUpLeg",
+      "target": "RightUpLeg",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightLeg",
+      "target": "RightLeg",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightFoot",
+      "target": "RightFoot",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightToe",
+      "target": "RightToeBase",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Root",
+      "target": "Hips",
+      "channels": "LOC",
+      "axes": "XY",
+      "influence": 1.0
+    }
+  ]
+}

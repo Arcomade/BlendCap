@@ -1,0 +1,390 @@
+{
+  "name": "Mixamo → Mixamo Control Rig",
+  "version": 1,
+  "target_kind": "generic",
+  "namespace_strip": "",
+  "auto_bake_ik": false,
+  "pairs": [
+    {
+      "source": "Head",
+      "target": "Ctrl_Head",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Neck",
+      "target": "Ctrl_Neck",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftShoulder",
+      "target": "Ctrl_Shoulder_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftArm",
+      "target": "Ctrl_Arm_FK_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftForeArm",
+      "target": "Ctrl_ForeArm_FK_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHand",
+      "target": "Ctrl_Hand_FK_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb1",
+      "target": "Ctrl_Thumb1_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb2",
+      "target": "Ctrl_Thumb2_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb3",
+      "target": "Ctrl_Thumb3_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex1",
+      "target": "Ctrl_Index1_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex2",
+      "target": "Ctrl_Index2_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex3",
+      "target": "Ctrl_Index3_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle1",
+      "target": "Ctrl_Middle1_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle2",
+      "target": "Ctrl_Middle2_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle3",
+      "target": "Ctrl_Middle3_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing1",
+      "target": "Ctrl_Ring1_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing2",
+      "target": "Ctrl_Ring2_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing3",
+      "target": "Ctrl_Ring3_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky1",
+      "target": "Ctrl_Pinky1_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky2",
+      "target": "Ctrl_Pinky2_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky3",
+      "target": "Ctrl_Pinky3_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightShoulder",
+      "target": "Ctrl_Shoulder_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightArm",
+      "target": "Ctrl_Arm_FK_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightForeArm",
+      "target": "Ctrl_ForeArm_FK_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHand",
+      "target": "Ctrl_Hand_FK_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb1",
+      "target": "Ctrl_Thumb1_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb2",
+      "target": "Ctrl_Thumb2_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb3",
+      "target": "Ctrl_Thumb3_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex1",
+      "target": "Ctrl_Index1_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex2",
+      "target": "Ctrl_Index2_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex3",
+      "target": "Ctrl_Index3_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle1",
+      "target": "Ctrl_Middle1_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle2",
+      "target": "Ctrl_Middle2_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle3",
+      "target": "Ctrl_Middle3_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing1",
+      "target": "Ctrl_Ring1_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing2",
+      "target": "Ctrl_Ring2_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing3",
+      "target": "Ctrl_Ring3_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky1",
+      "target": "Ctrl_Pinky1_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky2",
+      "target": "Ctrl_Pinky2_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky3",
+      "target": "Ctrl_Pinky3_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine2",
+      "target": "Ctrl_Spine2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine1",
+      "target": "Ctrl_Spine1",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine",
+      "target": "Ctrl_Spine",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Hips",
+      "target": "Ctrl_Hips_Free",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Hips",
+      "target": "Ctrl_Hips",
+      "channels": "LOC",
+      "influence": 1.0,
+      "axes": "Z"
+    },
+    {
+      "source": "Hips",
+      "target": "Ctrl_Master",
+      "channels": "LOC",
+      "influence": 1.0,
+      "axes": "XY"
+    },
+    {
+      "source": "LeftUpLeg",
+      "target": "Ctrl_UpLeg_FK_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftLeg",
+      "target": "Ctrl_Leg_FK_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftFoot",
+      "target": "Ctrl_Foot_FK_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftToeBase",
+      "target": "Ctrl_Toe_FK_Left",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightUpLeg",
+      "target": "Ctrl_UpLeg_FK_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightLeg",
+      "target": "Ctrl_Leg_FK_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightFoot",
+      "target": "Ctrl_Foot_FK_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightToeBase",
+      "target": "Ctrl_Toe_FK_Right",
+      "channels": "ROT",
+      "influence": 1.0
+    }
+  ],
+  "source_prefix": "mixamorig:",
+  "face_head_source": "Head",
+  "face_capture_compensation": false,
+  "face_amplification": {
+    "jaw": 1.0,
+    "gaze": 1.0,
+    "lids": 1.0,
+    "brows": 1.0,
+    "lips": 1.0,
+    "cheeks": 1.0,
+    "nose": 1.0,
+    "global": 1.0
+  },
+  "use_world_location": true,
+  "custom_ik_sources": {
+    "enabled": true,
+    "left_hand": "LeftHand",
+    "right_hand": "RightHand",
+    "left_foot": "LeftFoot",
+    "right_foot": "RightFoot",
+    "left_forearm": "LeftForeArm",
+    "right_forearm": "RightForeArm",
+    "left_shin": "LeftLeg",
+    "right_shin": "RightLeg"
+  },
+  "ik_chains": [
+    {
+      "limb_kind": "ARM",
+      "side": "L",
+      "owner": "",
+      "ik_control": "Ctrl_Hand_IK_Left",
+      "pole_control": "Ctrl_ArmPole_IK_Left"
+    },
+    {
+      "limb_kind": "ARM",
+      "side": "R",
+      "owner": "",
+      "ik_control": "Ctrl_Hand_IK_Right",
+      "pole_control": "Ctrl_ArmPole_IK_Right"
+    },
+    {
+      "limb_kind": "LEG",
+      "side": "L",
+      "owner": "",
+      "ik_control": "Ctrl_Foot_IK_Left",
+      "pole_control": "Ctrl_LegPole_IK_Left"
+    },
+    {
+      "limb_kind": "LEG",
+      "side": "R",
+      "owner": "",
+      "ik_control": "Ctrl_Foot_IK_Right",
+      "pole_control": "Ctrl_LegPole_IK_Right"
+    }
+  ]
+}

@@ -1,0 +1,138 @@
+BlendCap — Third Party Notices
+==============================
+
+BlendCap incorporates the following third-party software. Full license
+texts are bundled with each library in the venv (under
+venv/Lib/site-packages/<package>.dist-info/) and reproduced below
+where required by the respective license.
+
+URLs verified 2026-05-29 — re-check before each ship in case repos
+move or rename.
+
+---
+
+SAM 3D Body model weights (Meta)
+  License: Meta SAM License (full text in licenses/SAM_LICENSE.txt)
+  Source : https://huggingface.co/facebook/sam-3d-body-dinov3
+  License: https://huggingface.co/facebook/sam-3d-body-dinov3/blob/main/LICENSE
+
+DINOv3 backbone (Meta)
+  License: Meta DINOv3 License (full text in licenses/DINOV3_LICENSE.txt)
+  Source : https://github.com/facebookresearch/dinov3
+  License: https://github.com/facebookresearch/dinov3/blob/main/LICENSE.md
+  Note   : DINOv3 is the vision backbone inside SAM 3D Body and carries a
+           SEPARATE Meta license from the SAM License. BlendCap
+           redistributes a DINOv3-derived export
+           (checkpoints/onnx/backbone_dinov3_fp16.onnx) from the public
+           blendcap-onnx-exports HF repo, AND bundles the DINOv3 model
+           source code (models/dinov3_hub/ — architecture code only,
+           loaded offline via torch.hub source="local"; the upstream
+           LICENSE.md and per-file Meta copyright headers are preserved
+           in the bundled tree). A copy of this Agreement must travel with
+           the product (and live in that repo too). Commercial use is
+           granted royalty-free; same trade-control / no-military /
+           no-reverse-engineering restrictions as the SAM License.
+
+Fast-SAM-3D-Body (Timing Yang et al.)
+  Upstream: https://github.com/yangtiming/Fast-SAM-3D-Body
+  Paper   : https://arxiv.org/abs/2603.15603
+  License : DUAL in practice. The upstream repo ships an MIT LICENSE
+           (reproduced verbatim at models/fast-sam-3d-body/LICENSE,
+           copyright line "Fast SAM 3D Body Authors" — this is the
+           upstream author's own notice; do NOT alter it). HOWEVER the
+           library is largely DERIVED from Meta's sam-3d-body, and every
+           source file retains "Copyright (c) Meta Platforms, Inc. and
+           affiliates." Meta's sam-3d-body code is released under the
+           Meta SAM License (NOT MIT — see
+           https://github.com/facebookresearch/sam-3d-body). So the Meta
+           SAM License (SAM_LICENSE.txt, already shipped) is controlling
+           for the Meta-origin code; the MIT terms cover only the
+           authors' acceleration/pruning changes.
+  Note   : BlendCap applies device-aware GPU-dispatch patches (see
+           save_mhr_data.py for the patch summary). The per-file Meta
+           copyright headers and the upstream MIT LICENSE are both
+           preserved in the vendored tree, as both licenses require.
+
+PyTorch (torch, torchvision, torchaudio)
+  License: BSD-3-Clause
+  Source : https://pytorch.org
+  License: https://github.com/pytorch/pytorch/blob/main/LICENSE
+
+ONNX Runtime (onnxruntime, onnxruntime-gpu, onnxruntime-directml)
+  License: MIT
+  Source : https://onnxruntime.ai
+  License: https://github.com/microsoft/onnxruntime/blob/main/LICENSE
+
+MediaPipe (Google)
+  License: Apache 2.0
+  Source : https://google.github.io/mediapipe/
+  License: https://github.com/google/mediapipe/blob/master/LICENSE
+
+ICT-FaceKit (USC Institute for Creative Technologies)
+  License: MIT (full text in licenses/ICT_FACEKIT_LICENSE.txt)
+  Source : https://github.com/USC-ICT/ICT-FaceKit
+  Note   : BlendCap does NOT ship ICT-FaceKit itself. It ships a small
+           DERIVED asset, pipeline/ict_face_basis.npz: the ICT face
+           model's expression morph displacements sampled at MediaPipe
+           landmark positions (baked dev-side by bake_ict_basis.py).
+           The bake also uses MediaPipe's canonical_face_model.obj
+           (Apache 2.0, covered by the MediaPipe entry above) for the
+           landmark correspondence. Both notices travel with the
+           product; the MIT copyright line is preserved in
+           ICT_FACEKIT_LICENSE.txt as the license requires.
+
+YOLO11 / Ultralytics
+  License: AGPL-3.0 (full text in licenses/LICENSE_AGPL.txt)
+  Source : https://github.com/ultralytics/ultralytics
+  License: https://github.com/ultralytics/ultralytics/blob/main/LICENSE
+  Notice : BlendCap is open-source on GitHub (Arcomade/BlendCap),
+           satisfying the AGPL source-availability requirement. No
+           commercial Ultralytics license is required.
+  Note   : BlendCap ships the YOLO11m-pose .pt AND redistributes a
+           YOLO-derived ONNX export (checkpoints/onnx/yolo11m_pose.onnx,
+           used on the non-NVIDIA USE_ORT path) from the public
+           blendcap-onnx-exports HF repo. Both are AGPL-3.0; a copy of the
+           AGPL travels with the product (LICENSE_AGPL.txt) and in that repo.
+
+MoGe (Microsoft)
+  License: MIT for MoGe's own code; the bundled DINOv2 subcomponent
+           (moge/model/dinov2/) is Apache 2.0 (Meta). This is NOT
+           user's-choice dual licensing - MoGe's single LICENSE file
+           concatenates both texts because the package vendors DINOv2.
+           The MoGe-s ONNX export we redistribute derives from both, so
+           both notices apply.
+  Source : https://github.com/microsoft/MoGe
+  License: https://github.com/microsoft/MoGe/blob/main/LICENSE
+
+huggingface_hub
+  License: Apache 2.0
+  Source : https://github.com/huggingface/huggingface_hub
+  License: https://github.com/huggingface/huggingface_hub/blob/main/LICENSE
+
+opencv-python
+  License: MIT (packaging scripts) + Apache 2.0 (OpenCV library) +
+           bundled third-party libs: LGPL-2.1 (FFmpeg) and, on
+           non-headless Linux wheels only, LGPL-3.0 (Qt 5).
+  Source : https://github.com/opencv/opencv-python
+  Note   : The Windows wheels we ship include FFmpeg under LGPL-2.1;
+           providing the wheel itself satisfies LGPL re-distribution
+           as long as users can replace the bundled libraries. No
+           additional action needed for v1.
+
+onnx, NumPy, SciPy, einops, timm, safetensors, hydra-core, omegaconf,
+trimesh, roma, loguru, portalocker, pytorch-lightning, torchmetrics,
+fvcore, iopath, yacs, pycocotools, webdataset, requests, ultralytics-thop
+  Various open-source licenses (BSD-3 / MIT / Apache 2.0 / similar
+  permissive). Each package's full license text is included in its
+  .dist-info/ folder inside the venv on the customer's machine.
+
+---
+
+DirectML (Microsoft, optional dependency loaded when --extra directml
+is selected at install time)
+  License: see Microsoft's onnxruntime-directml package terms.
+
+NVIDIA CUDA libraries (loaded transitively by torch+cu124 when
+--extra cuda is selected)
+  License: NVIDIA Software License Agreement. See individual
+  nvidia-*-cu12 package distributions in the venv.

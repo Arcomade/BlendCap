@@ -1,0 +1,371 @@
+{
+  "name": "Mixamo → Rigify",
+  "version": 1,
+  "target_kind": "rigify_control",
+  "namespace_strip": "",
+  "auto_bake_ik": false,
+  "_note": "Body + hands mapping for transferring an already-animated Mixamo skeleton onto a Rigify rig (source = mixamorig:Hips/Spine/Spine1/Spine2/.../LeftToeBase, target = Rigify *_fk / spine_fk.*). Derived from rigify_new.json (BlendCap BVH source) with the Mixamo-source substitutions used in mixamo_to_mixamo_ctrl.json: source_prefix='mixamorig:', use_world_location, custom_ik_sources. SPINE remap: Mixamo Hips drives spine_fk (the slot BlendCap Spine drove); Spine/Spine1/Spine2 shift down into spine_fk.001/.002/.003. LOCOMOTION: Mixamo has no Root, so Hips alone drives root (LOC XY) and torso (LOC Z) plus spine_fk (ROT). NO FACE: Rigify face mapping is dropped because Mixamo capture never carries face data — for face animation use the BlendCap-source rigify_new.json preset.",
+  "ik_chains": [
+    {
+      "owner": "MCH-shin_ik.L",
+      "ik_control": "foot_ik.L",
+      "pole_control": "thigh_ik_target.L"
+    },
+    {
+      "owner": "MCH-shin_ik.R",
+      "ik_control": "foot_ik.R",
+      "pole_control": "thigh_ik_target.R"
+    },
+    {
+      "owner": "MCH-forearm_ik.L",
+      "ik_control": "hand_ik.L",
+      "pole_control": "upper_arm_ik_target.L"
+    },
+    {
+      "owner": "MCH-forearm_ik.R",
+      "ik_control": "hand_ik.R",
+      "pole_control": "upper_arm_ik_target.R"
+    }
+  ],
+  "pairs": [
+    {
+      "source": "Head",
+      "target": "head",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Neck",
+      "target": "neck",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftShoulder",
+      "target": "shoulder.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftArm",
+      "target": "upper_arm_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftForeArm",
+      "target": "forearm_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHand",
+      "target": "hand_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb1",
+      "target": "thumb.01.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb2",
+      "target": "thumb.02.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandThumb3",
+      "target": "thumb.03.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex1",
+      "target": "f_index.01.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex2",
+      "target": "f_index.02.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandIndex3",
+      "target": "f_index.03.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle1",
+      "target": "f_middle.01.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle2",
+      "target": "f_middle.02.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandMiddle3",
+      "target": "f_middle.03.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing1",
+      "target": "f_ring.01.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing2",
+      "target": "f_ring.02.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandRing3",
+      "target": "f_ring.03.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky1",
+      "target": "f_pinky.01.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky2",
+      "target": "f_pinky.02.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftHandPinky3",
+      "target": "f_pinky.03.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightShoulder",
+      "target": "shoulder.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightArm",
+      "target": "upper_arm_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightForeArm",
+      "target": "forearm_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHand",
+      "target": "hand_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb1",
+      "target": "thumb.01.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb2",
+      "target": "thumb.02.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandThumb3",
+      "target": "thumb.03.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex1",
+      "target": "f_index.01.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex2",
+      "target": "f_index.02.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandIndex3",
+      "target": "f_index.03.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle1",
+      "target": "f_middle.01.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle2",
+      "target": "f_middle.02.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandMiddle3",
+      "target": "f_middle.03.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing1",
+      "target": "f_ring.01.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing2",
+      "target": "f_ring.02.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandRing3",
+      "target": "f_ring.03.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky1",
+      "target": "f_pinky.01.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky2",
+      "target": "f_pinky.02.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightHandPinky3",
+      "target": "f_pinky.03.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine2",
+      "target": "spine_fk.003",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine1",
+      "target": "spine_fk.002",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine",
+      "target": "spine_fk.001",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Hips",
+      "target": "spine_fk",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Hips",
+      "target": "root",
+      "channels": "LOC",
+      "axes": "XY",
+      "influence": 1.0
+    },
+    {
+      "source": "Hips",
+      "target": "torso",
+      "channels": "LOC",
+      "axes": "Z",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftUpLeg",
+      "target": "thigh_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftLeg",
+      "target": "shin_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftFoot",
+      "target": "foot_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "LeftToeBase",
+      "target": "toe_fk.L",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightUpLeg",
+      "target": "thigh_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightLeg",
+      "target": "shin_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightFoot",
+      "target": "foot_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "RightToeBase",
+      "target": "toe_fk.R",
+      "channels": "ROT",
+      "influence": 1.0
+    }
+  ],
+  "source_prefix": "mixamorig:",
+  "use_world_location": true,
+  "custom_ik_sources": {
+    "enabled": true,
+    "left_hand": "LeftHand",
+    "right_hand": "RightHand",
+    "left_foot": "LeftFoot",
+    "right_foot": "RightFoot",
+    "left_forearm": "LeftForeArm",
+    "right_forearm": "RightForeArm",
+    "left_shin": "LeftLeg",
+    "right_shin": "RightLeg"
+  }
+}
