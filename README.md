@@ -50,7 +50,7 @@ BlendCap reconstructs a full **performance**, body, hands, and face, from an ord
 - **Retarget onto your rig**: Rigify, Auto-Rig Pro, CloudRig, Mixamo and custom rigs, in both **FK and IK**, with included presets and a visual bone-map editor.
 - **Capture cleanup built in**: foot grounding and locking, depth-noise filtering, smoothing, tracking-failure repair, and per-take camera-angle correction.
 - **Runs fully offline** after setup, your footage never leaves your machine.
-- **GPU-accelerated** on NVIDIA, with experimental AMD/Intel paths and a CPU-only fallback.
+- **GPU-accelerated** on NVIDIA, with AMD/Intel paths that install automatically but aren't hardware-validated yet, and a CPU-only fallback.
 
 ## See it in action
 
@@ -77,7 +77,7 @@ BlendCap reconstructs a full **performance**, body, hands, and face, from an ord
 |---|---|
 | **Blender** | 4.2 or newer |
 | **OS** | Windows 10/11 (fully supported) · Linux, including Flatpak Blender (supported) · macOS (not supported) |
-| **GPU** | NVIDIA RTX 20 / GTX 16 series or newer, 6 GB+ VRAM recommended. AMD/Intel experimental; CPU-only fallback available (slow). |
+| **GPU** | NVIDIA RTX 20 / GTX 16 series or newer, 6 GB+ VRAM recommended. AMD/Intel paths install automatically but aren't hardware-validated yet; CPU-only fallback available (slow). |
 | **Disk / network** | ~32 GB free for models + dependencies; internet needed once for the ~11 GB setup download. Capture itself runs offline. |
 
 See the full [system requirements](#documentation) in the documentation for the GPU tiers and the CPU-only fallback.
@@ -89,7 +89,7 @@ The easiest way to use BlendCap is the **paid build**: install it in Blender and
 - One-click dependency installer (no terminal, no manual Python)
 - Bundled model access, so the ~11 GB setup just works
 - Updates and support
-- Validated on Windows and Linux with NVIDIA GPUs, experimental support on non-nvidia windows and Linux.
+- Validated on Windows and Linux with NVIDIA GPUs; AMD/Intel paths install automatically but aren't hardware-validated yet.
 
 <div align="center">
 
