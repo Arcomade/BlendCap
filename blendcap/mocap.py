@@ -19,7 +19,7 @@ import time
 from .helpers import (
     blendcap_state, bvh_state,
     _addon_dir, _python_exe, _tag_redraw, addon_prefs,
-    _host_spawn_prefix,
+    _host_spawn_prefix, _subprocess_env,
     _seq_accessors, _strip_visible_start, _strip_visible_end,
     _import_bvh, _write_cache_params,
     _ansi_re, _progress_re, _warning_re, _frame_re, _tqdm_re,
@@ -430,7 +430,8 @@ def monitor_progress_timer():
                                 blendcap_state.get('cache_img_offset_start', 0),
                                 blendcap_state.get('cache_img_offset_end', 0),
                                 blendcap_state.get('cache_project_fps', 0.0),
-                                blendcap_state.get('cache_capture_sig', ''))
+                                blendcap_state.get('cache_capture_sig', ''),
+                                blendcap_state.get('cache_video_path', ''))
 
         # Show multi-subject warning popup if any warnings accumulated
         warnings = blendcap_state.get('warnings', [])
@@ -632,10 +633,10 @@ def run_mocap_thread(cmds, proxy_path, insert_frame, insert_channel,
     if force_cpu:
         env_overrides['BLENDCAP_FORCE_CPU'] = '1'
         env_overrides['BLENDCAP_ORT_CPU'] = '1'
-    capture_env = None
-    if env_overrides:
-        capture_env = os.environ.copy()
-        capture_env.update(env_overrides)
+    # _subprocess_env also strips the Steam runtime's library overrides
+    # when Blender was launched through Steam (they break torch /
+    # onnxruntime native imports in the venv python). None = inherit.
+    capture_env = _subprocess_env(env_overrides)
 
     # Under Flatpak Blender the venv lives on the host and must be run
     # there (see helpers._host_spawn_prefix); [] on every other platform.
@@ -920,6 +921,7 @@ def run_bvh_thread(jobs, vid_name, cache_dir, bvh_library_dir=None):
                                     stderr=subprocess.STDOUT, text=True,
                                     bufsize=1, encoding='utf-8',
                                     errors='replace',
+                                    env=_subprocess_env(),
                                     creationflags=getattr(
                                         subprocess, 'CREATE_NO_WINDOW', 0))
             bvh_state['active_process'] = proc

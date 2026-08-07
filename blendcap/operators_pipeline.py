@@ -19,13 +19,14 @@ from .helpers import (
     blendcap_state, bvh_state,
     _cache_dir, _bvh_library_dir, _addon_dir, _python_exe,
     _resolve_video_path, _resolve_clip_name, _strip_capture_prefix,
-    _next_free_clip_name, _active_video_strip,
+    _next_free_clip_name, _active_video_strip, _file_mode_source,
     source_mode_error,
     _strip_visible_start, _strip_visible_end,
     check_npz_coverage, _show_warning_popup,
     _cache_params_match, _SUPPORTED_VIDEO_EXTS,
     _installer_dir, _install_marker_path, _license_path,
     _host_spawn_prefix, _host_spawn_ok, _host_spawn_grant_cmd, _in_flatpak,
+    _subprocess_env,
     read_install_marker, is_dependencies_installed,
     addon_prefs, _tag_redraw, _terminate_state_process,
 )
@@ -588,8 +589,12 @@ class BLENDCAP_OT_install_run(bpy.types.Operator):
                                      cwd=installer_dir)
                 else:
                     # Native Linux: pass BLENDCAP_RUN through the Popen env.
-                    native_env = os.environ.copy()
-                    native_env["BLENDCAP_RUN"] = run
+                    # _subprocess_env strips the Steam runtime's library
+                    # overrides when Blender was launched through Steam -
+                    # without that, the terminal emulator itself (and every
+                    # host tool install.sh runs) starts against the Steam
+                    # runtime's old libs and can fail or misdetect the GPU.
+                    native_env = _subprocess_env({"BLENDCAP_RUN": run})
                     subprocess.Popen(["bash", "-lc", pick],
                                      cwd=installer_dir, env=native_env)
         except Exception as e:
@@ -1365,11 +1370,9 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
             capture_no_hands = True
         else:  # AUTO: refine on NVIDIA, skip on non-NVIDIA / CPU
             capture_no_hands = _non_nvidia
-        # FOV AUTO resolves to per-frame on NVIDIA, cached first-frame on
-        # non-NVIDIA / CPU (where per-frame MoGe is the expensive part).
+        # Legacy scenes saved with the removed 'AUTO' item resolve to the
+        # enum default ('FIRST') when Blender reads the property.
         capture_fov = props.fov_mode
-        if capture_fov == 'AUTO':
-            capture_fov = 'FIRST' if _non_nvidia else 'EVERY'
         _focal = f"{props.fov_focal_mm:.4f}" if capture_fov == 'MANUAL' else "-"
         capture_sig = (f"nh={int(capture_no_hands)};fov={capture_fov};"
                        f"focal={_focal};skip={props.capture_skip};"
@@ -1434,7 +1437,8 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
                 output_dir,
                 cache_start_frame, cache_max_frames,
                 img_offset_start, img_offset_end,
-                project_fps_now, capture_sig)
+                project_fps_now, capture_sig,
+                source_path=video_path)
 
             body_cached = False
             if props.track_body:
@@ -1569,6 +1573,7 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
         blendcap_state['cache_img_offset_end'] = img_offset_end
         blendcap_state['cache_project_fps'] = project_fps_now
         blendcap_state['cache_capture_sig'] = capture_sig
+        blendcap_state['cache_video_path'] = video_path
         blendcap_state['step_labels'] = step_labels
         blendcap_state['step_outputs'] = step_outputs
 
@@ -1735,11 +1740,7 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
         # ---- 2. Resolve source video --------------------------------
         video_path = ""
         if props.video_source == 'FILE':
-            obj = context.active_object
-            if obj and obj.type == 'EMPTY' and "blendcap_source" in obj:
-                video_path = bpy.path.abspath(str(obj["blendcap_source"]))
-            else:
-                video_path = bpy.path.abspath(props.video_path)
+            video_path, _empty = _file_mode_source(context)
         else:
             seq_ed = context.scene.sequence_editor
             strip = _active_video_strip(seq_ed)
@@ -1821,11 +1822,7 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
 
         # Resolve video path (simplified — BVH only needs the cache folder name)
         if props.video_source == 'FILE':
-            obj = context.active_object
-            if obj and obj.type == 'EMPTY' and "blendcap_source" in obj:
-                video_path = bpy.path.abspath(str(obj["blendcap_source"]))
-            else:
-                video_path = bpy.path.abspath(props.video_path)
+            video_path, _empty = _file_mode_source(context)
         else:
             seq_ed = context.scene.sequence_editor
             strip = _active_video_strip(seq_ed)
@@ -1929,11 +1926,13 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
                 cmd.append("--root-motion")
             if face_path:
                 cmd.extend(["--face", face_path])
-            if props.smooth_body > 0:
+            if props.smoothing_enabled and props.smooth_body > 0:
                 cmd.extend(["--smooth", str(props.smooth_body)])
-            if props.smooth_root > 0:
+            if props.smoothing_enabled and props.smooth_root > 0:
                 cmd.extend(["--smooth-root", str(props.smooth_root)])
-            cmd.extend(["--smooth-face", str(props.smooth_face)])
+            if props.smoothing_enabled and props.smooth_vertical > 0:
+                cmd.extend(["--smooth-vertical", str(props.smooth_vertical)])
+            cmd.extend(["--smooth-face", str(props.smooth_face if props.smoothing_enabled else 0)])
             cmd.extend(_bvh_face_denoise_args(props))
             cmd.extend(_bvh_face_amp_args(props))
             cmd.extend(_bvh_depth_denoise_args(props))
@@ -1969,6 +1968,12 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
                         f"{props.foot_pin_release_cm / 100.0:.3f}"])
             if props.foot_define_floor:
                 cmd.append("--feet-define-floor")
+            if props.body_grounding_enabled:
+                cmd.append("--body-grounding")
+                cmd.extend(["--body-catch-distance",
+                            f"{props.body_catch_distance_cm / 100.0:.3f}"])
+                cmd.extend(["--body-skin-radius",
+                            f"{props.body_skin_radius_cm / 100.0:.4f}"])
             # Camera angle offset is per-rig (Object.blendcap_camera_offset)
             # and applied via Bake Offset to BVH after the rig is imported,
             # not here.
@@ -1985,7 +1990,7 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
                 hands_bvh = os.path.join(output_dir, "output_hands.bvh")
                 cmd = _common()
                 cmd.extend(["--input", body_npz, "--export", "hands"])
-                if props.smooth_body > 0:
+                if props.smoothing_enabled and props.smooth_body > 0:
                     cmd.extend(["--smooth", str(props.smooth_body)])
                 if props.finger_curl_multiplier > 1.0:
                     cmd.extend(["--finger-boost",
@@ -2005,8 +2010,10 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
                 root_bvh = os.path.join(output_dir, "output_root.bvh")
                 cmd = _common()
                 cmd.extend(["--input", body_npz, "--export", "root"])
-                if props.smooth_root > 0:
+                if props.smoothing_enabled and props.smooth_root > 0:
                     cmd.extend(["--smooth-root", str(props.smooth_root)])
+                if props.smoothing_enabled and props.smooth_vertical > 0:
+                    cmd.extend(["--smooth-vertical", str(props.smooth_vertical)])
                 cmd.extend(["--output", root_bvh])
                 jobs.append((cmd, root_bvh, f"{clip_name}_R"))
 
@@ -2017,7 +2024,7 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
                 face_bvh = os.path.join(output_dir, "output_face.bvh")
                 cmd = _common()
                 cmd.extend(["--face", face_path, "--export", "face"])
-                cmd.extend(["--smooth-face", str(props.smooth_face)])
+                cmd.extend(["--smooth-face", str(props.smooth_face if props.smoothing_enabled else 0)])
                 cmd.extend(_bvh_face_denoise_args(props))
                 cmd.extend(_bvh_face_amp_args(props))
                 cmd.extend(["--face-boost",
@@ -2274,11 +2281,13 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
                 cmd.append("--root-motion")
             if face_path:
                 cmd.extend(["--face", face_path])
-            if props.smooth_body > 0:
+            if props.smoothing_enabled and props.smooth_body > 0:
                 cmd.extend(["--smooth", str(props.smooth_body)])
-            if props.smooth_root > 0:
+            if props.smoothing_enabled and props.smooth_root > 0:
                 cmd.extend(["--smooth-root", str(props.smooth_root)])
-            cmd.extend(["--smooth-face", str(props.smooth_face)])
+            if props.smoothing_enabled and props.smooth_vertical > 0:
+                cmd.extend(["--smooth-vertical", str(props.smooth_vertical)])
+            cmd.extend(["--smooth-face", str(props.smooth_face if props.smoothing_enabled else 0)])
             cmd.extend(_bvh_face_denoise_args(props))
             cmd.extend(_bvh_face_amp_args(props))
             cmd.extend(_bvh_depth_denoise_args(props))
@@ -2311,6 +2320,12 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
                         f"{props.foot_pin_release_cm / 100.0:.3f}"])
             if props.foot_define_floor:
                 cmd.append("--feet-define-floor")
+            if props.body_grounding_enabled:
+                cmd.append("--body-grounding")
+                cmd.extend(["--body-catch-distance",
+                            f"{props.body_catch_distance_cm / 100.0:.3f}"])
+                cmd.extend(["--body-skin-radius",
+                            f"{props.body_skin_radius_cm / 100.0:.4f}"])
             if abs(pitch) > 1e-6:
                 cmd.extend(["--camera-pitch", f"{pitch:.3f}"])
             if abs(roll) > 1e-6:
@@ -2337,7 +2352,7 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
             bvh_path = os.path.join(output_dir, "output_face.bvh")
             cmd = [python_exe, script_path, "--mhr-model", mhr_model,
                    "--face", face_path, "--export", "face"]
-            cmd.extend(["--smooth-face", str(props.smooth_face)])
+            cmd.extend(["--smooth-face", str(props.smooth_face if props.smoothing_enabled else 0)])
             cmd.extend(_bvh_face_denoise_args(props))
             cmd.extend(_bvh_face_amp_args(props))
             cmd.extend(["--face-boost",
@@ -2356,7 +2371,7 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
             bvh_path = os.path.join(output_dir, "output_hands.bvh")
             cmd = [python_exe, script_path, "--mhr-model", mhr_model,
                    "--input", body_npz, "--export", "hands"]
-            if props.smooth_body > 0:
+            if props.smoothing_enabled and props.smooth_body > 0:
                 cmd.extend(["--smooth", str(props.smooth_body)])
             if props.finger_curl_multiplier > 1.0:
                 cmd.extend(["--finger-boost",
@@ -2375,8 +2390,10 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
             bvh_path = os.path.join(output_dir, "output_root.bvh")
             cmd = [python_exe, script_path, "--mhr-model", mhr_model,
                    "--input", body_npz, "--export", "root"]
-            if props.smooth_root > 0:
+            if props.smoothing_enabled and props.smooth_root > 0:
                 cmd.extend(["--smooth-root", str(props.smooth_root)])
+            if props.smoothing_enabled and props.smooth_vertical > 0:
+                cmd.extend(["--smooth-vertical", str(props.smooth_vertical)])
             cmd.extend(["--output", bvh_path])
 
         else:

@@ -1403,8 +1403,6 @@ class BlendCapProperties(bpy.types.PropertyGroup):
     fov_mode: bpy.props.EnumProperty(name="FOV Mode",
         description="How the camera field of view is set during capture",
         items=[
-            ('AUTO', "Automatic",
-             "Sample every frame on NVIDIA, first frame only on non-NVIDIA and CPU"),
             ('FIRST', "Sample first frame only",
              "Estimate the field of view once and reuse it for the clip"),
             ('EVERY', "Sample every frame",
@@ -1412,7 +1410,7 @@ class BlendCapProperties(bpy.types.PropertyGroup):
             ('MANUAL', "Enter focal length",
              "Skip estimation and use the focal length set below (fastest)"),
         ],
-        default='AUTO')
+        default='FIRST')
     fov_focal_mm: bpy.props.FloatProperty(name="Focal Length (mm)",
         description="Camera focal length in millimetres (35mm / full-frame equivalent)",
         default=35.0, min=1.0, max=500.0)
@@ -1430,6 +1428,11 @@ class BlendCapProperties(bpy.types.PropertyGroup):
     use_separate_face: bpy.props.BoolProperty(name="Use Separate Face Data", default=False, update=update_use_separate_face,
         description="Combine the selected clip's body data with another clip's face data.")
     separate_face_data: bpy.props.EnumProperty(name="Face Data", description="Select cached face tracking data", items=get_face_data_items)
+    smoothing_enabled: bpy.props.BoolProperty(
+        name="Enable Smoothing",
+        default=True,
+        description="Apply the smoothing values below when generating "
+                    "the BVH")
     smooth_body: bpy.props.FloatProperty(
         name="Body Smoothing",
         description="Smoothing window for body rotations, measured in seconds. 0 = off",
@@ -1438,6 +1441,10 @@ class BlendCapProperties(bpy.types.PropertyGroup):
         name="Root Smoothing",
         description="Smoothing window for root position, measured in seconds. 0 = off",
         default=0.27, min=0.0, max=2.0, step=5, precision=2)
+    smooth_vertical: bpy.props.FloatProperty(
+        name="Vertical Smoothing",
+        description="Smoothing window for vertical root motion (jumps, squats), measured in seconds. 0 = off",
+        default=0.08, min=0.0, max=0.3, step=5, precision=2)
     smooth_face: bpy.props.FloatProperty(
         name="Face Smoothing",
         description="Smoothing window for face data, measured in seconds. 0 = off",
@@ -1694,7 +1701,9 @@ class BlendCapProperties(bpy.types.PropertyGroup):
         name="Sensitivity",
         default=0.5, min=0.0, max=1.0, step=5, precision=2,
         description="Higher values catch more foot contacts. "
-                    "Lower values catch fewer")
+                    "Lower values catch fewer. Also sets how Feet "
+                    "Define the Floor finds the contacts it builds "
+                    "the floor from")
     foot_max_gap_sec: bpy.props.FloatProperty(
         name="Max Gap",
         default=0.33, min=0.0, max=2.0, step=5, precision=2,
@@ -1707,7 +1716,7 @@ class BlendCapProperties(bpy.types.PropertyGroup):
                     "than this between them")
     foot_recover_glitches: bpy.props.BoolProperty(
         name="Bridge Phantom Lifts",
-        default=False,
+        default=True,
         description="Bridge contacts when the tracker reports a lift "
                     "but the foot didn't actually move horizontally")
     foot_recovery_lift_cm: bpy.props.FloatProperty(
@@ -1736,12 +1745,37 @@ class BlendCapProperties(bpy.types.PropertyGroup):
                     "slides that were mistaken for plants")
     foot_define_floor: bpy.props.BoolProperty(
         name="Feet Define the Floor",
-        default=False,
+        default=True,
         description="Uses a mixture of foot activity and video "
                     "information to determine the armature's height "
                     "above the ground, keeping the character on the "
                     "ground plane without destroying jumps. Works "
                     "best with Capture Skip at 0")
+
+    # --- Body Grounding (BVH generation time) ---
+    body_grounding_expanded: bpy.props.BoolProperty(
+        name="Body Grounding",
+        default=False,
+        description="Expand the body-grounding settings sub-section.")
+    body_grounding_enabled: bpy.props.BoolProperty(
+        name="Enable Body Grounding",
+        default=True,
+        description="Pull rolls, lying, handstands, and crawls down so "
+                    "the body actually touches the floor. Upright "
+                    "motion and jumps are never affected")
+    body_catch_distance_cm: bpy.props.FloatProperty(
+        name="Catch Distance (cm)",
+        default=30.0, min=10.0, max=100.0, step=100, precision=0,
+        description="The farthest the body can be pulled toward the "
+                    "floor. Raise it if a badly floating roll only "
+                    "comes partway down; lower it to limit how much "
+                    "this setting is allowed to move the body")
+    body_skin_radius_cm: bpy.props.FloatProperty(
+        name="Skin Radius (cm)",
+        default=1.5, min=0.0, max=15.0, step=10, precision=1,
+        description="Distance between the spine bones and the "
+                    "character's back surface. The back counts as "
+                    "touching when it is this far from the floor")
 
     # --- Camera Angle Offset (per-armature, BVH generation time) ---
     # Manual pitch / roll offset lives per-armature on the imported rig

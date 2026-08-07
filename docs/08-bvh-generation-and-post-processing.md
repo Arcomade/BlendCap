@@ -58,7 +58,7 @@ These sliders preview live on the selected armature; click **Bake Settings to BV
 
 ## Smoothing
 
-Time-based smoothing that reduces frame-to-frame jitter, measured in **seconds** (0 = off). There are separate values for the **Face**, the **Body**, and the **Root**. A little goes a long way, too much and you start to lose the snap of fast motion, so start near the defaults and adjust until the jitter is gone but the performance still feels alive.
+Time-based smoothing that reduces frame-to-frame jitter, measured in **seconds** (0 = off). **Enable Smoothing** turns the whole section on and off (on by default), and there are separate values for the **Face**, the **Body**, the **Root**, and **Vertical**. Root smoothing works along the ground plane only; the **Vertical** slider handles up-and-down motion (jumps, squats) separately, with a deliberately small default so jump arcs survive the smoothing. A little goes a long way, too much and you start to lose the snap of fast motion, so start near the defaults and adjust until the jitter is gone but the performance still feels alive.
 
 ---
 
@@ -68,7 +68,7 @@ The trickiest axis for any single-camera system is **depth** (toward and away fr
 
 There are separate strengths for the **Feet**, **Hands**, **Head**, and **Root** (the whole body's depth position), each measured in centimeters: motion smaller than the threshold is treated as noise and smoothed away, while larger, real motion passes through. It's on by default with safe values, increase a slider if a particular body part still shimmers in depth, or set it to 0 to leave that part untouched.
 
->If your character's entire body is randomly shifting by large amounts towards and away from the camera, try setting your capture's FOV mode to **Sample first frame only** and re-capturing (See [Capturing](05-capturing.md)), or turning off your BVH's **Root Motion** (See **Generating the BVH** above) instead of messing with depth noise filtering or smoothing settings. 
+>If your character's entire body is randomly shifting by large amounts towards and away from the camera, try setting your capture's FOV mode to **Sample first frame only** (the default) and re-capturing (See [Capturing](05-capturing.md)), or turning off your BVH's **Root Motion** (See **Generating the BVH** above) instead of messing with depth noise filtering or smoothing settings. 
 
 ---
 
@@ -78,6 +78,10 @@ Usually the most valuable cleanup step: it detects when a foot is in contact wit
 
 > Note that these settings will help remove footskate from the feet themselves, but cannot repair any sliding that comes from the armature's root motion, which needs to be cleaned up manually if present.
 
+- **Feet Define the Floor**: keeps the character on the ground plane while trying to conserve jumps. Feet in contact with the ground stay pinned to it. Helps with fixing floating captures or knees not bending enough. **Weaknesses**: if camera motion follows a jump this setting may not detect it properly, and feet dangling in the air during seated or hanging positions can be mistaken for standing or squatting. Furthermore, climbing onto elevated surfaces will not be properly detected while this setting is active. On by default, disable if your character is too stuck to the ground.
+
+![Feet Define Floor Fixes bad squat](images/18-1-feet-floor.png)
+
 - **Sensitivity**: how aggressively BlendCap decides a foot is in contact with the ground. Higher values catch more contacts (good for footage with lots of held poses); lower is more conservative (good when there are lots of genuine quick steps). It's also the fix for floating feet: a contact that drifted off the floor can sit too high for the detector to recognize it as one, which is exactly what keeps it from being corrected, and a higher setting widens what counts so grounding can catch it and pull it back down.
 - **Max Gap**: any contacts closer together in time than this (in seconds) are merged into one continuous contact.
 - **Max Lift**: any lifts that go higher than this value (in cm) between contacts will be considered a real footstep or leg lift, and will not be merged.
@@ -86,15 +90,23 @@ Usually the most valuable cleanup step: it detects when a foot is in contact wit
 
 ![Foot locking fixes bad feet](images/18-foot-locking.png)
 
-- **Feet Define the Floor**: keeps the character on the ground plane while trying to conserve jumps. Feet in contact with the ground stay pinned to it, jumps and crouches are told apart by whether the body rises on screen in the source video, and jump heights are calculated from the time spent in the air. Works best with **Capture Skip** at 0. Helps with fixing floating captures or knees not bending enough. **Weaknesses**: if camera motion follows a jump this setting may not detect it properly, and feet dangling in the air during seated or hanging positions can be mistaken for standing or squatting.
+### Suggested starting points for example cases
+- **Lots of dynamic movement and held poses:** raise **Sensitivity** to about 0.75 and raise **Recovery Lift** under **Bridge Phantom Lifts** to about 30 cm.
+- **Lively footwork with short quick steps:** keep the defaults, adjust **Sensitivity** and **Bridge Phantom Lifts** depending on results.
+- **My character's feet are floating when they shouldn't be:** raise **Sensitivity**, and make sure **Feet Define the Floor** is enabled. 
+- **Knees appear stiff or jumps aren't detected**: Lower **Sensitivity** to around 0.2, and maybe disable **Feet Define the Floor**.
+- **Character stuck to the floor while climbing**: Disable **Feet Define the Floor** and adjust **Sensitivity** until you get your preferred results.
 
-![Feet Define Floor Fixes bad squat](images/18-1-feet-floor.png)
+---
 
-### Suggested starting points
-- **Lots of dynamic movement and held poses:** raise **Sensitivity** to about 0.75, turn **Bridge Phantom Lifts** on, and raise **Recovery Lift** to about 30 cm.
-- **Lively footwork with short quick steps:** keep the defaults, they're deliberately conservative so they don't lock a foot that's genuinely moving.
-- **Feet floating during holds and deep squats:** raise **Sensitivity** and/or enable **Feet Define the Floor**. 
-- **Knees appear stiff (stuck either straight or in a permanent bend)**: Lower **Sensitivity** to around 0.2, and disable **Feet Define the Floor**.
+## Body Grounding
+
+Foot Locking keeps standing motion planted; **Body Grounding** covers everything that happens on the floor: rolls, lying down, crawls, and kneels. It finds the stretches where the body's weight is on something other than the feet, measures where that support actually touches the ground, and seats the body on it, while trying to keep it level with the floor.
+
+Upright motion and jumps are never touched, and airborne tricks (flips, dives) are protected automatically. It's on by default, with two sliders:
+
+- **Catch Distance**: the farthest the body may be pulled to reach the floor (default 30 cm). A pose hovering further off the ground than this is left where it is.
+- **Skin Radius**: the gap kept between the skeleton and the floor (default 1.5 cm), so the final retargeted body rests on its surface instead of its bones.
 
 ---
 

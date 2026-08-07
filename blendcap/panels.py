@@ -411,9 +411,13 @@ def _draw_bvh_smoothing(pp_col, props):
     sm_header.label(text="Smoothing")
     if props.bvh_smoothing_expanded:
         sm_col = pp_col.column(align=True)
-        sm_col.prop(props, "smooth_face", text="Face (s)")
-        sm_col.prop(props, "smooth_body", text="Body (s)")
-        sm_col.prop(props, "smooth_root", text="Root (s)")
+        sm_col.prop(props, "smoothing_enabled")
+        sm_sub = sm_col.column(align=True)
+        sm_sub.enabled = props.smoothing_enabled
+        sm_sub.prop(props, "smooth_face", text="Face (s)")
+        sm_sub.prop(props, "smooth_body", text="Body (s)")
+        sm_sub.prop(props, "smooth_root", text="Root (s)")
+        sm_sub.prop(props, "smooth_vertical", text="Vertical (s)")
 
 
 def _draw_bvh_depth_noise_filtering(pp_col, props):
@@ -457,6 +461,11 @@ def _draw_bvh_foot_locking(pp_col, props):
         fl_col.prop(props, "foot_lock_enabled")
         sub = fl_col.column(align=True)
         sub.enabled = props.foot_lock_enabled
+        # Feet Define the Floor sits directly under the master
+        # toggle: it replaces the whole vertical channel and ships
+        # default-on — the most consequential row in the section,
+        # ahead of the tuning knobs below.
+        sub.prop(props, "foot_define_floor")
         sub.prop(props, "foot_sensitivity")
         sub.prop(props, "foot_max_gap_sec")
         sub.prop(props, "foot_max_lift_cm")
@@ -474,7 +483,25 @@ def _draw_bvh_foot_locking(pp_col, props):
         pin_col.enabled = props.foot_pin_enabled
         pin_col.prop(props, "foot_pin_strength")
         pin_col.prop(props, "foot_pin_release_cm")
-        sub.prop(props, "foot_define_floor")
+
+    # --- BODY GROUNDING ---
+    # Grounds non-upright near-floor stretches (rolls, lying,
+    # handstands); posture-gated so upright motion and jumps are
+    # untouched. Baked at BVH generation time like foot locking.
+    pp_col.separator()
+    bg_header = pp_col.row(align=True)
+    bg_header.prop(props, "body_grounding_expanded",
+                   icon=('TRIA_DOWN' if props.body_grounding_expanded
+                         else 'TRIA_RIGHT'),
+                   emboss=False, text="")
+    bg_header.label(text="Body Grounding")
+    if props.body_grounding_expanded:
+        bg_col = pp_col.column(align=True)
+        bg_col.prop(props, "body_grounding_enabled")
+        bg_sub = bg_col.column(align=True)
+        bg_sub.enabled = props.body_grounding_enabled
+        bg_sub.prop(props, "body_catch_distance_cm")
+        bg_sub.prop(props, "body_skin_radius_cm")
 
 
 def _draw_bvh_face_noise_filtering(pp_col, props):

@@ -36,7 +36,9 @@
 # using the capture fps — see the argparse help strings):
 #   --smooth N        Savitzky-Golay on body rotations, window N seconds (e.g. 0.23)
 #   --smooth-root N   Gaussian on root position, sigma N seconds (e.g. 0.27)
-#                     Depth axis (Z) gets 2x sigma automatically.
+#                     Depth axis (Z) gets 2x sigma automatically. X/Z only.
+#   --smooth-vertical N  Gaussian on vertical root motion, sigma N seconds
+#                     (e.g. 0.08). Kept separate and small so jump arcs survive.
 #   --smooth-face N   Savitzky-Golay on face data, window N seconds (e.g. 0.23)
 #                     Smooths landmarks, blendshapes, eye gaze.
 #
@@ -126,7 +128,12 @@ def _build_argparser():
                         help="Gaussian sigma for root position in seconds "
                              "(e.g. 0.27). FPS-independent: converted to "
                              "frames at runtime. Depth axis auto gets 2x. "
-                             "0 = off.")
+                             "X/Z only. 0 = off.")
+    parser.add_argument("--smooth-vertical", type=float, default=0,
+                        help="Gaussian sigma for vertical root motion in "
+                             "seconds (e.g. 0.08). Separate from "
+                             "--smooth-root so a small value can denoise "
+                             "hips Y without flattening jump arcs. 0 = off.")
     parser.add_argument("--smooth-face", type=float, default=0.23,
                         help="Face smoothing window in seconds (Savitzky-"
                              "Golay, polyorder=3). FPS-independent: "
@@ -257,6 +264,26 @@ def _build_argparser():
                              "Planted feet are pinned to the floor; "
                              "airborne gaps follow a gravity arc sized "
                              "by hang time.")
+    parser.add_argument("--body-grounding", action="store_true",
+                        help="Pull non-upright near-floor stretches "
+                             "(rolls, lying, handstands, crawls) down "
+                             "so the body actually touches the floor. "
+                             "Posture-gated: upright motion and jumps "
+                             "are never affected; airborne horizontal "
+                             "tricks stay outside the catch distance.")
+    parser.add_argument("--body-catch-distance", type=float, default=0.30,
+                        help="Maximum distance (m) body grounding may "
+                             "pull the body toward the floor. Genuine "
+                             "flight is protected by its ballistic "
+                             "(gravity) signature, not by altitude, so "
+                             "this is a safety cap rather than an "
+                             "eligibility threshold.")
+    parser.add_argument("--body-skin-radius", type=float, default=0.015,
+                        help="Distance (m) between the spine joints and "
+                             "the character's back surface; the back "
+                             "counts as grounded at this height. MHR "
+                             "spine joints sit almost at the skin, so "
+                             "the default is small.")
     parser.add_argument("--no-foot-pin", action="store_true",
                         help="Skip the planted-foot pin (on by "
                              "default). Pinning holds each planted "
@@ -349,6 +376,14 @@ def _validate_smoothing_flags(args):
         print("WARNING: --smooth-root requires scipy (pip install scipy)")
         args.smooth_root = 0
 
+    if args.smooth_vertical > 0 and not HAS_SCIPY:
+        print("WARNING: --smooth-vertical requires scipy (pip install scipy)")
+        args.smooth_vertical = 0
+
+    if args.body_grounding and not HAS_SCIPY:
+        print("WARNING: --body-grounding requires scipy (pip install scipy)")
+        args.body_grounding = False
+
     # --smooth-face validated at smooth_face_data() call (scipy check
     # + Nyquist check) since it needs face-data fps.
 
@@ -374,6 +409,11 @@ def _print_summary(args, export_mode, info):
             print(f"Root centered at origin: ON")
         if args.smooth_root > 0:
             print(f"Root smoothing: Gaussian sigma={args.smooth_root:.2f} s (depth 2x)")
+        if args.smooth_vertical > 0:
+            print(f"Vertical smoothing: Gaussian sigma={args.smooth_vertical:.2f} s")
+        if args.body_grounding:
+            print(f"Body grounding: ON (catch distance "
+                  f"{args.body_catch_distance:.2f} m)")
         if args.smooth > 0:
             print(f"Rotation smoothing: Savitzky-Golay window={args.smooth:.2f} s")
 

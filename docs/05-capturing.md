@@ -74,12 +74,11 @@ If you see lots of misses, fix the footage (framing, lighting, occlusion) before
 These controls let you trade quality for speed, or adapt certain parameters to your footage.
 
 ### FOV Mode (field of view)
-BlendCap estimates the camera's field of view to place the subject's body correctly in depth. It's generally safe to leave this on **Automatic**, but your capture results may call for a change. If the BVH armature glides toward and away from the camera for no reason, lock the field of view by setting the focal length manually or sampling only the first frame. If you notice quality drops in the body pose estimation, or your footage has lens zooms, sample every frame instead. You can then clean up the locomotion by hand in your final animation, or leave locomotion data out of the export entirely and animate the root bone yourself (see [BVH Generation and Post-Processing](08-bvh-generation-and-post-processing.md)).
+BlendCap estimates the camera's field of view to place the subject's body correctly in depth. It's generally safe to leave this on the default **Sample first frame only**, but your capture results may call for a change. If the BVH armature glides toward and away from the camera for no reason, make sure the field of view is locked by sampling only the first frame (the default) or setting the focal length manually. If you notice quality drops in the body pose estimation, or your footage has lens zooms, sample every frame instead. You can then clean up the locomotion by hand in your final animation, or leave locomotion data out of the export entirely and animate the root bone yourself (see [BVH Generation and Post-Processing](08-bvh-generation-and-post-processing.md)).
 
 ![Capture quality and speed options](images/14-capture-options.png)
 
-- **Automatic** (default): This setting will sample every frame on NVIDIA cards, and sample the first frame only on non-NVIDIA and CPU pipelines.
-- **Sample first frame only**: This will estimate once from the first frame, and assume the same FOV for the rest of the shot. Gives better locomotion results, but can sometimes degrade the body pose estimation.
+- **Sample first frame only** (default): This will estimate once from the first frame, and assume the same FOV for the rest of the shot. Gives better locomotion results, but can sometimes degrade the body pose estimation.
 - **Sample every frame**: This will re-estimate the focal length for every frame in the video. Generally leads to the most accurate body poses, but less accurate locomotion. It's also slow on non-NVIDIA GPUs and CPU, so it's generally best to avoid it when running non-NVIDIA hardware.
 - **Enter focal length**: This allows you to type in the lens focal length as a **35mm-format/full-frame equivalent**, and BlendCap will keep it fixed at that value for the whole shot. This should technically be the most "correct" option, but like the first-frame setting it can sometimes degrade the pose estimation results.
 

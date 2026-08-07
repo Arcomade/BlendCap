@@ -29,6 +29,8 @@ Floor reference: per-foot global minimum Y observed across the take
 By construction, the lowest stance's correction is ~zero — only higher
 stances need lowering.
 """
+import os
+
 import numpy as np
 
 from scipy.ndimage import gaussian_filter1d, median_filter, minimum_filter1d
@@ -171,6 +173,109 @@ FDF_SOFTPLANT_EDGE_M = 0.08
 # drifting (that drift is usually why the gap exists), so the
 # edge-most v values are contaminated; a few frames in, they're clean.
 FDF_ANCHOR_BACKOFF_FRAMES = 4
+
+# --- FDF jump preservation (three cooperating mechanisms) ---
+# The stance detector's gates are deliberately loose (at default
+# sensitivity: velocity < 2 m/s, height < 15 cm above base) because
+# missing a real plant is worse for grounding than keeping a marginal
+# one. But FDF's plant rule pins the perceived foot to level 0, so a
+# frame wrongly kept planted while the foot was airborne doesn't just
+# miss the jump — it drags the body DOWN by the foot's real clearance.
+# A modest hop (feet peak ~11 cm, ~1.5 m/s) fits entirely inside the
+# default gates: no gap ever forms and the jump is erased outright.
+#
+# 1. De-plant: inside each stance, frames whose smoothed bottom-of-
+#    foot sits clearly above that stance's OWN plant level (its 25th
+#    percentile) are un-planted before v is built. Per-stance levels
+#    keep stairs safe (each step is its own stance at its own level);
+#    calf raises are safe because bottom-of-foot is min(ankle, toe)
+#    and the toe stays down; standing noise after the median+Gaussian
+#    pre-smooth is well under the margin. The margin SCALES with the
+#    user's Sensitivity setting (this fraction of the detector's own
+#    height gate — 4 cm at the default 15 cm gate), so cranking
+#    sensitivity up still means "lock more aggressively" instead of
+#    being silently overridden by a fixed number.
+FDF_DEPLANT_CLEAR_FRAC = 0.27
+# 2. Clearance vote: a gap where even the LOWER foot's world height
+#    rises this far above its edge baseline means both feet left the
+#    ground — direct flight evidence that doesn't depend on the
+#    video's root rise (which a camera tilting to follow the jump
+#    cancels, failing the normal vote and flattening the jump into a
+#    "held blink"). The video still votes on direction: its rise must
+#    be non-negative, so drops keep their existing classification.
+#    Squats whose stances were lost can't sneak in — their feet stay
+#    at the floor, so the lower-foot rise is ~zero. Measured on the
+#    RAW bottom-of-foot series (no median/Gaussian), because the
+#    detector's smoothing flattens exactly the short bumps this vote
+#    exists to catch.
+FDF_CLEAR_VOTE_M = 0.05
+# 3. Apex/clearance consistency. In a genuine ballistic flight the
+#    feet rise AT LEAST as high as the body: they're attached, and
+#    mid-air the legs can only fold (raising the feet further) — they
+#    were already extended at push-off. So a gap whose hang-time apex
+#    (g*T^2/8) far exceeds the measured foot clearance is NOT a body
+#    in free fall — it's a rotational trick (butterfly, twist, flip)
+#    or partial support, where the feet are off the floor for far
+#    longer than the body could ballistically hang. TUCKED flights
+#    failing the check keep the video's motion (anchored at the
+#    plants) instead of getting launched — a 0.8 s acrobatic gap
+#    otherwise claims a 77 cm arc. UNTUCKED ones are straight-leg
+#    jumps whose evidence merely conflicts (a crouch before takeoff
+#    lowers the gap-side chord and inflates the claim); their arc is
+#    capped at what the feet's clearance supports.
+#    The tolerance absorbs what the raw clearance under-measures
+#    (smear, push-off extension); tuck-assisted jumps pass easily
+#    because tucked feet clear far above the body's own apex. Kept
+#    TIGHT on purpose: the physics is an inequality (feet >= body),
+#    so genuine jumps sit comfortably inside it, while rotational
+#    tricks measured on real takes overshot a looser 1.4x bar by
+#    only ~1 cm — the margin is what separates the two populations.
+FDF_APEX_CLEAR_TOL = 1.15
+FDF_APEX_CLEAR_MARGIN_M = 0.03
+# Window for measuring the clearance bump: slightly wider than the
+# gap, because the bump's shoulders live in the eroded stance edges.
+# The bump's width at half maximum must also span most of the gap
+# (>= half) for the clearance VOTE to count — a narrow feet-up
+# sliver inside a long gap is a roll entry or legs swinging over
+# during a stand-up, not a flight.
+FDF_BUMP_WINDOW_SEC = 0.15
+# 4. Inferred contacts. Consecutive jumps prove a ground touch the
+#    perception may never show: between two explosive moves its
+#    depth goes bad, and the landing's feet can read 25+ cm off the
+#    floor — undetectable by any height threshold. An interior dip
+#    inside an over-long gap counts as that contact only when the
+#    feet peak at least this far above the dip on BOTH sides AND
+#    each half independently passes the full flight vote (rise,
+#    clearance, consistency) AND shows real foot clearance of its
+#    own (feet that never left the ground cannot be a flight
+#    between contacts). The prominence bar is a cheap
+#    pre-filter, deliberately modest — a small lead-in hop's feet
+#    clear its landing dip by well under 20 cm — because the
+#    per-half votes are the real safety: rolls and tumbling can
+#    shape the dip but their halves cannot pass the votes, so
+#    grounded motion never gains a phantom contact.
+#    A committed contact is a SPAN, not an instant: a landing that
+#    re-launches is grounded for several frames (land, compress,
+#    drive). No per-frame channel survives the perception failure
+#    that hid the contact (heights read 25+ cm high, "planted" feet
+#    report 4-8 m/s), but the garbage is CONSISTENT: grounded frames
+#    cluster within a few cm of the dip's level while flight frames
+#    sit far above. The span extends from the dip to every
+#    contiguous frame within FDF_CONTACT_BAND_M of it, clamped so at
+#    least a few frames of each flight survive.
+FDF_SPLIT_PROMINENCE_M = 0.12
+FDF_CONTACT_BAND_M = 0.10
+
+# NOTE on standing knees: v is deliberately NOT smoothed or averaged
+# on planted frames. Any massaging of v here desynchronizes it from
+# the rendered skeleton's leg geometry, and the footskate IK absorbs
+# the disagreement as knee bend (a near-straight leg turns 1 cm of
+# height error into ~6 degrees of bend) — while smoothing also mutes
+# the crouch/landing dynamics that sell a jump's physics. The
+# consistency problem is solved downstream instead: modes.py's FDF
+# plant reconciliation re-levels the hips so the FINAL FK skeleton's
+# planted foot sits at the floor with its captured pose, which is
+# why compute_feet_defined_vertical returns its planted mask.
 # Light smoothing on the rebuilt vertical: softens left/right stance
 # handoffs during walking (the two feet sit at slightly different
 # body-frame heights) without visibly flattening jump arcs.
@@ -191,6 +296,34 @@ LEFT_ANKLE_SAM_IDX = 5
 LEFT_TOE_SAM_IDX = 7
 RIGHT_ANKLE_SAM_IDX = 21
 RIGHT_TOE_SAM_IDX = 23
+NECK_SAM_IDX = 110
+HIPS_SAM_IDX = 1
+
+# Grounded-tail anchor for over-long non-flight gaps. A gap longer
+# than FDF_MAX_FLIGHT_SEC cannot be a jump — but rising from the
+# floor produces exactly such a gap: the feet never hold still enough
+# to re-plant, and the video's height estimate right after a lie is
+# depth-corrupted, so the kept-video fallback renders the body
+# airborne until the next plant snaps it back (measured on a real
+# get-up: a CROUCHED body floating 15-23 cm for ~1 s, then the legs
+# extend down to meet the floor). Once the body is UPRIGHT and its
+# body-frame foot level HOLDS STEADY for long enough — a crouch or
+# stance settling, however deep — the feet are its ground contact:
+# follow them to the floor (the soft-plant rule, gated by posture +
+# foot-level stability) and STAY anchored to the gap's end, so a
+# subsequent leg extension renders as the body rising off planted
+# feet instead of feet chasing the floor down. Stability, not XZ
+# stillness (this runs before depth denoise; post-lie depth noise
+# swings world toe XZ at 1-3 m/s on a body standing dead still) and
+# not nearness to the plant level (a crouch's feet sit far above it
+# in body frame by definition). Fires only when the kept-video tail
+# actually floats (median drift above FDF_STAND_DRIFT_M) so clean
+# takes are untouched; tumbling gaps fail the upright test.
+FDF_STAND_TILT_DEG = 40.0
+FDF_STAND_SETTLE_SPEED = 0.25  # m/s, median-filtered foot-level slope
+FDF_STAND_MIN_SEC = 0.4
+FDF_STAND_DRIFT_M = 0.06
+FDF_STAND_RAMP_SEC = 0.25
 
 
 def sensitivity_to_thresholds(sensitivity, fps):
@@ -418,21 +551,31 @@ def compute_per_stance_correction(joint_coords, translation, fps,
 
 
 def compute_feet_defined_vertical(joint_coords, translation, fps,
-                                  sensitivity=0.5):
+                                  sensitivity=0.5,
+                                  translation_raw=None):
     """Feet Define the Floor: rebuild the body's vertical translation
     from foot plants + ballistic flight, discarding the video's
     vertical channel (which cannot distinguish a jump from camera
     motion or an elevator).
 
-    Returns a per-frame replacement for translation[:, 1] ("v"), or
-    None when no plants were detected (feature falls back to classic
-    behavior).
+    Returns (v, planted) — v is a per-frame replacement for
+    translation[:, 1]; planted is the (n_frames, 2) per-foot plant
+    mask after the de-plant pass, consumed by modes.py's FDF plant
+    reconciliation. Returns None when no plants were detected
+    (feature falls back to classic behavior).
 
     Construction, in the same world series stance detection uses
     (v + body-frame bottom-of-foot Y):
       - Planted frames: v = -(lowest planted foot's body-frame Y), so
         the weight-bearing foot sits exactly at level 0. Where the
-        video thought the ground was never enters the math.
+        video thought the ground was never enters the math. Frames
+        the loose detector kept planted while the foot was clearly
+        above its stance's plant level are un-planted first (see
+        FDF_DEPLANT_CLEAR_FRAC — without this a modest hop never
+        forms a gap and the plant rule drags the body down mid-air).
+        v is deliberately raw here; consistency with the rendered
+        skeleton is restored downstream (see the NOTE on standing
+        knees at module top).
       - Gaps up to FDF_MAX_FLIGHT_SEC where the video shows the body
         RISING during the gap (see FDF_FLIGHT_RISE_MIN_M): a gravity
         arc between the takeoff and landing plant levels, apex =
@@ -442,10 +585,22 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
         required on-screen rise is relaxed — but never the direction
         (see the FDF_TUCK_* comments at module top) — so real jumps
         whose root-rise the model under-reported still get their arc.
+        A gap whose lower foot demonstrably cleared the ground for
+        most of the gap also counts as a flight even when the camera
+        followed the jump (see FDF_CLEAR_VOTE_M). Any voted flight
+        must also pass the apex/clearance consistency check (see
+        FDF_APEX_CLEAR_TOL): feet that never rose anywhere near the
+        claimed apex mean a rotational trick, not free fall — those
+        gaps keep the video's motion, anchored at the plants.
+        Over-long gaps holding two flights back to back are split at
+        the dip between them — consecutive jumps prove a ground
+        contact the perception missed — and the contact becomes a
+        short plant span sized by the dip's own level (see the
+        FDF_SPLIT_PROMINENCE_M / FDF_CONTACT_BAND_M comments).
       - Grounded gaps (either length) whose feet stayed horizontally
-        still AND whose reconstruction meets the neighboring plant
-        levels at both edges: soft-plant — v follows the still feet
-        per-frame exactly as planted frames do. This is the squat/
+        still AND low AND whose reconstruction meets the neighboring
+        plant levels at both edges: soft-plant — v follows the still
+        feet per-frame exactly as planted frames do. This is the squat/
         kneel case: the stances were lost, not the contact. (See the
         FDF_SOFTPLANT_* comments at module top.)
       - Remaining gaps up to FDF_MAX_FLIGHT_SEC (a stance-detection
@@ -461,6 +616,16 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
     plants are strictly better when the plants ARE the floor) and the
     ROLLING height base, so sustained camera drift — the very thing
     this mode removes — can't disqualify the plants it needs.
+
+    translation_raw: the PRE-smoothing translation (see
+    _build_translation in modes.py). Used ONLY for the inferred-
+    contact dip geometry (valley prominence + contact-span band) —
+    the one measurement the output-smoothing sliders demonstrably
+    erase. All VOTES stay on the pipeline's translation, the series
+    their thresholds were calibrated against; moving them to rawer
+    data shifted the whole vote system's operating point and let
+    mid-roll segments pass flight votes. None (the CLI without
+    smoothing, or sliders at 0) means the two series coincide.
     """
     left_stances, right_stances, foot_y = detect_stances_per_foot(
         joint_coords, translation, fps, sensitivity=sensitivity,
@@ -485,11 +650,59 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
     for stances, col in ((left_stances, 0), (right_stances, 1)):
         for s, e in stances:
             planted[s:e + 1, col] = True
+
+    # De-plant pass: frames the loose detector kept planted while the
+    # foot was visibly above its stance's own plant level would drag
+    # the body down by that clearance (see FDF_DEPLANT_CLEAR_FRAC).
+    # Un-planting them lets swallowed hops form a gap and reach the
+    # flight vote. Sub-2-frame leftovers are noise, not plants.
+    _, h_thresh_m, _ = sensitivity_to_thresholds(sensitivity, fps)
+    deplant_clear = FDF_DEPLANT_CLEAR_FRAC * h_thresh_m
+    n_deplanted = 0
+    for c in (0, 1):
+        for s, e in _find_runs(planted[:, c], 1):
+            level = float(np.percentile(foot_y[s:e + 1, c], 25))
+            high = foot_y[s:e + 1, c] > level + deplant_clear
+            if high.any():
+                planted[s:e + 1, c][high] = False
+                n_deplanted += int(high.sum())
+        for s, e in _find_runs(planted[:, c], 1):
+            if e - s + 1 < 2:
+                planted[s:e + 1, c] = False
     any_plant = planted.any(axis=1)
+    if not any_plant.any():
+        return None
 
     v = np.zeros(n, dtype=np.float64)
     masked = np.where(planted, jc_foot, np.inf)
     v[any_plant] = -masked[any_plant].min(axis=1)
+
+    # World lower-foot series (no median/Gaussian), two flavors.
+    # ev_lower rides the pipeline's translation — possibly carrying
+    # the user's output smoothing — because every vote threshold in
+    # _gap_evidence was calibrated against exactly that series across
+    # the validated clip set; moving the votes to rawer data shifts
+    # the whole vote system's operating point (live-tested result:
+    # mid-roll segments started passing flight votes and gained
+    # phantom contacts). dip_lower rides the PRE-smoothing
+    # translation and feeds ONLY the inferred-contact dip geometry
+    # (valley prominence + contact-span band) — the one measurement
+    # the output sliders demonstrably erase: a real landing dip's
+    # prominence fell from 16.5 cm to 9.8 cm under default sliders,
+    # below the valley bar, hiding a proven contact. Same flip
+    # convention as detect_stances_per_foot.
+    flip = np.array([1.0, -1.0, -1.0])
+    feet_idx = [LEFT_ANKLE_SAM_IDX, LEFT_TOE_SAM_IDX,
+                RIGHT_ANKLE_SAM_IDX, RIGHT_TOE_SAM_IDX]
+
+    def _lower_series(tr):
+        fy = (tr[:, None, :] + joint_coords[:, feet_idx, :]
+              * flip)[:, :, 1]
+        return np.minimum(fy[:, :2].min(axis=1), fy[:, 2:].min(axis=1))
+
+    ev_lower = _lower_series(translation)
+    dip_lower = (ev_lower if translation_raw is None
+                 else _lower_series(translation_raw))
 
     # The flight gate reads the VIDEO's vertical during each gap (see
     # the FDF_FLIGHT_RISE_* comments). Nothing to precompute here —
@@ -505,30 +718,39 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
     if last < n - 1:
         v[last + 1:] = video_y[last + 1:] + (v[last] - video_y[last])
 
-    # Interior gaps: flight arcs, soft-plants, held levels, or
-    # anchored-video fallback.
-    n_flights = 0
-    n_assisted = 0
-    n_soft = 0
-    n_holds = 0
-    n_fallbacks = 0
-    max_apex = 0.0
-    f = first
-    while f <= last:
-        if any_plant[f]:
-            f += 1
-            continue
-        g0 = f
-        g1 = f
-        while g1 + 1 <= last and not any_plant[g1 + 1]:
-            g1 += 1
-        a, b = g0 - 1, g1 + 1          # planted anchor frames
-        va = _anchor_value(v, any_plant, a, -1)
-        vb = _anchor_value(v, any_plant, b, +1)
+    # Full flight evidence for a gap [g0, g1] between planted anchors
+    # a, b. Shared by the main classification loop and the inferred-
+    # contact splitter (which must judge each half of a candidate
+    # split with EXACTLY the machinery a real gap faces). wlo/whi
+    # clamp the clearance-bump window: the main loop extends it into
+    # the neighboring stances (the bump's shoulders live in the
+    # eroded edges), but a split half must not read past the dip —
+    # the other half's flight would poison its baseline.
+    ext = int(round(FDF_BUMP_WINDOW_SEC * max(fps, 1e-6)))
+
+    def _gap_evidence(g0, g1, a, b, wlo, whi):
         span = b - a
         hang_sec = span / max(fps, 1e-6)
         ts = (np.arange(g0, g1 + 1) - a) / float(span)
-        base = va + (vb - va) * ts
+        # Clearance bump: the lower foot's RAW world rise against a
+        # baseline chord (see the FDF_BUMP_WINDOW_SEC comment). When
+        # even the LOWER foot rises, both feet are off the ground.
+        wa, wb = max(wlo, a - ext), min(whi, b + ext)
+        seg = ev_lower[wa:wb + 1]
+        bl = seg[0] + (seg[-1] - seg[0]) * (np.arange(len(seg))
+                                            / max(len(seg) - 1, 1))
+        clear = seg - bl
+        clear_rise = float(clear.max())
+        # The bump must be COMMENSURATE with the gap to speak for it:
+        # in a real flight the feet are clear for essentially the
+        # whole gap. A narrow bump inside a much longer gap is a
+        # brief feet-up moment within grounded motion (a roll entry,
+        # legs swinging over during a stand-up) — no flight evidence.
+        w_half_sec = 0.0
+        if clear_rise > FDF_CLEAR_VOTE_M:
+            w_half_sec = (np.count_nonzero(clear > 0.5 * clear_rise)
+                          * 1.41421356 / max(fps, 1e-6))
+        commensurate = w_half_sec >= 0.5 * hang_sec
         apex_pred = G_MPS2 * hang_sec * hang_sec / 8.0
         # Flight vote: did the body visibly rise on screen during the
         # gap? Measured against the straight line between the gap's
@@ -551,13 +773,199 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
         assisted = ((not rise > rise_needed) and tucked
                     and rise > max(FDF_TUCK_VIDEO_FLOOR_M,
                                    FDF_TUCK_VIDEO_RELIEF * rise_needed))
-        took_off = rise > rise_needed or assisted
-        if hang_sec <= FDF_MAX_FLIGHT_SEC and took_off:
-            v[g0:g1 + 1] = base + 4.0 * apex_pred * ts * (1.0 - ts)
+        # Clearance vote: both feet demonstrably off the ground is
+        # flight evidence in its own right — it survives a camera that
+        # tilts to follow the jump (which cancels the root's on-screen
+        # rise and fails the votes above). The video still rules on
+        # direction: a falling root keeps its old classification.
+        cleared = ((not rise > rise_needed) and not assisted
+                   and clear_rise > FDF_CLEAR_VOTE_M and commensurate
+                   and rise > 0.0)
+        took_off = rise > rise_needed or assisted or cleared
+        # Apex/clearance consistency (see FDF_APEX_CLEAR_TOL): a body
+        # in free fall cannot rise higher than its feet did.
+        consistent = (apex_pred <= clear_rise * FDF_APEX_CLEAR_TOL
+                      + FDF_APEX_CLEAR_MARGIN_M)
+        arc_apex = apex_pred
+        if not consistent:
+            arc_apex = (clear_rise * FDF_APEX_CLEAR_TOL
+                        + FDF_APEX_CLEAR_MARGIN_M)
+        arcable = (hang_sec <= FDF_MAX_FLIGHT_SEC and took_off
+                   and (consistent or not tucked))
+        return dict(hang_sec=hang_sec, ts=ts, apex_pred=apex_pred,
+                    rise=rise, rise_needed=rise_needed,
+                    clear_rise=clear_rise, tuck_rise=tuck_rise,
+                    assisted=assisted, cleared=cleared,
+                    took_off=took_off, consistent=consistent,
+                    tucked=tucked, arc_apex=arc_apex, arcable=arcable)
+
+    # Inferred contacts: a human cannot launch a second flight
+    # without touching the ground between. When an over-long gap
+    # (> FDF_MAX_FLIGHT_SEC, so it would ride the video fallback)
+    # contains a flight-dip-flight signature — feet peaking high on
+    # BOTH sides of an interior dip (see FDF_SPLIT_PROMINENCE_M) —
+    # the dip is a ground contact the perception missed (fast motion
+    # between two explosive moves is where its depth goes bad; the
+    # dip can read 25+ cm off the floor while the performer is
+    # standing on it). The split only COMMITS when each half
+    # independently passes the full flight vote above: a roll's foot
+    # swings can shape a dip, but a roll's halves cannot pass the
+    # rise/clearance votes, so grounded tumbling never gains a
+    # phantom contact. Committed dips become one-frame plants (the
+    # plant rule grounds them; reconciliation and the correction
+    # smoothing downstream handle the rest) and the halves classify
+    # as ordinary gaps in the main loop below.
+    n_inferred = 0
+    f = first
+    while f <= last:
+        if any_plant[f]:
+            f += 1
+            continue
+        g0 = f
+        g1 = f
+        while g1 + 1 <= last and not any_plant[g1 + 1]:
+            g1 += 1
+        a, b = g0 - 1, g1 + 1
+        if ((b - a) / max(fps, 1e-6) > FDF_MAX_FLIGHT_SEC
+                and g1 - g0 >= 6):
+            # Valley detection (on dip_lower — the pre-smoothing
+            # series; see its comment above): the global minimum
+            # sits at the gap's EDGES (takeoff/landing ramps start
+            # at the ground), so the dip must be found by prominence
+            # — the lowest interior point with feet peaking above it
+            # on BOTH sides. Prefix/suffix running maxima give each
+            # candidate its side peaks in one pass.
+            seg = dip_lower[g0:g1 + 1]
+            pref = np.maximum.accumulate(seg)
+            suf = np.maximum.accumulate(seg[::-1])[::-1]
+            m = -1
+            dip = np.inf
+            for k in range(2, len(seg) - 2):
+                side = min(pref[k - 1], suf[k + 1])
+                if (side >= seg[k] + FDF_SPLIT_PROMINENCE_M
+                        and seg[k] < dip):
+                    m, dip = g0 + k, float(seg[k])
+            peak_l = float(dip_lower[g0:m].max()) if m >= 0 else 0.0
+            peak_r = (float(dip_lower[m + 1:g1 + 1].max())
+                      if m >= 0 else 0.0)
+            ok = False
+            if (m >= 0
+                    and (m - a) / max(fps, 1e-6) <= FDF_MAX_FLIGHT_SEC
+                    and (b - m) / max(fps, 1e-6) <= FDF_MAX_FLIGHT_SEC):
+                ev1 = _gap_evidence(g0, m - 1, a, m, a, m)
+                ev2 = _gap_evidence(m + 1, g1, m, b, m, b)
+                # Each half must pass the full flight vote AND show
+                # real foot clearance: feet that never left the
+                # ground cannot be a flight between contacts.
+                # Mid-roll segments sneak past the vote alone — the
+                # dive's on-screen rise or a leg-fold "tuck" votes
+                # yes while the feet stay at the floor (live-tested:
+                # a roll entry with 3 cm of clearance voted flight
+                # through the untucked consistency cap and grounded
+                # a phantom contact mid-roll).
+                ok = (ev1["arcable"] and ev2["arcable"]
+                      and ev1["clear_rise"] > FDF_CLEAR_VOTE_M
+                      and ev2["clear_rise"] > FDF_CLEAR_VOTE_M)
+            if ok:
+                # Contact SPAN: every contiguous frame whose lower
+                # foot stays within the band of the dip's level is
+                # part of the same touch-down (see the
+                # FDF_CONTACT_BAND_M comment). Clamped so each
+                # flight keeps at least 3 gap frames.
+                s0 = m
+                while (s0 - 1 >= g0
+                       and dip_lower[s0 - 1] <= dip + FDF_CONTACT_BAND_M):
+                    s0 -= 1
+                s1 = m
+                while (s1 + 1 <= g1
+                       and dip_lower[s1 + 1] <= dip + FDF_CONTACT_BAND_M):
+                    s1 += 1
+                s0 = max(s0, g0 + 3)
+                s1 = min(s1, g1 - 3)
+                if s0 > s1:
+                    s0 = s1 = m
+                for fc in range(s0, s1 + 1):
+                    c_low = int(np.argmin(jc_foot[fc]))
+                    planted[fc, c_low] = True
+                    any_plant[fc] = True
+                    v[fc] = -float(jc_foot[fc, c_low])
+                n_inferred += 1
+                if os.environ.get("BLENDCAP_FDF_DEBUG"):
+                    print(f"       [FDF split] gap f={g0}..{g1}: "
+                          f"inferred contact f={s0}..{s1} (dip "
+                          f"{dip*100:.1f}cm at f={m}, peaks "
+                          f"{peak_l*100:.0f}/{peak_r*100:.0f}cm)")
+                f = g0
+                continue
+        f = g1 + 2
+
+    # Interior gaps: flight arcs, soft-plants, held levels, or
+    # anchored-video fallback.
+    n_flights = 0
+    n_assisted = 0
+    n_cleared = 0
+    n_implausible = 0
+    flight_spans = []
+    n_soft = 0
+    n_holds = 0
+    n_fallbacks = 0
+    n_anchored = 0
+    max_apex = 0.0
+    f = first
+    while f <= last:
+        if any_plant[f]:
+            f += 1
+            continue
+        g0 = f
+        g1 = f
+        while g1 + 1 <= last and not any_plant[g1 + 1]:
+            g1 += 1
+        a, b = g0 - 1, g1 + 1          # planted anchor frames
+        va = _anchor_value(v, any_plant, a, -1)
+        vb = _anchor_value(v, any_plant, b, +1)
+        span = b - a
+        ts = (np.arange(g0, g1 + 1) - a) / float(span)
+        base = va + (vb - va) * ts
+        ev = _gap_evidence(g0, g1, a, b, first, last)
+        hang_sec = ev["hang_sec"]
+        if os.environ.get("BLENDCAP_FDF_DEBUG"):
+            print(f"       [FDF gap] f={g0}..{g1} hang={hang_sec:.2f}s "
+                  f"apex={ev['apex_pred']*100:.0f}cm "
+                  f"rise={ev['rise']*100:.1f}cm "
+                  f"need={ev['rise_needed']*100:.1f}cm "
+                  f"clear={ev['clear_rise']*100:.1f}cm "
+                  f"tuck={ev['tuck_rise']*100:.1f}cm "
+                  f"assisted={ev['assisted']} cleared={ev['cleared']} "
+                  f"took_off={ev['took_off']} "
+                  f"consistent={ev['consistent']}")
+        if ev["arcable"]:
+            # Untucked flights that fail consistency are genuine
+            # straight-leg jumps with a measurement conflict (their
+            # feet SHOULD clear exactly the apex; crouch-lowered
+            # chords inflate the gap side) — the arc is capped at
+            # what the feet's clearance supports (see _gap_evidence).
+            v[g0:g1 + 1] = base + 4.0 * ev["arc_apex"] * ts * (1.0 - ts)
+            flight_spans.append((g0, g1))
             n_flights += 1
-            if assisted:
+            if ev["assisted"]:
                 n_assisted += 1
-            max_apex = max(max_apex, apex_pred)
+            if ev["cleared"]:
+                n_cleared += 1
+            max_apex = max(max_apex, ev["arc_apex"])
+        elif hang_sec <= FDF_MAX_FLIGHT_SEC and ev["took_off"]:
+            # TUCKED flight failing consistency: the clearance
+            # already includes the leg fold, yet still falls far
+            # short of the claimed apex — a rotational trick
+            # (butterfly, twist, flip) or partially supported move,
+            # not a body in free fall. The video's motion (anchored
+            # at the plants) is the best available shape — holding a
+            # level would freeze visible movement, and the arc would
+            # launch the performer.
+            off_a = va - video_y[a]
+            off_b = vb - video_y[b]
+            v[g0:g1 + 1] = (video_y[g0:g1 + 1]
+                            + off_a * (1.0 - ts) + off_b * ts)
+            n_implausible += 1
         else:
             # Grounded gap. Soft-plant first: feet that stayed
             # horizontally still are plants the detector LOST
@@ -568,8 +976,18 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
             v_soft = None
             still_cols = _still_feet_cols(toe_xz, g0, g1)
             if still_cols:
+                # A soft-plant foot must also have stayed LOW: a
+                # vertical hop in place is horizontally still too, and
+                # "following" its rising feet would pull the body DOWN
+                # mid-air. Feet above the edge plant level by more
+                # than the de-plant margin are not lost plants.
+                sc_y = foot_y[g0:g1 + 1][:, still_cols].min(axis=1)
+                edge_y = max(float(foot_y[a, still_cols].min()),
+                             float(foot_y[b, still_cols].min()))
+                stayed_low = float(sc_y.max()) <= edge_y + deplant_clear
                 cand = -jc_foot[g0:g1 + 1][:, still_cols].min(axis=1)
-                if (abs(float(cand[0]) - va) <= FDF_SOFTPLANT_EDGE_M
+                if (stayed_low
+                        and abs(float(cand[0]) - va) <= FDF_SOFTPLANT_EDGE_M
                         and abs(float(cand[-1]) - vb)
                         <= FDF_SOFTPLANT_EDGE_M):
                     v_soft = cand
@@ -590,17 +1008,76 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
                 v[g0:g1 + 1] = (video_y[g0:g1 + 1]
                                 + off_a * (1.0 - ts) + off_b * ts)
                 n_fallbacks += 1
+                # Standing-tail anchor (see the constants block).
+                if joint_coords.shape[1] > NECK_SAM_IDX:
+                    tvec = (joint_coords[:, NECK_SAM_IDX, :]
+                            - joint_coords[:, HIPS_SAM_IDX, :])
+                    tnorm = np.maximum(
+                        np.linalg.norm(tvec, axis=1), 1e-9)
+                    # jc is Y-down: up-component is -y.
+                    tilt_ok = (np.degrees(np.arccos(np.clip(
+                        -tvec[:, 1] / tnorm, -1.0, 1.0)))
+                        <= FDF_STAND_TILT_DEG)
+                    cand = -jc_foot.min(axis=1)
+                    cs = median_filter(cand, size=5, mode="nearest")
+                    stab = np.ones(len(cs), dtype=bool)
+                    stab[:-1] = (np.abs(np.diff(cs)) * fps
+                                 <= FDF_STAND_SETTLE_SPEED)
+                    okv = tilt_ok & stab
+                    if os.environ.get("BLENDCAP_FDF_DEBUG"):
+                        for f2 in range(g0, g1 + 1, 2):
+                            print(f"       [FDF stand] f={f2} "
+                                  f"tilt_ok={bool(tilt_ok[f2])} "
+                                  f"stab={bool(stab[f2])} "
+                                  f"cand={cand[f2]*100:.1f} "
+                                  f"v={v[f2]*100:.1f}")
+                    min_fr = max(int(round(FDF_STAND_MIN_SEC * fps)), 3)
+                    s = -1
+                    run = 0
+                    for f2 in range(g0, g1 + 1):
+                        run = run + 1 if okv[f2] else 0
+                        if run >= min_fr:
+                            s = f2 - min_fr + 1
+                            break
+                    if s >= 0:
+                        drift = float(np.median(v[s:g1 + 1]
+                                                - cand[s:g1 + 1]))
+                        if drift > FDF_STAND_DRIFT_M:
+                            ramp = max(int(round(FDF_STAND_RAMP_SEC
+                                                 * fps)), 2)
+                            for f2 in range(s, g1 + 1):
+                                wgt = min((f2 - s + 1) / float(ramp),
+                                          1.0)
+                                v[f2] = ((1.0 - wgt) * v[f2]
+                                         + wgt * cand[f2])
+                            n_anchored += 1
         f = g1 + 2
 
     if FDF_SMOOTH_SIGMA > 0:
+        # The final smooth exists for stance handoffs; flight arcs
+        # are analytically smooth already, and blurring them shaves a
+        # short hop's apex by a third. Restore arc interiors, blending
+        # back into the smoothed series over a couple of edge frames.
+        v_arcs = v.copy()
         v = gaussian_filter1d(v, sigma=FDF_SMOOTH_SIGMA)
+        edge = 2
+        for g0, g1 in flight_spans:
+            for f2 in range(g0, g1 + 1):
+                w = min((f2 - g0 + 1) / (edge + 1),
+                        (g1 - f2 + 1) / (edge + 1), 1.0)
+                v[f2] = w * v_arcs[f2] + (1.0 - w) * v[f2]
 
     print(f"       Feet-defined vertical: {len(left_stances)} L / "
           f"{len(right_stances)} R stances, {n_flights} flight(s) "
-          f"({n_assisted} tuck-assisted, max apex {max_apex*100:.0f} cm), "
+          f"({n_assisted} tuck-assisted, {n_cleared} clearance-voted, "
+          f"max apex {max_apex*100:.0f} cm), "
           f"{n_soft} soft-plant(s), {n_holds} held blink(s), "
-          f"{n_fallbacks} non-flight gap(s) kept video motion")
-    return v
+          f"{n_fallbacks} non-flight gap(s) kept video motion; "
+          f"{n_deplanted} airborne frame(s) de-planted, "
+          f"{n_implausible} implausible arc(s) kept video motion, "
+          f"{n_inferred} inferred contact(s) split over-long gaps, "
+          f"{n_anchored} standing tail(s) anchored")
+    return v, planted
 
 
 def _anchor_value(v, any_plant, i, direction):

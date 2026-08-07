@@ -14,8 +14,9 @@ import threading
 from .helpers import (
     blendcap_state, arkit_state,
     _cache_dir, _bvh_library_dir, _addon_dir, _python_exe,
-    _host_spawn_prefix, _terminate_state_process,
-    _resolve_clip_name, _progress_re, format_workspace_status,
+    _host_spawn_prefix, _subprocess_env, _terminate_state_process,
+    _resolve_clip_name, _file_mode_source, _progress_re,
+    format_workspace_status,
     _seq_accessors, _tag_redraw, _import_bvh, _active_video_strip,
     _bake_root_into_hips_for_export,
 )
@@ -146,7 +147,7 @@ def _smooth_face_npz_via_venv(input_npz, output_npz, smooth_s):
     print(f"[ARKit] Running smoothing subprocess: {' '.join(cmd)}")
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
-                                check=False,
+                                check=False, env=_subprocess_env(),
                                 creationflags=getattr(
                                     subprocess, 'CREATE_NO_WINDOW', 0))
     except Exception as e:
@@ -259,6 +260,7 @@ def _smooth_face_npz_worker(input_npz, output_npz, smooth_s, state):
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
+                                env=_subprocess_env(),
                                 creationflags=getattr(
                                     subprocess, 'CREATE_NO_WINDOW', 0))
     except Exception as e:
@@ -829,13 +831,10 @@ class BLENDCAP_OT_clear_current_cache(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.blendcap_props
 
-        # Resolve video path
+        # Resolve video path (same winner as capture — _file_mode_source —
+        # so Clear Cache always targets the clip capture would run on)
         if props.video_source == 'FILE':
-            obj = context.active_object
-            if obj and obj.type == 'EMPTY' and "blendcap_source" in obj:
-                video_path = bpy.path.abspath(str(obj["blendcap_source"]))
-            else:
-                video_path = bpy.path.abspath(props.video_path)
+            video_path, _empty = _file_mode_source(context)
         else:
             seq_ed = context.scene.sequence_editor
             strip = _active_video_strip(seq_ed)
@@ -1053,13 +1052,18 @@ class BLENDCAP_OT_clear_all_caches(bpy.types.Operator):
             pass
 
         # Delete cache folders. No retry loop — if a file is still
-        # locked after the flush above (rare), it'll be overwritten
-        # on the next capture anyway and the NPZ data stays valid.
+        # locked after the flush above (rare, Windows), the folder
+        # survives, so its tracking-identity files are removed
+        # individually: a half-deleted cache must never satisfy a
+        # cache-params match and silently pass off stale data as a
+        # fresh capture. Locked leftovers (overlay/source mp4s) get
+        # overwritten by the next capture.
         if not os.path.exists(cache_dir):
             self.report({'INFO'}, "No cache directory found. Proxy strips reverted.")
             return {'FINISHED'}
 
         cleared = 0
+        failed = 0
         for folder in os.listdir(cache_dir):
             fp = os.path.join(cache_dir, folder)
             if os.path.isdir(fp) and folder != "bvh_exports":
@@ -1068,8 +1072,21 @@ class BLENDCAP_OT_clear_all_caches(bpy.types.Operator):
                     cleared += 1
                 except Exception as e:
                     print(f"[BlendCap] Failed to delete {fp}: {e}")
+                    failed += 1
+                    for leftover in (".cache_params", "mhr_frames.npz",
+                                     "face_frames.npz"):
+                        try:
+                            os.remove(os.path.join(fp, leftover))
+                        except OSError:
+                            pass
 
-        self.report({'INFO'}, f"Emptied {cleared} cache folders. Mocap Library preserved.")
+        if failed:
+            self.report({'WARNING'},
+                        f"Emptied {cleared} cache folders; {failed} could not "
+                        f"be fully removed (files in use). Tracking data in "
+                        f"them was invalidated.")
+        else:
+            self.report({'INFO'}, f"Emptied {cleared} cache folders. Mocap Library preserved.")
         return {'FINISHED'}
 
 
@@ -1407,16 +1424,29 @@ class BLENDCAP_OT_export_lib_bvh(bpy.types.Operator):
                 ).to_4x4()
                 tmp_obj.matrix_world = M.inverted()
                 context.view_layer.update()
-                bpy.ops.object.transform_apply(
-                    location=False, rotation=True, scale=False)
-                bpy.ops.export_anim.bvh(
-                    filepath=dst,
-                    global_scale=1.0,
-                    frame_start=context.scene.frame_start,
-                    frame_end=context.scene.frame_end,
-                    rotate_mode='NATIVE',
-                    root_transform_only=False,
-                )
+                # context.object / selected_objects inside a running
+                # operator are FROZEN at button-click time — setting
+                # view_layer.objects.active above updates the scene but
+                # not this operator's context members. The BVH exporter's
+                # poll and save() both read context.object, so without an
+                # explicit override the export fails ("poll() failed,
+                # context is incorrect") whenever the user clicked with
+                # no armature active. Hand both ops the temp armature
+                # directly, regardless of click-time state.
+                with context.temp_override(
+                        object=tmp_obj, active_object=tmp_obj,
+                        selected_objects=[tmp_obj],
+                        selected_editable_objects=[tmp_obj]):
+                    bpy.ops.object.transform_apply(
+                        location=False, rotation=True, scale=False)
+                    bpy.ops.export_anim.bvh(
+                        filepath=dst,
+                        global_scale=1.0,
+                        frame_start=context.scene.frame_start,
+                        frame_end=context.scene.frame_end,
+                        rotate_mode='NATIVE',
+                        root_transform_only=False,
+                    )
             except Exception as e:
                 export_ok = False
                 export_err = str(e)
@@ -1527,16 +1557,25 @@ class BLENDCAP_OT_export_lib_fbx(bpy.types.Operator):
                       if restructure_err else None)
         if export_ok:
             try:
-                bpy.ops.export_scene.fbx(
-                    filepath=dst,
-                    use_selection=True,
-                    object_types={'ARMATURE'},
-                    bake_anim=True,
-                    bake_anim_use_all_bones=True,
-                    bake_anim_use_nla_strips=False,
-                    bake_anim_use_all_actions=False,
-                    add_leaf_bones=True,
-                )
+                # Same frozen-context issue as the BVH export above, but
+                # worse: use_selection=True reads the FROZEN click-time
+                # selection, so this could silently export the user's
+                # selected objects instead of the temp armature. Override
+                # pins both to the temp armature.
+                with context.temp_override(
+                        object=tmp_obj, active_object=tmp_obj,
+                        selected_objects=[tmp_obj],
+                        selected_editable_objects=[tmp_obj]):
+                    bpy.ops.export_scene.fbx(
+                        filepath=dst,
+                        use_selection=True,
+                        object_types={'ARMATURE'},
+                        bake_anim=True,
+                        bake_anim_use_all_bones=True,
+                        bake_anim_use_nla_strips=False,
+                        bake_anim_use_all_actions=False,
+                        add_leaf_bones=True,
+                    )
             except Exception as e:
                 export_ok = False
                 export_err = str(e)

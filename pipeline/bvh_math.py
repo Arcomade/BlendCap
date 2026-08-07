@@ -315,13 +315,16 @@ def smooth_rotations(local_rots, window, polyorder=3):
     return smoothed
 
 
-def smooth_positions(positions, sigma, depth_axis=2):
-    """Gaussian smoothing on root positions. Depth axis gets 2x sigma."""
+def smooth_positions(positions, sigma, depth_axis=2, skip_axes=()):
+    """Gaussian smoothing on root positions. Depth axis gets 2x sigma.
+    Axes in skip_axes pass through untouched."""
     if not HAS_SCIPY or positions.shape[0] < 4:
         return positions
 
     smoothed = positions.copy()
     for axis in range(3):
+        if axis in skip_axes:
+            continue
         s = sigma * 2.0 if axis == depth_axis else sigma
         smoothed[:, axis] = gaussian_filter1d(positions[:, axis], sigma=s)
     return smoothed

@@ -297,6 +297,59 @@ def _python_exe():
     return os.path.join(d, "venv", "bin", "python")
 
 
+def _steam_launched():
+    """True when Blender was launched through the Steam client on Linux
+    (the Steam version of Blender). Steam exports its runtime's
+    LD_LIBRARY_PATH (old bundled libs) and an LD_PRELOAD overlay hook
+    into Blender's environment, and every subprocess inherits them -
+    which breaks host tools (rocminfo / nvidia-smi during install, so
+    the GPU is misdetected as absent) and can break the venv python's
+    native imports (torch / onnxruntime) at capture time. Detected via
+    the env Steam sets rather than any file, so it also covers a user
+    who exported the same vars by hand."""
+    if not sys.platform.startswith("linux"):
+        return False
+    return (bool(os.environ.get("STEAM_RUNTIME"))
+            or "steam-runtime" in os.environ.get("LD_LIBRARY_PATH", "")
+            or "gameoverlayrenderer" in os.environ.get("LD_PRELOAD", ""))
+
+
+def _subprocess_env(overrides=None):
+    """Environment for installer / venv-python subprocesses.
+
+    Returns None (= inherit Blender's env unchanged, what every caller
+    passed before) unless something needs changing:
+      - overrides: {VAR: VALUE} injected on top (capture backend pins).
+      - Steam-launched Blender: the Steam runtime's library overrides
+        are stripped (see _steam_launched). LD_LIBRARY_PATH is restored
+        to the pre-Steam value Steam saves in SYSTEM_LD_LIBRARY_PATH
+        (usually empty -> dropped); only the gameoverlayrenderer entries
+        are removed from LD_PRELOAD, anything user-set is kept.
+    """
+    if not overrides and not _steam_launched():
+        return None
+    env = os.environ.copy()
+    if _steam_launched():
+        orig = env.get("SYSTEM_LD_LIBRARY_PATH")
+        if orig:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+        pre = env.get("LD_PRELOAD")
+        if pre:
+            # LD_PRELOAD entries may be separated by colons OR spaces.
+            kept = [p for p in re.split(r"[:\s]+", pre)
+                    if p and "gameoverlayrenderer" not in p]
+            if kept:
+                env["LD_PRELOAD"] = ":".join(kept)
+            else:
+                env.pop("LD_PRELOAD", None)
+        env.pop("STEAM_RUNTIME", None)
+    if overrides:
+        env.update(overrides)
+    return env
+
+
 def _in_flatpak():
     """True when Blender (and thus this addon) is running inside a Flatpak
     sandbox. Detected via /.flatpak-info, which the runtime always mounts.
@@ -680,6 +733,15 @@ def _import_bvh(filepath, armature_name=None):
         #   Root  — shrunken to a vertical stub at world origin (the
         #           existing locomotion-axis-preserving shrink, see comment
         #           above).
+        #   Hips  — extended to the neighboring Spine bone's length,
+        #           strictly along its importer-derived axis (which is
+        #           the near-zero average of Spine up + two UpLegs down,
+        #           hence the sub-centimeter nub users missed during
+        #           retarget setup). Length-only, direction untouched:
+        #           the rest axis anchors the baked rotation + Hips.Y
+        #           curves. Wherever the axis happens to point is
+        #           accepted — user's call: "I don't care what direction
+        #           it's pointing, I just want it to be a bone".
         #   Head  — in a face-only BVH (Head is the armature root, no
         #           body to give it context) the importer averages the
         #           ~70 face children's heads to derive Head's tail,
@@ -773,7 +835,36 @@ def _import_bvh(filepath, armature_name=None):
                             eb_head.head = (mid_x, mid_y, bottom_z)
                             eb_head.tail = (mid_x, mid_y,
                                             top_z + 0.02)
+            # Extend Hips to a visible length. Same safety rule as the
+            # Root stub above: scale the tail along the bone's EXISTING
+            # axis only — direction defines the rest frame the baked
+            # rotation + Hips.Y curves live in and must never change;
+            # length is free. Target = the neighboring Spine bone's
+            # length (its true chain segment: single child, tail on
+            # Spine1's head), floored by the pelvis->Spine gap. Children
+            # are imported non-connected, so moving Hips' tail moves
+            # nothing else.
+            eb_hips = obj.data.edit_bones.get('Hips')
+            eb_spine = obj.data.edit_bones.get('Spine')
+            if (eb_hips is not None and eb_spine is not None
+                    and eb_hips.length > 1e-6):
+                target_len = max(eb_spine.length,
+                                 (eb_spine.head - eb_hips.head).length)
+                if target_len > eb_hips.length:
+                    eb_hips.tail = (eb_hips.head
+                                    + (eb_hips.tail - eb_hips.head)
+                                    * (target_len / eb_hips.length))
             bpy.ops.object.mode_set(mode='OBJECT')
+            # The custom-shape disguise this replaced is retired; remove
+            # the shape object an older addon version may have saved
+            # into this .blend (it had a fake user, so it would linger
+            # forever otherwise).
+            stale = bpy.data.objects.get("BlendCapBoneShape")
+            if stale is not None:
+                stale_mesh = stale.data if stale.type == 'MESH' else None
+                bpy.data.objects.remove(stale, do_unlink=True)
+                if stale_mesh is not None and stale_mesh.users == 0:
+                    bpy.data.meshes.remove(stale_mesh)
         finally:
             if prev_active is not None:
                 bpy.context.view_layer.objects.active = prev_active
@@ -1003,6 +1094,45 @@ def _active_video_strip(seq_ed):
     return strip
 
 
+def _file_mode_source(context):
+    """Resolve File-Path mode's video source. Returns (video_path, empty).
+
+    The active BlendCap preview Empty normally carries the clip identity —
+    clicking the preview plane and re-running capture must keep pointing
+    at that clip. But when the Video field holds a DIFFERENT existing file
+    than the Empty's stored source, the user has just picked a new video
+    and the field wins; otherwise the selected Empty silently hijacks
+    every capture (and Clear Cache) until it is deselected or removed.
+
+    The field only wins when its file exists on disk: a stale/moved field
+    path keeps the old Empty-first behavior, so re-capture and BVH
+    generation from a still-valid cache keep working after the source
+    file is gone.
+
+    `empty` is the object whose stored identity should drive clip naming
+    (None = the field is authoritative, name from the file stem). Every
+    File-mode consumer (capture, BVH generation, Clear Cache, clip
+    naming) resolves through here so they can't disagree.
+    """
+    props = context.scene.blendcap_props
+    field = bpy.path.abspath(props.video_path) if props.video_path else ""
+    obj = context.active_object
+    empty = (obj if obj and obj.type == 'EMPTY' and "blendcap_source" in obj
+             else None)
+    if empty is None:
+        return field, None
+    stored = bpy.path.abspath(str(empty["blendcap_source"]))
+    if field and os.path.exists(field):
+        try:
+            differs = (os.path.normcase(os.path.normpath(field))
+                       != os.path.normcase(os.path.normpath(stored)))
+        except Exception:
+            differs = False
+        if differs:
+            return field, None
+    return stored, empty
+
+
 def _resolve_video_path(context):
     """Resolve the active video path and mode from UI state.
     Returns (video_path, start_frame, max_frames, insert_frame, insert_channel, mode) or None on error.
@@ -1012,11 +1142,7 @@ def _resolve_video_path(context):
     insert_frame = 1; insert_channel = 1
 
     if props.video_source == 'FILE':
-        obj = context.active_object
-        if obj and obj.type == 'EMPTY' and "blendcap_source" in obj:
-            video_path = bpy.path.abspath(str(obj["blendcap_source"]))
-        else:
-            video_path = bpy.path.abspath(props.video_path)
+        video_path, _empty = _file_mode_source(context)
         return (video_path, start_frame, max_frames, insert_frame, insert_channel, 'FILE')
 
     # VSE mode
@@ -1194,8 +1320,9 @@ def _resolve_clip_name(context):
     custom prop (so re-capture stays in the original cache folder);
     otherwise the active strip's current name.
 
-    FILE / viewport mode: prefers the active Empty's stored
-    `blendcap_source_strip`; otherwise the file's basename stem.
+    FILE / viewport mode: resolves through _file_mode_source (so naming
+    can't disagree with the path capture reads): the winning Empty's
+    stored `blendcap_source_strip`, otherwise the file's basename stem.
 
     Returns "" if nothing can be resolved.
     """
@@ -1203,17 +1330,15 @@ def _resolve_clip_name(context):
     raw = ""
 
     if props.video_source == 'FILE':
-        obj = context.active_object
-        if obj and obj.type == 'EMPTY' and "blendcap_source" in obj:
-            stored = str(obj.get("blendcap_source_strip", "") or "")
+        vp, empty = _file_mode_source(context)
+        if empty is not None:
+            stored = str(empty.get("blendcap_source_strip", "") or "")
             # Stored stamps are already extension-stripped at write time.
-            raw = stored or _strip_media_extension(obj.name)
-        else:
-            vp = bpy.path.abspath(props.video_path) if props.video_path else ""
-            if vp:
-                base = os.path.basename(vp.rstrip(os.sep))
-                stem = os.path.splitext(base)[0]
-                raw = stem if stem and not stem.startswith('.') else base
+            raw = stored or _strip_media_extension(empty.name)
+        elif vp:
+            base = os.path.basename(vp.rstrip(os.sep))
+            stem = os.path.splitext(base)[0]
+            raw = stem if stem and not stem.startswith('.') else base
     else:
         seq_ed = context.scene.sequence_editor
         strip = _active_video_strip(seq_ed)
@@ -1452,7 +1577,7 @@ def _show_warning_popup(messages):
 
 def _write_cache_params(output_dir, start_frame, max_frames,
                         img_offset_start=0, img_offset_end=0,
-                        project_fps=0.0, capture_sig=""):
+                        project_fps=0.0, capture_sig="", source_path=""):
     """Write the frame parameters used for this run so cache validity
     can be checked later. Includes image-sequence offsets since IMAGE
     strips always have start_frame=0, max_frames=0. project_fps is
@@ -1461,31 +1586,38 @@ def _write_cache_params(output_dir, start_frame, max_frames,
     different FPS would misalign it). capture_sig (6th line) records the
     capture-affecting settings (FOV mode/focal, hand refinement, capture
     skip, backend) so changing any of them re-captures instead of reusing
-    a mismatched NPZ."""
+    a mismatched NPZ. source_path (7th line) records the resolved source
+    video (or image directory) so a DIFFERENT file that happens to
+    resolve to the same clip name (same basename in another folder, a
+    relinked strip) can never pass as a cache hit and silently reuse
+    another video's tracking data. utf-8: paths can carry non-ASCII."""
     try:
-        with open(os.path.join(output_dir, ".cache_params"), 'w') as f:
-            f.write(f"{start_frame}\n{max_frames}\n{img_offset_start}\n{img_offset_end}\n{project_fps:.6f}\n{capture_sig}\n")
+        with open(os.path.join(output_dir, ".cache_params"), 'w',
+                  encoding='utf-8') as f:
+            f.write(f"{start_frame}\n{max_frames}\n{img_offset_start}\n{img_offset_end}\n{project_fps:.6f}\n{capture_sig}\n{source_path}\n")
     except Exception:
         pass
 
 
 def _cache_params_match(output_dir, start_frame, max_frames,
                         img_offset_start=0, img_offset_end=0,
-                        project_fps=0.0, capture_sig=""):
+                        project_fps=0.0, capture_sig="", source_path=""):
     """Exact match: cache is valid only when it was generated with the
-    SAME trim, SAME project FPS, and SAME capture settings as the current
-    request. A wider OR narrower cache forces re-tracking: an earlier
-    cache-covers-request shortcut produced overlay/NPZ misalignment when
-    the current trim was much smaller than the cached range.
+    SAME trim, SAME project FPS, SAME capture settings, and SAME source
+    file as the current request. A wider OR narrower cache forces
+    re-tracking: an earlier cache-covers-request shortcut produced
+    overlay/NPZ misalignment when the current trim was much smaller than
+    the cached range.
 
-    Legacy caches without a recorded project FPS (4-line) or without a
-    capture-settings signature (5-line) are treated as mismatched so they
-    get regenerated and pick up the new metadata on the next run."""
+    Legacy caches without a recorded project FPS (4-line), without a
+    capture-settings signature (5-line), or without a recorded source
+    path (6-line) are treated as mismatched so they get regenerated and
+    pick up the new metadata on the next run."""
     path = os.path.join(output_dir, ".cache_params")
     if not os.path.exists(path):
         return False
     try:
-        with open(path, 'r') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             lines = f.read().strip().split('\n')
         if len(lines) < 5:
             return False  # legacy or truncated
@@ -1508,6 +1640,17 @@ def _cache_params_match(output_dir, start_frame, max_frames,
         c_sig = lines[5] if len(lines) >= 6 else ""
         if c_sig != capture_sig:
             return False
+        # Source path (7th line). Same regenerate-once rule for 6-line
+        # caches. Compared case/separator-insensitively (Windows paths);
+        # a different file under the same clip name must never reuse
+        # another video's tracking data.
+        if source_path:
+            c_src = lines[6] if len(lines) >= 7 else ""
+            if not c_src:
+                return False
+            if (os.path.normcase(os.path.normpath(c_src))
+                    != os.path.normcase(os.path.normpath(source_path))):
+                return False
         return True
     except Exception:
         return False

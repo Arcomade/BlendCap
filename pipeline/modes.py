@@ -44,6 +44,7 @@ from .camera_level import apply_correction as apply_camera_level
 from .camera_level import resolve_correction as resolve_camera_level
 from .camera_level import apply_head_correction_local as apply_head_local
 from .camera_level import resolve_head_correction as resolve_head_level
+from .body_grounding import compute_body_grounding_correction
 from .foot_grounding import (compute_feet_defined_vertical,
                              compute_per_stance_correction)
 from .footskate_cleanup import apply_footskate_cleanup
@@ -221,6 +222,53 @@ def _solve_hands_stage(args, export_mode, npz, parents, offsets_cm,
     return bool(summary.get("any_solved"))
 
 
+# Largest camera pitch the detrend below is allowed to believe. The
+# regression cannot tell a tilted camera from an actor whose height
+# happens to correlate with their depth — walking toward the camera
+# while crouching reads identically to a camera pointed down. Measured
+# on a close-range two-camera take: both cameras were level to 3 deg by
+# their own floor plane, the regression claimed 27 and -35 deg, and
+# applying it turned a floor flat to 7 cm into one varying by 22-37 cm.
+# A camera framing a standing figure sits within a few degrees of
+# level; past this cap the fit is describing the performance, not the
+# camera, so trust the footage and leave the vertical alone.
+MAX_DETREND_PITCH_DEG = 12.0
+
+
+def _detrend_camera_pitch(cam_t, npz=None):
+    """Remove the depth-correlated component of cam_t.y, in place.
+
+    SAM 3D Body's pred_cam_t is in CAMERA frame, not world frame. For
+    any camera pitch (up/down tilt about world X), pred_cam_t.y picks
+    up a linear-in-Z component of slope -tan(pitch). Feeding that into
+    the BVH as world Y bleeds depth motion into apparent vertical
+    motion: as the actor walks toward the camera the body appears to
+    rise or sink. Subtracting the regression of cam_t.y on cam_t.z
+    removes it. Vertical motion NOT correlated with depth passes
+    through unchanged; vertical motion that IS correlated with depth
+    gets absorbed, which is why MAX_DETREND_PITCH_DEG exists.
+
+    Returns a status line for the caller to print.
+    """
+    if npz is not None and "gravity_aligned" in getattr(npz, "files", ()):
+        return ("Camera pitch detrend: skipped (input is already "
+                "gravity-aligned)")
+    if cam_t.shape[0] < 2 or float(cam_t[:, 2].var()) <= 1e-6:
+        return ("Camera pitch detrend: skipped "
+                "(insufficient depth motion variance)")
+    z_c = cam_t[:, 2] - cam_t[:, 2].mean()
+    y_c = cam_t[:, 1] - cam_t[:, 1].mean()
+    slope = float((y_c * z_c).sum() / (z_c * z_c).sum())
+    pitch = abs(np.degrees(np.arctan(slope)))
+    if pitch > MAX_DETREND_PITCH_DEG:
+        return (f"Camera pitch detrend: skipped (fit implies {pitch:.0f} deg "
+                f"of camera pitch, over the {MAX_DETREND_PITCH_DEG:.0f} deg "
+                f"limit, treating it as real vertical motion)")
+    cam_t[:, 1] = cam_t[:, 1] - slope * cam_t[:, 2]
+    return (f"Camera pitch detrend: removed {slope:+.4f} * cam_t.z from "
+            f"cam_t.y ({pitch:.1f} deg of depth-induced Y bleed)")
+
+
 def _load_cam_t(npz, args, export_mode):
     """Load + repair cam_t and run the camera-pitch detrend.
 
@@ -238,34 +286,7 @@ def _load_cam_t(npz, args, export_mode):
                 print(f"[WARNING] Repaired {_n_bad} invalid (NaN) cam_t frames")
             print(f"       cam_t loaded ({cam_t.shape})")
 
-            # Camera-pitch detrend. SAM 3D Body's pred_cam_t is in
-            # CAMERA frame, not world frame. For any camera pitch
-            # (up/down tilt about world X), pred_cam_t.y picks up a
-            # linear-in-Z component of slope -tan(pitch). Feeding
-            # that into the BVH as world Y bleeds depth motion into
-            # apparent vertical motion: as the actor walks toward
-            # the camera the body appears to rise or sink (sign
-            # depends on tilt direction). Symptom is most visible
-            # when combined with real vertical motion ("jumps higher
-            # when running forward"). Subtract the linear regression
-            # of cam_t.y on cam_t.z to remove the depth-correlated
-            # component. Noise and real vertical motion that is NOT
-            # correlated with depth pass through unchanged. Real
-            # vertical motion that IS correlated with depth (e.g.,
-            # always-bigger-jump-when-running) gets partially
-            # absorbed, but that's small for typical clips.
-            z_var = float(cam_t[:, 2].var())
-            if cam_t.shape[0] >= 2 and z_var > 1e-6:
-                z_c = cam_t[:, 2] - cam_t[:, 2].mean()
-                y_c = cam_t[:, 1] - cam_t[:, 1].mean()
-                slope = float((y_c * z_c).sum() / (z_c * z_c).sum())
-                cam_t[:, 1] = cam_t[:, 1] - slope * cam_t[:, 2]
-                print(f"       Camera pitch detrend: removed "
-                      f"{slope:+.4f} * cam_t.z from cam_t.y "
-                      f"(depth-induced Y bleed)")
-            else:
-                print(f"       Camera pitch detrend: skipped "
-                      f"(insufficient depth motion variance)")
+            print(f"       {_detrend_camera_pitch(cam_t, npz)}")
         elif args.root_motion:
             print("WARNING: --root-motion set but 'cam_t' not found in NPZ")
             print("         Available keys:", list(npz.files))
@@ -518,7 +539,16 @@ def _anchor_face_to_body(face_data, face_calibration, args, parents,
 def _build_translation(args, cam_t, n_frames, fps):
     """Per-frame translation vector (Y-up, centered, smoothed). Split
     into Root / Hips later: Root takes X/Z locomotion; Hips takes
-    vertical body motion (squat / jump / gait bob)."""
+    vertical body motion (squat / jump / gait bob).
+
+    Returns (translation, translation_raw): the smoothed series the
+    pipeline renders from, and the pre-smoothing series kept as
+    EVIDENCE for Feet Define the Floor's classification votes.
+    Smoothing is an aesthetic control; a five-frame landing dip or a
+    sharp takeoff rise is exactly what it erases, and detection
+    decisions must not change when the user moves an output slider
+    (corrections consume the render; classifications consume the
+    evidence)."""
     if cam_t is not None:
         translation = cam_t.copy()
         translation[:, 1] *= -1   # SAM Y-down -> BVH Y-up
@@ -534,12 +564,28 @@ def _build_translation(args, cam_t, n_frames, fps):
             translation -= delta
             print(f"       Centered: frame 0 -> origin")
 
+    translation_raw = translation.copy()
+
     if args.smooth_root > 0:
         sigma = seconds_to_sigma_frames(args.smooth_root, fps)
         print(f"       Root smoothing: Gaussian sigma={sigma:.1f} frames "
-              f"({args.smooth_root:.2f} s at {fps:.1f} fps, depth Z 2x)")
-        translation = smooth_positions(translation, sigma)
-    return translation
+              f"({args.smooth_root:.2f} s at {fps:.1f} fps, X/Z only, "
+              f"depth Z 2x)")
+        # Y (axis 1) is deliberately NOT smoothed here: a jump lives
+        # almost entirely in cam_t.Y for only ~12-18 airborne frames, so
+        # this Gaussian flattens the arc — and the flattened remainder
+        # then reads as a floating plant to foot grounding, which pulls
+        # it to the floor (net: jumps frozen at standing height). This
+        # slider's job is locomotion/depth noise; vertical noise gets its
+        # own much smaller sigma below (--smooth-vertical).
+        translation = smooth_positions(translation, sigma, skip_axes=(1,))
+
+    if args.smooth_vertical > 0:
+        vsigma = seconds_to_sigma_frames(args.smooth_vertical, fps)
+        print(f"       Vertical smoothing: Gaussian sigma={vsigma:.1f} frames "
+              f"({args.smooth_vertical:.2f} s at {fps:.1f} fps, Y only)")
+        translation = smooth_positions(translation, vsigma, skip_axes=(0, 2))
+    return translation, translation_raw
 
 
 def _solve_vertical_motion(args, export_mode, joint_coords, translation,
@@ -733,7 +779,8 @@ def run_body(args, export_mode, face_data, face_calibration):
         f0_err = np.max(np.abs(local_rots[0] - np.eye(3)))
         print(f"       Frame 0 identity error: {f0_err:.6f} (should be ~0)")
 
-    translation = _build_translation(args, cam_t, n_frames, fps)
+    translation, translation_raw = _build_translation(args, cam_t,
+                                                      n_frames, fps)
 
     # Robust floor (--robust-floor / "Recover Floor Level"): estimate
     # the floor from stance frames instead of the take's single lowest
@@ -754,14 +801,18 @@ def run_body(args, export_mode, face_data, face_calibration):
     use_fdf = foot_lock_on and bool(getattr(args, 'feet_define_floor',
                                             False))
     fdf_vertical = None
+    fdf_planted = None
     if use_fdf:
-        fdf_vertical = compute_feet_defined_vertical(
+        fdf_result = compute_feet_defined_vertical(
             joint_coords, translation, fps,
-            sensitivity=getattr(args, 'foot_sensitivity', 0.5))
-        if fdf_vertical is None:
+            sensitivity=getattr(args, 'foot_sensitivity', 0.5),
+            translation_raw=translation_raw)
+        if fdf_result is None:
             print("       Feet-defined floor: no plants detected — "
                   "falling back to classic vertical")
             use_fdf = False
+        else:
+            fdf_vertical, fdf_planted = fdf_result
 
     floor_override_y = None
     if use_fdf:
@@ -774,6 +825,18 @@ def run_body(args, export_mode, face_data, face_calibration):
         floor_override_y = 0.0
     else:
         vert_translation = translation
+        if "floor_y" in npz.files and cam_t is not None:
+            # A measured floor level (two-camera merge writes one) beats
+            # the classic lowest-frame rule, which lets a single
+            # downward foot glitch define the floor and float the whole
+            # take. Convert from NPZ world Y-down to the grounding
+            # metric's series: metric = -world_ydown, plus cam_t[0].y
+            # when frame 0 was centered to the origin.
+            floor_override_y = -float(npz["floor_y"])
+            if not args.no_center:
+                floor_override_y += float(cam_t[0, 1])
+            print(f"       Floor: using measured level from NPZ "
+                  f"(two-camera), not lowest frame")
 
     body_y, hips_offset_y, animation_shift_y = _solve_vertical_motion(
         args, export_mode, joint_coords, vert_translation, rest_pos,
@@ -801,6 +864,7 @@ def run_body(args, export_mode, face_data, face_calibration):
     # we add to body_y so the BVH file ships already grounded — every
     # downstream tool (Blender, Maya, MotionBuilder, Unreal) sees the
     # corrected take. Skipped when --no-foot-lock is set.
+    per_stance_correction = None
     if foot_lock_on and not use_fdf:
         _progress(35, "Foot grounding (Pass 1)")
         per_stance_correction = compute_per_stance_correction(
@@ -899,6 +963,76 @@ def run_body(args, export_mode, face_data, face_calibration):
             head_thr_m=head_thr, root_thr_m=root_thr,
             progress_range=(45, 55))
 
+    # FDF plant reconciliation: re-level the hips so the RENDERED
+    # skeleton's planted foot sits at the floor with its captured leg
+    # pose. FDF's v placed the hips where the AI's PERCEIVED feet
+    # said; the FK skeleton's legs are a different geometry (several
+    # cm on real takes), and the footskate IK below would bridge the
+    # disagreement by bending knees — a near-straight leg turns 1 cm
+    # of reach shortfall into ~6 degrees of visible bend, which is
+    # why no amount of smoothing upstream could fix standing knees.
+    # Moving the hips WITH the FK foot per frame means the pinning
+    # has nothing left to correct on quiet stances: knee angles stay
+    # exactly as captured, and crouch/landing dynamics pass through
+    # 1:1 — during a fast crouch the planted foot stays put, so the
+    # CORRECTION is near-constant and smoothing it never touches the
+    # motion. The correction channel itself IS smoothed (short median
+    # + Gaussian): it is calibration, not motion, and its only fast
+    # content is discrete weight-foot switches and stance-edge steps,
+    # which otherwise render as visible cm-scale hips pops. Runs
+    # AFTER rotation smoothing and depth denoise so it measures what
+    # actually ships — the same lesson body grounding learned. Gap
+    # frames (jump arcs) get the correction interpolated between the
+    # surrounding plant edges, so arc shapes shift by a near-constant
+    # offset and stay intact.
+    #
+    # Target is the floor plane itself (0), not FLOOR_CLEARANCE_M:
+    # holding every plant at exactly +1 cm reads as hovering — the
+    # classic path lets plants press to the floor and slightly into
+    # it (foot meshes extend below the joints), which is what a
+    # firmly planted contact looks like.
+    if (use_fdf and fdf_planted is not None and export_mode != "template"
+            and fdf_planted.any()):
+        _progress(52, "FDF plant reconciliation")
+        from .footskate_cleanup import (_fk_world_positions_bvh,
+                                        _local_to_global_bvh)
+        name_idx = {nm: i for i, nm in enumerate(names)}
+        foot_pairs = []
+        for side in ("Left", "Right"):
+            pair = [name_idx[nm] for nm in (side + "Foot", side + "Toe")
+                    if nm in name_idx]
+            foot_pairs.append(pair)
+        if all(foot_pairs):
+            any_plant_m = fdf_planted.any(axis=1)
+            delta = np.full(n_frames, np.nan)
+            for f in range(n_frames):
+                if not any_plant_m[f]:
+                    continue
+                g = _local_to_global_bvh(parents, local_rots[f])
+                w = _fk_world_positions_bvh(parents, bvh_offsets, g,
+                                            hips_pos[f])
+                # Bottom of each PLANTED foot; weight foot = lowest.
+                cand = [w[foot_pairs[c], 1].min()
+                        for c in (0, 1) if fdf_planted[f, c]]
+                delta[f] = -min(cand)
+            # Interpolate across gaps, hold before/after the ends,
+            # smooth the correction channel (see the comment above),
+            # and clamp for safety (a genuine correction is cm-scale).
+            from scipy.ndimage import (gaussian_filter1d as _gauss1d,
+                                       median_filter as _med_filt)
+            pl_idx = np.flatnonzero(~np.isnan(delta))
+            delta = np.interp(np.arange(n_frames), pl_idx, delta[pl_idx])
+            med_w = max(3, int(round(0.2 * fps)) | 1)
+            delta = _med_filt(delta, size=med_w, mode='nearest')
+            delta = _gauss1d(delta, sigma=max(1.0, 0.08 * fps))
+            delta = np.clip(delta, -0.15, 0.15)
+            print(f"       FDF plant reconciliation: hips re-leveled "
+                  f"{delta.min()*100:+.1f}..{delta.max()*100:+.1f} cm "
+                  f"(median {np.median(delta[any_plant_m])*100:+.1f}, "
+                  f"max step {np.abs(np.diff(delta)).max()*100:.1f} "
+                  f"cm/frame) so planted FK feet touch the floor")
+            hips_pos[:, 1] += delta
+
     # Per-foot FK grounding (Pass 2): Kovar-style footskate cleanup.
     # Runs AFTER rotation smoothing so the smoother provides the "non-
     # stance" baseline; we then overwrite leg rotations during plants
@@ -930,6 +1064,65 @@ def run_body(args, export_mode, face_data, face_calibration):
             robust_floor=use_fdf,
             local_height_base=use_fdf,
             progress_range=(55, 90))
+
+    # Body grounding (--body-grounding): the LAST grounding pass, run
+    # on the FINAL FK-rendered skeleton — after rotation smoothing,
+    # depth denoise, and footskate cleanup — so it grounds exactly what
+    # ships. Earlier placements measured SAM's raw joint positions and
+    # were invalidated downstream (rotation smoothing straightens the
+    # roll's spine curl; the foot passes move the feet that define the
+    # visual floor). Its posture gate is closed for anything upright,
+    # so stances and jumps are untouched; corrections land on the Hips
+    # Y channel, moving the whole body per frame.
+    if getattr(args, 'body_grounding', False) and export_mode != "template":
+        _progress(90, "Body grounding")
+        from .footskate_cleanup import (_fk_world_positions_bvh,
+                                        _local_to_global_bvh)
+        from .body_grounding import compute_body_tilt_alignment
+
+        def _bg_fk():
+            w = np.zeros((n_frames, len(parents), 3))
+            for f in range(n_frames):
+                g = _local_to_global_bvh(parents, local_rots[f])
+                w[f] = _fk_world_positions_bvh(parents, bvh_offsets,
+                                               g, hips_pos[f])
+            return w
+
+        bg_world = _bg_fk()
+        # Support-plane tilt alignment first: a resting body whose
+        # perceived orientation is rolled/pitched (monocular depth's
+        # lying-pose failure) gets leveled by a rigid rotation about
+        # its contact centroid, so the translation pass below can
+        # seat the whole contact polygon instead of pinning the one
+        # deepest joint while everything else ramps out of the floor.
+        # Writes the Hips channels directly: at this point Hips is
+        # still the FK root (the synthetic Root is inserted after
+        # this block), so its local rotation IS its world rotation.
+        skin_r = getattr(args, 'body_skin_radius', 0.015)
+        rotvec, tilt_pivot, resting_w = compute_body_tilt_alignment(
+            bg_world, names, fps, back_radius=skin_r)
+        if np.linalg.norm(rotvec, axis=1).max() > 1e-6:
+            from scipy.spatial.transform import Rotation as _Rot
+            hips_i = names.index("Hips")
+            Rm = _Rot.from_rotvec(rotvec).as_matrix()
+            for f in range(n_frames):
+                if np.abs(rotvec[f]).max() < 1e-9:
+                    continue
+                local_rots[f, hips_i] = Rm[f] @ local_rots[f, hips_i]
+                hips_pos[f] = (tilt_pivot[f]
+                               + Rm[f] @ (hips_pos[f] - tilt_pivot[f]))
+            bg_world = _bg_fk()
+        # With Feet Define the Floor, the floor plane IS y=0 by
+        # construction (plants grounded to clearance above it) — pass
+        # it. The derive-from-feet fallback self-references on
+        # lie-heavy takes: the lying feet, capture-pressed below the
+        # floor, become the 5th percentile, and the whole resting
+        # body seats several cm under the visible floor.
+        hips_pos[:, 1] += compute_body_grounding_correction(
+            bg_world, names, fps,
+            catch_distance=getattr(args, 'body_catch_distance', 0.30),
+            back_radius=skin_r, resting_w=resting_w,
+            floor_y=0.0 if floor_override_y is not None else None)
 
     # Manual floor-level correction (--height-offset): a constant Y on
     # the Hips channel, applied AFTER Pass 1/Pass 2 grounding so the
@@ -1147,19 +1340,7 @@ def run_root(args):
     n_frames = cam_t.shape[0]
     print(f"       {n_frames} frames, {fps:.1f} FPS")
 
-    # Camera-pitch detrend (matches run_body — see comment there).
-    # SAM's pred_cam_t is in CAMERA frame, so any pitch produces a
-    # linear-in-Z bleed in cam_t.y. Subtract the regression of
-    # cam_t.y on cam_t.z so depth motion doesn't show up as
-    # apparent vertical motion.
-    z_var = float(cam_t[:, 2].var())
-    if cam_t.shape[0] >= 2 and z_var > 1e-6:
-        z_c = cam_t[:, 2] - cam_t[:, 2].mean()
-        y_c = cam_t[:, 1] - cam_t[:, 1].mean()
-        slope = float((y_c * z_c).sum() / (z_c * z_c).sum())
-        cam_t[:, 1] = cam_t[:, 1] - slope * cam_t[:, 2]
-        print(f"       Camera pitch detrend: removed "
-              f"{slope:+.4f} * cam_t.z from cam_t.y")
+    print(f"       {_detrend_camera_pitch(cam_t, npz)}")
 
     print("[2/3] Building root-only skeleton...")
     parents, bvh_offsets, names, end_site_offsets = (
@@ -1179,8 +1360,17 @@ def run_root(args):
     if args.smooth_root > 0:
         sigma = seconds_to_sigma_frames(args.smooth_root, fps)
         print(f"       Root smoothing: Gaussian sigma={sigma:.1f} frames "
-              f"({args.smooth_root:.2f} s at {fps:.1f} fps)")
-        root_pos = smooth_positions(root_pos, sigma)
+              f"({args.smooth_root:.2f} s at {fps:.1f} fps, X/Z only)")
+        # Same Y exclusion as the body path (_build_translation): in this
+        # root-only export ALL vertical motion lives in this one vector,
+        # so smoothing Y would flatten jump arcs here too.
+        root_pos = smooth_positions(root_pos, sigma, skip_axes=(1,))
+
+    if args.smooth_vertical > 0:
+        vsigma = seconds_to_sigma_frames(args.smooth_vertical, fps)
+        print(f"       Vertical smoothing: Gaussian sigma={vsigma:.1f} frames "
+              f"({args.smooth_vertical:.2f} s at {fps:.1f} fps, Y only)")
+        root_pos = smooth_positions(root_pos, vsigma, skip_axes=(0, 2))
 
     local_rots = np.tile(np.eye(3), (n_frames, 1, 1, 1))
 

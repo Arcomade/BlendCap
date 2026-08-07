@@ -8,5 +8,6 @@ __pycache__/
 *.pyc
 install_marker.json
 install.log
+*.blend1
 .DS_Store
 Thumbs.db
