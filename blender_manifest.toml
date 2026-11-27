@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 # Unique add-on id (lowercase). Becomes the module name bl_ext.<repo>.blendcap.
 id = "blendcap"
-version = "1.1.0"
+version = "1.1.1"
 name = "BlendCap"
 tagline = "Markerless video-to-BVH performance capture"
 maintainer = "Arcomade <arcomade@users.noreply.github.com>"
