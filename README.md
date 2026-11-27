@@ -74,12 +74,11 @@ BlendCap reconstructs a full **performance**, body, hands, and face, from an ord
 <table>
   <tr><th colspan="2" align="center">Multi-camera &amp; multi-person capture</th></tr>
   <tr>
-    <td align="center"><img src="assets/sh-19-fight-footage.webp" width="380"></td>
-    <td align="center"><img src="assets/sh-20-fight-render.webp" width="380"></td>
+    <td colspan="2" align="center"><img src="assets/sh-19-fight.webp" width="786"></td>
   </tr>
   <tr>
-    <td align="center">Four cameras, two performers tracked</td>
-    <td align="center">The same take, on two characters</td>
+    <td align="center" width="50%">Four cameras, two performers tracked</td>
+    <td align="center" width="50%">The same take, on two characters</td>
   </tr>
 </table>
 
