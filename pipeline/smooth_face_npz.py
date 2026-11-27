@@ -24,7 +24,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.face_export import load_face_data
-from pipeline.bvh_math import smooth_face_data
+from pipeline.bvh_math import smooth_face_data, ease_face_dropouts
 
 
 def main():
@@ -65,6 +65,8 @@ def main():
     if args.smooth_face > 0:
         print("[PROGRESS 70] smoothing", flush=True)
         smooth_face_data(face_data, window_s=float(args.smooth_face))
+    # Dropouts fade in and out, exactly like the BVH export path.
+    ease_face_dropouts(face_data)
     print("[PROGRESS 85] writing", flush=True)
 
     # Round-trip the original NPZ so unused keys (face_bbox,

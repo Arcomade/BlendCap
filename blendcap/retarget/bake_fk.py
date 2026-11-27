@@ -58,13 +58,42 @@ from .bake_fk_common import _compute_scale_ratio, _compute_pair_rest_invariants
 USE_FAST_ENGINE = True
 
 
-def _compute_rig_height(rig):
-    """Vertical extent (world Z) of a rig measured across all pose-bone
-    head positions. Used for auto-scale. 0 if the rig has no bones."""
-    if not rig or rig.type != 'ARMATURE' or not rig.pose.bones:
+def _compute_rig_height(rig, only=None):
+    """Vertical extent (world Z) of a rig measured across all REST-pose
+    bone heads (data bones). Used for auto-scale. 0 if the rig has no
+    bones.
+
+    REST, not pose, deliberately: the bake sets the scene to the clip's
+    first frame before measuring, so a pose-bone measurement reads the
+    source at whatever pose the animation opens with - a clip that
+    starts crouched measured short and OVERSIZED the scale ratio,
+    inflating every translation delta (worst visible as deep-squat
+    sinking). The target was polluted the same way by a previous bake
+    left on it or by the user's manual rest-matching pose. Data-bone
+    heads are immune to all of it; matrix_world still folds in object
+    scale/rotation (Mixamo's 0.01-scale -90-degree import measures
+    correctly).
+
+    `only` (optional): restrict the measurement to these bone names.
+    The auto-scale caller passes each side's MAPPED bone set, so the
+    measurement scopes itself to what the retarget actually touches: a
+    face-only map compares face-region extents (ratio near 1) instead
+    of a face-sized source armature against a full-height target -
+    which used to blow the source up by the height ratio. Names absent
+    from the rig are skipped; an empty/None `only`, or one that
+    resolves to fewer than two bones, measures the whole rig (the
+    caller treats a degenerate mapped extent the same way)."""
+    if not rig or rig.type != 'ARMATURE' or not rig.data.bones:
         return 0.0
     mw = rig.matrix_world
-    zs = [(mw @ pb.head).z for pb in rig.pose.bones]
+    bones = rig.data.bones
+    if only:
+        picked = [bones[n] for n in only if n in bones]
+        if len(picked) < 2:
+            picked = list(bones)
+    else:
+        picked = list(bones)
+    zs = [(mw @ b.head_local).z for b in picked]
     if not zs:
         return 0.0
     return max(zs) - min(zs)

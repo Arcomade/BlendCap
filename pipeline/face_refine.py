@@ -695,7 +695,7 @@ def apply_face_refine(face_data, mode=None, neutral_frame=-1,
     bs_idx = face_data["bs_name_to_idx"]
 
     if not detected.any():
-        print("       Face refine: no detected frames — skipped")
+        print("       Face refine: no detected frames - skipped")
         report["skipped"] = "no detected frames"
         return report
 
@@ -710,7 +710,7 @@ def apply_face_refine(face_data, mode=None, neutral_frame=-1,
                                       mp_blendshape_sum=mp_sum,
                                       neutral_frame=neutral_frame)
     except ValueError as e:
-        print(f"       Face refine: stabilization failed ({e}) — skipped")
+        print(f"       Face refine: stabilization failed ({e}) - skipped")
         report["skipped"] = str(e)
         return report
     stab, template = st["stab"], st["template"]
@@ -749,7 +749,7 @@ def apply_face_refine(face_data, mode=None, neutral_frame=-1,
     report["gate"] = gate_info
     if gate is None:
         print(f"       Face refine: pixel gate unavailable "
-              f"({gate_info.get('reason', '?')}) — landmarks only")
+              f"({gate_info.get('reason', '?')}) - landmarks only")
 
     # tongueOut is computed BEFORE the jaw composition because it must
     # exempt the teeth/cavity gate: a protruding tongue FILLS the mouth
@@ -773,7 +773,7 @@ def apply_face_refine(face_data, mode=None, neutral_frame=-1,
         from pipeline import face_solver
         basis = face_solver.load_basis()
         if basis is None:
-            print("       Face refine: ict_face_basis.npz missing — "
+            print("       Face refine: ict_face_basis.npz missing - "
                   "falling back to geometric mode")
             report["solver"] = "basis missing"
         else:

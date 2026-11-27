@@ -2,10 +2,13 @@
 and face-region classification with amplitude / denoise resolvers.
 
 Shipped presets live in {addon_dir}/retarget_maps/ and ship with the
-addon. User-saved presets save alongside the shipped ones now; the
-{user_resource('CONFIG')}/blendcap/retarget_maps/ folder is still READ
-so legacy custom maps saved there before the change continue to show
-up in the dropdown.
+addon. User-saved presets save into the extension user folder
+(helpers.presets_root), which survives addon updates - they briefly
+saved alongside the shipped ones, and an update would have wiped them
+with the rest of the addon folder. Two legacy locations are still READ
+so nothing already saved disappears from the dropdown: the addon's own
+retarget_maps/ (migrated out of at register) and the even older
+{user_resource('CONFIG')}/blendcap/retarget_maps/.
 
 The face-region helpers (`_face_region_from_source`, `_resolve_loc_scale`,
 `_resolve_denoise`) live here too — they read scene properties whose
@@ -49,6 +52,7 @@ SHIPPED_PRESET_FILENAMES = frozenset({
     # animated Mixamo skeleton onto a different rig. Body+hands only
     # (Mixamo capture carries no face data, so no Rigify-old variant
     # is needed).
+    "mixamo_to_mixamo.json",
     "mixamo_to_mixamo_ctrl.json",
     "mixamo_to_arp.json",
     "mixamo_to_rigify.json",
@@ -184,16 +188,24 @@ def _retarget_maps_dir_shipped():
     return os.path.join(_addon_dir(), "retarget_maps")
 
 def _retarget_maps_dir_user():
-    try:
-        base = bpy.utils.user_resource('CONFIG')
-    except Exception:
-        base = os.path.join(os.path.expanduser("~"), ".config")
-    d = os.path.join(base, "blendcap", "retarget_maps")
+    """Where custom maps SAVE: the extension user folder, which
+    survives addon updates."""
+    from ..helpers import presets_root
+    d = os.path.join(presets_root(), "retarget_maps")
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
         pass
     return d
+
+
+def _retarget_maps_dir_legacy_config():
+    """The oldest save location (Blender CONFIG dir). READ-ONLY."""
+    try:
+        base = bpy.utils.user_resource('CONFIG')
+    except Exception:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "blendcap", "retarget_maps")
 
 def _list_presets_in(directory, kind_label):
     """Return [(file_path, display_name, tooltip)] for every .json under
@@ -236,7 +248,8 @@ def _save_retarget_map(path, name, map_hint, namespace_strip,
                         face_amp_global=None,
                         use_world_location=None,
                         custom_ik_sources=None,
-                        source_prefix=""):
+                        source_prefix="",
+                        mute_conflicts=None):
     """`map_hint` is the preset's target_kind string (e.g. "rigify_control",
     "generic", or empty). `auto_bake_ik` mirrors the "Auto-bake IK on Apply"
     checkbox; `ik_chains_collection` is the FK->IK Mapping collection
@@ -272,6 +285,14 @@ def _save_retarget_map(path, name, map_hint, namespace_strip,
     map preset schema. Old presets that carry them are tolerated on
     load (ignored), but new saves never emit them.
 
+    `mute_conflicts` is the state of Advanced > "Mute Limits and Drivers"
+    and "Include Unmapped Bones" on the target rig when the preset is
+    saved, as {'on', 'unmapped'} (rig_conflicts.preset_state), or None
+    when there is no target rig to read it from. Written under the key
+    of the same name only when given: a preset WITHOUT the key (every
+    bundled one, and every preset saved before 1.1.0) leaves the rig's
+    checkboxes alone on load, which is how all presets behaved before.
+
     Pair source/target names persist as already stored on the pair
     collection — which, after the smart-strip update callbacks (and
     legacy-strip on load), is the SHORT form. The prefixes above carry
@@ -292,6 +313,12 @@ def _save_retarget_map(path, name, map_hint, namespace_strip,
         data["face_head_target"] = face_head_target
     if face_capture_compensation is not None:
         data["face_capture_compensation"] = bool(face_capture_compensation)
+    if isinstance(mute_conflicts, dict):
+        _on = bool(mute_conflicts.get("on", False))
+        data["mute_conflicts"] = {
+            "on": _on,
+            "unmapped": _on and bool(mute_conflicts.get("unmapped", False)),
+        }
     # face_amplification + face_amp_global share one JSON block. Global
     # rides under the reserved key "global"; per-region keys come from
     # FACE_AMPLIFICATION_REGIONS. Emit the block whenever EITHER source

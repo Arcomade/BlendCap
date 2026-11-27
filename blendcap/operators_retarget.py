@@ -23,7 +23,19 @@ from .helpers import get_3d_override
 # retarget is single-instance — there's no second bake to disambiguate.
 _BAKE_RUNNING = False
 _BAKE_CANCEL_REQUESTED = False
-from .helpers import retarget_progress_state, format_workspace_status
+
+# "Use current source pose as rest": the pose sampled by the last Apply
+# ({'src': rig name, 'data': {bone: armature-space matrix}}). The bake
+# ends with a frame_set, which replaces the user's hand-set pose with the
+# clip's first frame, so a retarget started again by the rig conflict
+# pop-up ("Mute and Retarget Again") would sample THAT as the rest pose.
+# The pop-up sets REUSE_SOURCE_REST_ONCE and the next Apply takes the
+# stored pose instead of sampling (found live 2026-11-15). An Apply the
+# user clicks samples the live pose as always.
+_LAST_SOURCE_REST = None
+REUSE_SOURCE_REST_ONCE = False
+from .helpers import (retarget_progress_state, format_workspace_status,
+                      _filename_error)
 from .retarget import (
     SHIPPED_PRESET_FILENAMES,
     _sanitize_preset_filename,
@@ -32,6 +44,8 @@ from .retarget import (
     _save_retarget_map,
     _populate_pairs_from_map,
     _auto_match_pairs,
+    _auto_match_pairs_spatial,
+    _iter_action_fcurves,
     _ordered_bones_for_add_all,
     _resolve_against_rig,
     _resolve_pair_names_for_bake,
@@ -128,6 +142,102 @@ def _force_cloudrig_fk(rig):
     return changed
 
 
+# ------------------------------------------------------------
+# IK/FK switch bookkeeping (support item 22)
+# ------------------------------------------------------------
+# Apply forces every switch to FK for the bake and used to leave it
+# there. Now: Apply snapshots the switches first; when auto-bake IK
+# is on, the FK->IK convert restores that snapshot after a successful
+# bake (the rig ends up in whatever mode it started in). A manual
+# Convert FK->IK instead sets the baked chains to IK (operators_ik).
+# Set-only, never keyed, same rule as the FK flip itself.
+
+_FK_SWITCH_KEYS = ("IK_FK", "ik_fk_switch")
+_CLOUDRIG_NON_SWITCH = ('ik_stretch', 'ik_parents', 'ik_pole_follow',
+                        'ik_hinge')
+
+
+def _is_cloudrig(rig):
+    try:
+        return ('cloudrig' in rig.keys() or 'cloudrig' in rig.data.keys())
+    except Exception:
+        return False
+
+
+def snapshot_ik_switches(rig):
+    """{(bone name, key): value} for every IK/FK switch the FK flip can
+    touch: Rigify IK_FK, ARP ik_fk_switch, and CloudRig ik_* switches
+    (gated on the CloudRig marker, same filter as _force_cloudrig_fk)."""
+    snap = {}
+    if rig is None or getattr(rig, 'type', None) != 'ARMATURE':
+        return snap
+    cloud = _is_cloudrig(rig)
+    for pb in rig.pose.bones:
+        try:
+            keys = list(pb.keys())
+        except Exception:
+            continue
+        for key in keys:
+            if key in _FK_SWITCH_KEYS or (
+                    cloud and key.startswith('ik_')
+                    and not key.startswith(_CLOUDRIG_NON_SWITCH)):
+                try:
+                    value = pb[key]
+                except Exception:
+                    continue
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    snap[(pb.name, key)] = value
+                elif isinstance(value, bool):
+                    snap[(pb.name, key)] = value
+    return snap
+
+
+def restore_ik_switches(rig, snap):
+    """Put snapshotted switch values back. Returns the number changed."""
+    if rig is None or not snap:
+        return 0
+    pbs = rig.pose.bones
+    changed = 0
+    for (name, key), value in snap.items():
+        pb = pbs.get(name)
+        if pb is None or key not in pb.keys():
+            continue
+        try:
+            if pb[key] != value:
+                pb[key] = type(pb[key])(value)
+                changed += 1
+        except Exception:
+            pass
+    if changed:
+        try:
+            rig.update_tag()
+        except Exception:
+            pass
+    return changed
+
+
+# Handoff from Apply (auto-bake IK on) to the FK->IK convert it fires:
+# the snapshot taken BEFORE Apply's FK flip, to be restored once the IK
+# bake succeeds. Consumed (and cleared) by operators_ik at prepare.
+_PENDING_SWITCH_RESTORE = {'rig': None, 'snap': None}
+
+
+def set_pending_switch_restore(rig, snap):
+    _PENDING_SWITCH_RESTORE['rig'] = rig.name if rig is not None else None
+    _PENDING_SWITCH_RESTORE['snap'] = dict(snap) if snap else None
+
+
+def take_pending_switch_restore(rig):
+    """Return the pending snapshot for `rig` (and clear it), else None."""
+    name = _PENDING_SWITCH_RESTORE['rig']
+    snap = _PENDING_SWITCH_RESTORE['snap']
+    _PENDING_SWITCH_RESTORE['rig'] = None
+    _PENDING_SWITCH_RESTORE['snap'] = None
+    if rig is not None and name == rig.name and snap:
+        return snap
+    return None
+
+
 # ============================================================
 # RETARGET OPERATORS
 # ============================================================
@@ -186,7 +296,7 @@ class BLENDCAP_OT_retarget_save_preset(bpy.types.Operator):
         filename = _sanitize_preset_filename(self.map_name)
         if not filename:
             return "", "", None
-        path = os.path.join(_retarget_maps_dir_shipped(), filename)
+        path = os.path.join(_retarget_maps_dir_user(), filename)
         if filename in SHIPPED_PRESET_FILENAMES:
             return filename, path, 'shipped'
         if os.path.exists(path):
@@ -195,8 +305,8 @@ class BLENDCAP_OT_retarget_save_preset(bpy.types.Operator):
 
     def invoke(self, context, event):
         # Show a small props dialog with just the name field. No file
-        # picker — saves auto-route to the shipped maps folder so user
-        # presets sit next to the standard ones.
+        # picker — saves auto-route to the user presets folder
+        # (extension user dir, survives addon updates).
         # Pre-fill the name with the loaded preset (so Save = Overwrite
         # in the common edit-then-save workflow) or "<target rig> Map"
         # when nothing is loaded. See _default_name.
@@ -210,21 +320,33 @@ class BLENDCAP_OT_retarget_save_preset(bpy.types.Operator):
 
     def draw(self, context):
         layout = self.layout
-        _, _, kind = self._resolved()
+        filename, _, kind = self._resolved()
+        # Sanitizing already swaps forbidden characters for '_', so
+        # only Windows-reserved device names ("con", "nul", ...) can
+        # still make an unusable file name here.
+        err = _filename_error(filename) if filename else None
         row = layout.row()
-        row.alert = kind is not None
+        row.alert = kind is not None or err is not None
         row.prop(self, "map_name")
         if kind == 'shipped':
             warn = layout.row()
             warn.alert = True
             warn.label(text="Can't overwrite Standard presets.",
                        icon='ERROR')
+        elif err:
+            warn = layout.row()
+            warn.alert = True
+            warn.label(text=err, icon='ERROR')
 
     def execute(self, context):
         scene = context.scene
         filename, path, kind = self._resolved()
         if not filename:
             self.report({'ERROR'}, "Preset name is required")
+            return {'CANCELLED'}
+        err = _filename_error(filename)
+        if err:
+            self.report({'ERROR'}, err)
             return {'CANCELLED'}
 
         # Refuse to overwrite shipped presets. SHIPPED_PRESET_FILENAMES
@@ -244,11 +366,12 @@ class BLENDCAP_OT_retarget_save_preset(bpy.types.Operator):
                 'INVOKE_DEFAULT', map_name=self.map_name)
             return {'FINISHED'}
 
-        # Custom maps save into the running addon's retarget_maps/ folder
-        # (alongside the shipped presets), via the `path` returned by
-        # _resolved(). The combined preset dropdown reads both this folder
-        # and Blender's user config dir, so customs saved by either path
-        # appear in the list.
+        # Custom maps save into the extension user folder (survives
+        # addon updates), via the `path` returned by _resolved(). The
+        # combined preset dropdown also reads the two legacy locations
+        # (the addon's retarget_maps/ and Blender's user config dir),
+        # so customs saved by any past version appear in the list.
+        from . import rig_conflicts
         try:
             _save_retarget_map(
                 path, self.map_name or "Unnamed",
@@ -260,6 +383,11 @@ class BLENDCAP_OT_retarget_save_preset(bpy.types.Operator):
                 face_head_source=scene.blendcap_retarget_face_head_source,
                 face_head_target=scene.blendcap_retarget_face_head_target,
                 source_prefix=scene.blendcap_retarget_source_prefix,
+                # Mute Limits and Drivers / Include Unmapped Bones, as
+                # they stand on the target rig (None with no target rig:
+                # the preset then says nothing about them).
+                mute_conflicts=rig_conflicts.preset_state(
+                    scene.blendcap_retarget_target),
                 face_capture_compensation=scene.blendcap_face_capture_compensation,
                 face_amplification={
                     r: getattr(scene, f"blendcap_face_amp_{r}")
@@ -289,6 +417,16 @@ class BLENDCAP_OT_retarget_save_preset(bpy.types.Operator):
         retarget._LOADING_PRESET = True
         try:
             scene.blendcap_retarget_preset = path
+        except TypeError:
+            # The file was written but the dropdown doesn't list that
+            # path (a same-named preset elsewhere won the dedupe, or
+            # the list hasn't caught up). Never a failure of the save.
+            self.report({'WARNING'},
+                        f"Saved map to {path}, but the dropdown lists "
+                        f"another preset with the same filename; rename "
+                        f"or remove the other copy.")
+            scene.blendcap_retarget_last_loaded_preset = path
+            return {'FINISHED'}
         finally:
             retarget._LOADING_PRESET = False
         scene.blendcap_retarget_last_loaded_preset = path
@@ -342,7 +480,7 @@ class BLENDCAP_OT_retarget_reload_preset(bpy.types.Operator):
         # __HDR_*__, __EMPTY_*__) all start with "__".
         if not sel or sel.startswith('__') or not os.path.isfile(sel):
             self.report({'WARNING'},
-                        "No preset selected — pick one from the dropdown first")
+                        "No preset selected - pick one from the dropdown first")
             return {'CANCELLED'}
         try:
             with open(sel, 'r', encoding='utf-8') as f:
@@ -428,11 +566,72 @@ class BLENDCAP_OT_retarget_delete_preset(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _source_channel_map(src_rig):
+    """{real bone name: 'LOC'|'ROT'|'LOC_ROT'} read from the source
+    rig's action — which bones ACTUALLY translate / rotate in the
+    loaded clip. Auto-Match uses it to set each new pair's channels
+    from the data instead of a blanket ROT (which dropped the hips'
+    locomotion). Only curves whose keyed values vary count: BVH-style
+    exports write flat location curves for every bone, and a constant
+    curve carries no motion worth a LOC channel. Empty when the source
+    has no action (pairs then default to ROT)."""
+    ad = getattr(src_rig, 'animation_data', None)
+    act = getattr(ad, 'action', None) if ad else None
+    if act is None:
+        return {}
+    loc_moving, rot_moving = set(), set()
+    # _iter_action_fcurves, not act.fcurves: Blender 5.x actions are
+    # slotted and the legacy .fcurves accessor is gone.
+    for fc in _iter_action_fcurves(act):
+        dp = fc.data_path
+        if not dp.startswith('pose.bones["'):
+            continue
+        end = dp.find('"]', 12)
+        if end < 0:
+            continue
+        bone = dp[12:end]
+        prop = dp.rsplit('.', 1)[-1]
+        if prop == 'location':
+            kind = loc_moving
+        elif prop in ('rotation_quaternion', 'rotation_euler',
+                      'rotation_axis_angle'):
+            kind = rot_moving
+        else:
+            continue
+        if bone in kind:
+            continue
+        kps = fc.keyframe_points
+        n = len(kps)
+        if n == 0:
+            continue
+        try:
+            import numpy as np
+            arr = np.empty(n * 2, dtype=np.float64)
+            kps.foreach_get('co', arr)
+            ys = arr[1::2]
+            span = float(ys.max() - ys.min())
+        except Exception:
+            ys = [kp.co[1] for kp in kps]
+            span = max(ys) - min(ys)
+        if span > 1e-6:
+            kind.add(bone)
+    out = {}
+    for b in loc_moving | rot_moving:
+        if b in loc_moving and b in rot_moving:
+            out[b] = 'LOC_ROT'
+        elif b in loc_moving:
+            out[b] = 'LOC'
+        else:
+            out[b] = 'ROT'
+    return out
+
+
 class BLENDCAP_OT_retarget_auto_match(bpy.types.Operator):
     bl_idname = "blendcap.retarget_auto_match"
-    bl_label = "Auto-Match Names"
-    bl_description = ("Automatically fill Source/Target pairs wherever "
-                      "matching names are found.")
+    bl_label = "Auto-Match"
+    bl_description = ("Automatically fill Source/Target pairs: matching "
+                      "names first, then matching rest-pose bone "
+                      "positions for the bones names couldn't pair.")
     bl_options = {'REGISTER', 'UNDO'}
 
     replace: bpy.props.BoolProperty(name="Replace existing", default=False)
@@ -466,6 +665,24 @@ class BLENDCAP_OT_retarget_auto_match(bpy.types.Operator):
             src_strip = scene.blendcap_retarget_source_prefix or ""
             tgt_strip = scene.blendcap_retarget_namespace_strip or ""
             suggested = dict(_auto_match_pairs(src, tgt, src_strip, tgt_strip))
+            by_name = set(suggested)
+
+            # Location pass for everything names couldn't pair (across
+            # naming conventions that is most bones). Name matches and
+            # targets already claimed — by the name pass or by complete
+            # rows in the table — sit this pass out, so a positional
+            # guess can never steal a bone from a confident match.
+            # Rows with an empty target keep their source eligible: a
+            # location suggestion may fill them in pass 1 below.
+            used_src = by_name | {p.source for p in pairs
+                                  if p.source and p.target}
+            used_tgt = (set(suggested.values())
+                        | {p.target for p in pairs if p.target})
+            for s, t in _auto_match_pairs_spatial(
+                    src, tgt, src_strip, tgt_strip,
+                    used_sources=used_src, used_targets=used_tgt,
+                    verbose=True):
+                suggested.setdefault(s, t)
 
             # Pass 1: fill empty target fields on existing pairs.
             filled = 0
@@ -474,24 +691,36 @@ class BLENDCAP_OT_retarget_auto_match(bpy.types.Operator):
                     p.target = suggested[p.source]
                     filled += 1
 
-            # Pass 2: append pairs for source bones not yet represented at all.
+            # Pass 2: append pairs for source bones not yet represented
+            # at all. Channels come from what each source bone actually
+            # does in the loaded clip (see _source_channel_map) — a
+            # translating hips gets LOC_ROT so locomotion transfers
+            # (and gives auto-scale its pelvis LOC pair); everything
+            # else typically stays ROT. No action loaded -> all ROT.
+            ch_map = _source_channel_map(src)
             sources_present = {p.source for p in pairs}
-            appended = 0
+            appended = n_loc = 0
             for s, t in suggested.items():
                 if s in sources_present:
                     continue
                 p = pairs.add()
                 p.source = s
                 p.target = t
-                p.channels = 'ROT'
+                p.channels = ch_map.get(
+                    s, ch_map.get(src_strip + s, 'ROT'))
                 p.influence = 1.0
                 appended += 1
+                if s not in by_name:
+                    n_loc += 1
         finally:
             _props._BULK_EDITING = False
 
         msg_parts = []
         if filled:   msg_parts.append(f"filled {filled} empty target(s)")
-        if appended: msg_parts.append(f"added {appended} new pair(s)")
+        if appended:
+            detail = (f" ({appended - n_loc} by name, {n_loc} by location)"
+                      if n_loc else "")
+            msg_parts.append(f"added {appended} new pair(s){detail}")
         self.report({'INFO'}, "Auto-match: " + (", ".join(msg_parts) or "no matches found"))
         return {'FINISHED'}
 
@@ -667,6 +896,138 @@ class BLENDCAP_OT_retarget_sort_pairs(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Object-transform neutralisation for the bake (support items 13 + 15).
+#
+# The engines fold each rig's object matrix into their world-space rest
+# math, and the leg-anchor compensation / IK lookups / LOC pairs read
+# world positions of both rigs. So a target that is moved, rotated or
+# scaled in Object Mode retargets differently from the same rig at the
+# origin. The bake only ever writes pose-bone channels, which live in
+# the rig's own space, so the fix is to run the bake with the target's
+# PLACEMENT (location + facing) factored out and put the object
+# transform back afterwards: the character keeps its placement and
+# performs the motion there. Nothing is applied; the user's file is
+# untouched.
+#
+# What is deliberately NOT factored out: the part of the object rotation
+# that tilts the rig relative to world Z. A raw Mixamo FBX has Y-up rest
+# bones and a 90 deg X rotation on the armature object that stands it
+# up; the engine needs that rotation in the bake (see _strip_yaw).
+#
+# The source gets the same treatment (its placement shouldn't matter
+# either), and its scale is kept RELATIVE to the target's
+# (src_scale / tgt_scale) so world sizes still compare the way they
+# did - a Mixamo source at 0.01 next to a Mixamo target at 0.01 stays
+# 1:1, and auto-scale multiplies on top exactly as before.
+# ---------------------------------------------------------------------------
+
+_OBJECT_TRANSFORM_PATHS = frozenset((
+    'location', 'rotation_euler', 'rotation_quaternion',
+    'rotation_axis_angle', 'scale', 'delta_location',
+    'delta_rotation_euler', 'delta_rotation_quaternion', 'delta_scale',
+))
+
+
+def _object_transform_snapshot(obj):
+    return {
+        'location': obj.location.copy(),
+        'rotation_mode': obj.rotation_mode,
+        'rotation_euler': obj.rotation_euler.copy(),
+        'rotation_quaternion': obj.rotation_quaternion.copy(),
+        'rotation_axis_angle': tuple(obj.rotation_axis_angle),
+        'scale': obj.scale.copy(),
+    }
+
+
+def _restore_object_transform(obj, snap):
+    obj.rotation_mode = snap['rotation_mode']
+    obj.rotation_euler = snap['rotation_euler']
+    obj.rotation_quaternion = snap['rotation_quaternion']
+    obj.rotation_axis_angle = snap['rotation_axis_angle']
+    obj.location = snap['location']
+    obj.scale = snap['scale']
+
+
+def _object_level_animation(obj):
+    """Return the first object in `obj`'s parent chain (starting with
+    `obj` itself) that has keyframes on the object transform, else None.
+
+    Pose-bone keys live on the same action as object keys, so the check
+    is per f-curve data_path, not "has an action". NLA strips count too:
+    a frame_set during the IK bake would replay them over the temporary
+    identity transform."""
+    from .retarget.fcurves import _iter_action_fcurves
+
+    def _has_object_keys(action):
+        if action is None:
+            return False
+        try:
+            for fc in _iter_action_fcurves(action):
+                if fc.data_path in _OBJECT_TRANSFORM_PATHS:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    o = obj
+    while o is not None:
+        ad = getattr(o, 'animation_data', None)
+        if ad is not None:
+            if _has_object_keys(ad.action):
+                return o
+            for track in getattr(ad, 'nla_tracks', ()) or ():
+                if track.mute:
+                    continue
+                for strip in track.strips:
+                    if _has_object_keys(getattr(strip, 'action', None)):
+                        return o
+        o = o.parent
+    return None
+
+
+def _strip_yaw(mw):
+    """Rotation of `mw` with its twist about world Z removed. Returns a
+    Quaternion: the 'swing' part, i.e. whatever tilts the rig away from
+    the world Z axis (a Mixamo import's 90 deg X stand-up rotation
+    survives; a character turned to face the camera loses the turn).
+
+    Twist/swing split: q = twist @ swing with twist = the component of
+    q about Z. Composition order puts the twist LAST in world, which
+    is what "the user turned the rig after everything else" means."""
+    from mathutils import Quaternion
+    q = mw.to_quaternion()
+    twist = Quaternion((q.w, 0.0, 0.0, q.z))
+    if twist.magnitude < 1e-9:
+        # 180 deg swing straight through the pole - no defined yaw.
+        return q
+    twist.normalize()
+    return twist.inverted() @ q
+
+
+def _matrix_close(a, b, tol):
+    for i in range(4):
+        for j in range(4):
+            if abs(a[i][j] - b[i][j]) > tol:
+                return False
+    return True
+
+
+def _describe_object_transform(obj):
+    """'location, rotation, scale' style summary of what's non-identity
+    on the object, for the console note. Empty string when clean."""
+    mw = obj.matrix_world
+    loc, rot, scale = mw.decompose()
+    parts = []
+    if loc.length > 1e-6:
+        parts.append("location")
+    if abs(rot.angle) > 1e-6:
+        parts.append("rotation")
+    if any(abs(s - 1.0) > 1e-6 for s in scale):
+        parts.append("scale")
+    return ", ".join(parts)
+
+
 class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
     """Apply the current bone-mapping table from source rig to target rig.
 
@@ -738,6 +1099,14 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
     # restore the SHORT stored form in _finalize. See
     # retarget._resolve_pair_names_for_bake.
     _pair_name_snapshot = None
+    # [(obj, transform snapshot)] for src + tgt, taken BEFORE the bake
+    # sets both object transforms aside. Restored in _finalize on every
+    # exit path. See the module comment above _object_transform_snapshot.
+    _xform_snapshot = None
+    # IK/FK switch values BEFORE the FK flip (snapshot_ik_switches);
+    # handed to the auto-bake convert. Not restored here: with auto-bake
+    # off the rig stays in FK, which is what the FK keys need.
+    _switch_snapshot = None
 
     # Frames advanced per timer tick. Higher = faster bake but coarser
     # responsiveness. 4 keeps UI snappy on a ~60-frame clip while still
@@ -765,8 +1134,16 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
             self._finalize(context)
             self.report({'ERROR'}, f"Retargeting failed: {e}")
             return {'CANCELLED'}
+        tgt = self._tgt
         self._finalize(context)
         self.report({'INFO'}, "Retargeting complete")
+        # Script / synchronous call: work out what limits and drivers did
+        # (console + rig_conflicts.LAST_FINDINGS) but open no dialog.
+        try:
+            from . import rig_conflicts
+            rig_conflicts.after_bake(self, tgt, context.scene, show=False)
+        except Exception as e:
+            print(f"[BlendCap] rig limits check skipped: {e}")
         return {'FINISHED'}
 
     def invoke(self, context, event):
@@ -780,6 +1157,16 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
             self.report({'ERROR'}, err)
             self._finalize(context)
             return {'CANCELLED'}
+        # Mark the job as running NOW, not on the first modal tick: the
+        # update notice fires 0.2 s after the click that started this,
+        # and checks for a running job then. With the flag set only in
+        # modal(), a slow _prepare let the notice land on top of a
+        # retarget (seen live 2026-11-05).
+        retarget_progress_state.update({
+            'running': True, 'phase': "Retargeting", 'progress': 0.0,
+            'status_text': "Starting…", 'frames_done': 0,
+            'frames_total': getattr(self, '_frames_total', 0) or 0,
+        })
         wm = context.window_manager
         self._wm = wm
         self._timer = wm.event_timer_add(0.03, window=context.window)
@@ -809,8 +1196,19 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
                 if yielded is not None:
                     self._frames_done += 1
         except StopIteration:
+            tgt_done = self._tgt
             self._finalize(context)
             self.report({'INFO'}, "Retargeting complete")
+            # Rotation limits that changed the motion / drivers on keyed
+            # channels (support item 14). With auto-bake IK the dialog
+            # waits until that has finished too.
+            auto_ik = bool(context.scene.blendcap_retarget_auto_bake_ik)
+            from . import rig_conflicts
+            try:
+                rig_conflicts.after_bake(self, tgt_done, context.scene,
+                                         defer=auto_ik)
+            except Exception as e:
+                print(f"[BlendCap] rig limits check skipped: {e}")
             # Auto-bake IK on apply: opt-in via panel checkbox or
             # preset. Fires AFTER _finalize so the user's mode/active/
             # selection have been restored and any intermediate rig
@@ -820,16 +1218,28 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
             # still land cleanly even if FK->IK has a configuration
             # issue (missing IK control mapping, etc.).
             if context.scene.blendcap_retarget_auto_bake_ik:
+                # Hand the pre-flip switch snapshot to the convert: it
+                # restores the rig's original IK/FK mode after a
+                # successful IK bake, and drops it on cancel/failure
+                # (FK keys are then the only valid ones).
+                set_pending_switch_restore(self._tgt,
+                                           self._switch_snapshot)
                 try:
                     # INVOKE_DEFAULT so the FK->IK conversion runs as
                     # a modal too — preserves UI responsiveness, the
                     # progress bar, and the ESC/Cancel button while
                     # auto-bake is mid-flight. (EXEC_DEFAULT used to
                     # block the UI here.)
-                    bpy.ops.blendcap.convert_fk_to_ik('INVOKE_DEFAULT')
+                    res = bpy.ops.blendcap.convert_fk_to_ik('INVOKE_DEFAULT')
+                    if 'RUNNING_MODAL' not in res:
+                        # Finished or refused on the spot: nothing left
+                        # to wait for.
+                        rig_conflicts.show_pending()
                 except Exception as e:
+                    take_pending_switch_restore(self._tgt)
                     self.report({'WARNING'},
                                 f"Auto-bake IK skipped: {e}")
+                    rig_conflicts.show_pending()
             return {'FINISHED'}
         except Exception as e:
             self.report({'ERROR'}, f"Retargeting failed: {e}")
@@ -873,6 +1283,97 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
 
     # ----- internals -----
 
+    def _restore_object_transforms(self):
+        """Undo auto-scale's source scale, then put both rigs' object
+        transforms back exactly as the user had them. Idempotent: the
+        snapshot and the saved scale are cleared once used, so the
+        early call in _prepare and the safety call in _finalize don't
+        double-apply."""
+        if self._src is not None and self._src_orig_scale is not None:
+            try:
+                self._src.scale = self._src_orig_scale
+            except Exception:
+                pass
+            self._src_orig_scale = None
+        if self._xform_snapshot:
+            for o, snap in self._xform_snapshot:
+                try:
+                    _restore_object_transform(o, snap)
+                except Exception:
+                    pass
+            self._xform_snapshot = None
+
+    def _neutralize_object_transforms(self, context, src, tgt):
+        """Snapshot both rigs' object transforms, then run the bake with
+        the target at identity and the source at the origin with no
+        rotation and scale = src_scale / tgt_scale. Returns a user-facing
+        error string when that can't be done safely, else None. The
+        snapshot is taken first so _finalize restores even on error."""
+        from mathutils import Matrix, Vector
+
+        self._xform_snapshot = [
+            (o, _object_transform_snapshot(o)) for o in (src, tgt)
+        ]
+
+        for label, o in (("Source", src), ("Target", tgt)):
+            anim = _object_level_animation(o)
+            if anim is not None:
+                who = (f"{label} rig" if anim is o
+                       else f"{label} rig's parent '{anim.name}'")
+                return (f"The {who} has keyframes on the object itself, "
+                        f"not on its bones. Retargeting can't compensate "
+                        f"for that. Remove that animation (or bake it "
+                        f"into the bones), then Apply again.")
+
+        notes = []
+        for label, o in (("Source", src), ("Target", tgt)):
+            what = _describe_object_transform(o)
+            if what:
+                notes.append(f"{label} rig '{o.name}' has an object "
+                             f"transform ({what})")
+
+        # Only PLACEMENT is set aside: location and the yaw about world
+        # Z (facing). The rest of the object rotation stays, because
+        # for some rigs it is what stands the character up - a Mixamo
+        # FBX imports with Y-up rest bones and a 90 deg X rotation on
+        # the armature object; strip that and the rig bakes lying down.
+        # The engine's rotation math is world-consistent (target world
+        # rotation = source world rotation times a fixed rest offset),
+        # so keeping the stand-up rotation is exactly right and the
+        # facing is the only rotation that has to be factored out.
+        # Yaw comes off via a twist/swing split about world Z on the
+        # rotation MATRIX (not the Euler values), so it doesn't matter
+        # how the user rotated the rig.
+        src_scale = src.matrix_world.to_scale()
+        tgt_scale = tgt.matrix_world.to_scale()
+        rel = Vector((src_scale[i] / max(abs(tgt_scale[i]), 1e-9)
+                      for i in range(3)))
+        want_tgt = _strip_yaw(tgt.matrix_world).to_matrix().to_4x4()
+        want_src = (_strip_yaw(src.matrix_world).to_matrix().to_4x4()
+                    @ Matrix.Diagonal(rel).to_4x4())
+
+        # matrix_world's setter accounts for parenting. Anything else
+        # that would fight it (object constraints, delta transforms) is
+        # caught by re-reading the result after a depsgraph update.
+        tgt.matrix_world = want_tgt
+        src.matrix_world = want_src
+        context.view_layer.update()
+
+        for label, o, want in (("Target", tgt, want_tgt),
+                               ("Source", src, want_src)):
+            tol = 1e-4 * max(1.0, max(abs(v) for v in rel))
+            if not _matrix_close(o.matrix_world, want, tol):
+                return (f"Couldn't set aside the {label} rig's object "
+                        f"transform for the bake. That usually means "
+                        f"constraints or delta transforms on the object "
+                        f"itself (not its bones). Apply or remove them, "
+                        f"then Apply again.")
+
+        for line in notes:
+            print(f"[BlendCap] retarget: {line}; kept as-is. Its "
+                  f"placement and facing don't affect the retarget.")
+        return None
+
     def _prepare(self, context):
         scene = context.scene
         self._scene = scene
@@ -898,6 +1399,26 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
 
         self._src = src
         self._tgt = tgt
+
+        # "Mute Limits and Drivers" ticked for this rig: mute again for
+        # the current map before the engine scans the rig's constraints
+        # (pair names are rig-resolved at this point).
+        from . import rig_conflicts
+        rig_conflicts.before_bake(tgt, scene)
+        # A World Space rotation limit depends on how the rig object
+        # really sits in the scene, and the bake runs with that placement
+        # set aside. Hand the real one to the limit report now.
+        from .retarget import limit_probe
+        limit_probe.set_target_world(tgt.matrix_world)
+
+        # Set both rigs' object transforms aside for the bake (restored
+        # in _finalize). Must come before _src_orig_scale is captured:
+        # auto-scale multiplies on top of the neutralised source scale
+        # and restores to it, then the snapshot restore below puts the
+        # real transform back.
+        err = self._neutralize_object_transforms(context, src, tgt)
+        if err is not None:
+            return False, err
         self._src_orig_scale = tuple(src.scale)
 
         # Capture pre-bake context so _finalize can put the user back where
@@ -932,11 +1453,28 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
         # check both defensively and prefer the live snapshot if anything
         # ever bypasses the UI guard.
         source_rest_override = None
+        global _LAST_SOURCE_REST, REUSE_SOURCE_REST_ONCE
+        # Taken (and cleared) on every Apply, so it can't linger into a
+        # later click if the retarget it was meant for never started.
+        reuse_rest, REUSE_SOURCE_REST_ONCE = REUSE_SOURCE_REST_ONCE, False
         if use_current_pose:
-            source_rest_override = {}
-            for p in pairs:
-                if p.source and p.source in src.pose.bones:
-                    source_rest_override[p.source] = src.pose.bones[p.source].matrix.copy()
+            if (reuse_rest and _LAST_SOURCE_REST is not None
+                    and _LAST_SOURCE_REST['src'] == src.name):
+                # Started again by the rig conflict pop-up: same rest pose
+                # as the run it follows (see _LAST_SOURCE_REST).
+                source_rest_override = {
+                    k: m.copy() for k, m in _LAST_SOURCE_REST['data'].items()}
+                print("[BlendCap] retarget: reusing the source rest pose "
+                      "sampled by the previous Apply.")
+            else:
+                source_rest_override = {}
+                for p in pairs:
+                    if p.source and p.source in src.pose.bones:
+                        source_rest_override[p.source] = src.pose.bones[p.source].matrix.copy()
+                _LAST_SOURCE_REST = {
+                    'src': src.name,
+                    'data': {k: m.copy()
+                             for k, m in source_rest_override.items()}}
         elif use_custom_rest_pose and custom_rest_pose_path \
                 and not custom_rest_pose_path.startswith('__') \
                 and os.path.isfile(custom_rest_pose_path):
@@ -944,11 +1482,26 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
             try:
                 source_rest_override = load_rest_pose_preset_to_override(
                     custom_rest_pose_path, src)
+                from . import operators_rest_pose as _orp
+                _stats = _orp.LAST_LOAD_STATS or {}
+                if _stats.get('wrong_skeleton'):
+                    # Stop here: carrying on without the preset would
+                    # give a result the user did not ask for, with the
+                    # warning buried under "Retargeting complete".
+                    return False, _orp.WRONG_SKELETON_APPLY
                 if not source_rest_override:
                     source_rest_override = None
                     self.report({'WARNING'},
-                                "Custom rest pose preset has no entries "
-                                "matching the source rig's bones — skipping.")
+                                f"Rest pose preset: 0 of "
+                                f"{_stats.get('total', 0)} bones match "
+                                f"the source rig - retargeting without it.")
+                else:
+                    _note = _orp.match_summary(_stats)
+                    if _note:
+                        # Partial matches are normal (a preset with
+                        # fingers on a rig without them), so this is a
+                        # console line, not a warning.
+                        print(f"[BlendCap] rest pose preset: {_note}.")
             except Exception as e:
                 source_rest_override = None
                 self.report({'WARNING'},
@@ -1005,7 +1558,9 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
             #                     each finger IK control, which is why
             #                     finger FK retarget on ARP requires
             #                     this flip)
-            _FK_SWITCH_KEYS = ("IK_FK", "ik_fk_switch")
+            # Snapshot first: with auto-bake IK on, the convert puts
+            # these back after its bake (support item 22).
+            self._switch_snapshot = snapshot_ik_switches(tgt)
             for pb in tgt.pose.bones:
                 for key in _FK_SWITCH_KEYS:
                     if key in pb.keys():
@@ -1023,10 +1578,108 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
             _force_cloudrig_fk(tgt)
 
             if auto_scale:
-                src_h = _compute_rig_height(src)
-                tgt_h = _compute_rig_height(tgt)
-                if src_h > 1e-6 and tgt_h > 1e-6:
-                    ratio = tgt_h / src_h
+                # Ratio preference order:
+                #
+                # 1) PELVIS REST HEIGHT - the body's LOC-Z carrier pair
+                #    (Hips -> pelvis control in the shipped presets):
+                #    ratio = target rest Z / source rest Z of that one
+                #    pair. All vertical travel funnels through it, so
+                #    this lands floor contact exactly by construction
+                #    (source hips on the floor -> target hips on the
+                #    floor) regardless of proportions. A total-height
+                #    ratio only lands it when the character's leg-to-
+                #    height proportion matches the source's - every rig
+                #    floated or sank by its own amount, worst on
+                #    stylized proportions. Candidates: BASIS-space LOC
+                #    pairs with a Z axis (HEAD_LOCAL face pairs are
+                #    head-relative amplitudes, not body height; Root
+                #    rows are LOC XY and floor-level anyway), resolved
+                #    on both rigs, both rest heads above the floor. If
+                #    several qualify, the source bone carrying the most
+                #    descendants wins (the whole-body carrier beats a
+                #    foot or head row).
+                #
+                # 2) MAPPED-EXTENT fallback when no such pair exists
+                #    (face-only maps, unusual custom maps): vertical
+                #    extent of the mapped bones only, and only pairs
+                #    that resolve on BOTH sides, so the two extents
+                #    describe the SAME region (per-side filtering used
+                #    to compare a partial source's torso span against
+                #    the target's full-body span - a nonsense ratio in
+                #    either direction). Degenerate results (under 2
+                #    resolvable pairs, or near-coplanar) fall back to
+                #    the whole-rig measurement inside
+                #    _compute_rig_height / the 1e-6 guards below.
+                #
+                # Pair names are already rig-resolved by
+                # _resolve_pair_names_for_bake above.
+                ratio = 0.0
+                best = None  # ((n_descendants, src_z), src_z, tgt_z, names)
+                for _p in scene.blendcap_retarget_pairs:
+                    if _p.channels not in ('LOC', 'LOC_ROT'):
+                        continue
+                    if 'Z' not in (_p.axes or "XYZ").upper():
+                        continue
+                    if _p.loc_space == 'HEAD_LOCAL':
+                        continue
+                    sb = src.data.bones.get(_p.source)
+                    tb = tgt.data.bones.get(_p.target)
+                    if sb is None or tb is None:
+                        continue
+                    src_z = (src.matrix_world @ sb.head_local).z
+                    tgt_z = (tgt.matrix_world @ tb.head_local).z
+                    if src_z < 1e-4 or tgt_z < 1e-4:
+                        continue
+                    key = (len(sb.children_recursive), src_z)
+                    if best is None or key > best[0]:
+                        best = (key, src_z, tgt_z, sb.name, tb.name)
+                if best is not None:
+                    _key, src_z, tgt_z, _sn, _tn = best
+                    ratio = tgt_z / src_z
+                    print(f"[BlendCap] auto-scale pelvis pair "
+                          f"{_sn} -> {_tn}: rest Z {src_z:.3f} -> "
+                          f"{tgt_z:.3f}, ratio {ratio:.3f} "
+                          f"(target/source)")
+                else:
+                    _map_src, _map_tgt = set(), set()
+                    for _p in scene.blendcap_retarget_pairs:
+                        if (_p.source in src.data.bones
+                                and _p.target in tgt.data.bones):
+                            _map_src.add(_p.source)
+                            _map_tgt.add(_p.target)
+                    src_h = _compute_rig_height(src, only=_map_src)
+                    tgt_h = _compute_rig_height(tgt, only=_map_tgt)
+
+                    def _extent_line(rig, only):
+                        # Mirrors _compute_rig_height's pick (including
+                        # the whole-rig fallback) so the console reports
+                        # the measurement actually used, and names the
+                        # two bones defining it.
+                        bones = rig.data.bones
+                        picked = [bones[n] for n in only if n in bones]
+                        scope = f"{len(picked)} mapped bones"
+                        if len(picked) < 2:
+                            picked = list(bones)
+                            scope = f"whole rig, {len(picked)} bones"
+                        mw = rig.matrix_world
+                        zs = sorted(((mw @ b.head_local).z, b.name)
+                                    for b in picked)
+                        lo_z, lo_n = zs[0]
+                        hi_z, hi_n = zs[-1]
+                        return (f"{hi_z - lo_z:.3f}m ({scope}; "
+                                f"lo={lo_n} @{lo_z:.3f}, "
+                                f"hi={hi_n} @{hi_z:.3f})")
+
+                    print(f"[BlendCap] auto-scale source {src.name}: "
+                          f"{_extent_line(src, _map_src)}")
+                    print(f"[BlendCap] auto-scale target {tgt.name}: "
+                          f"{_extent_line(tgt, _map_tgt)}")
+                    if src_h > 1e-6 and tgt_h > 1e-6:
+                        ratio = tgt_h / src_h
+                        print(f"[BlendCap] auto-scale ratio "
+                              f"{ratio:.3f} (target/source, extent "
+                              f"fallback)")
+                if ratio > 1e-6:
                     bpy.ops.object.mode_set(mode='OBJECT')
                     # Multiply, don't overwrite. Mixamo sources sit at
                     # ~(0.01, 0.01, 0.01) to compensate for a 100x rest
@@ -1060,6 +1713,24 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
             )
             self._frames_total = phase_frames
 
+            # Prime the bake. The first step runs the engine's setup,
+            # which is the ONLY place it reads either rig's object
+            # matrix (src_mw / tgt_mw are captured there; every later
+            # frame is pure math off those values and the extracted
+            # fcurves). So the object transforms - and auto-scale's
+            # source scale - can go back immediately, instead of the
+            # viewport showing the target at unit scale and un-turned
+            # for the whole bake (a 0.01 Mixamo rig looked 100x for
+            # the duration). An empty bake (no resolvable pairs) ends
+            # the coroutine here; that's handled naturally downstream.
+            try:
+                first = next(self._coroutine)
+                if first is not None:
+                    self._frames_done = 1
+            except StopIteration:
+                pass
+            self._restore_object_transforms()
+
         global _BAKE_RUNNING, _BAKE_CANCEL_REQUESTED
         _BAKE_RUNNING = True
         _BAKE_CANCEL_REQUESTED = False
@@ -1081,11 +1752,9 @@ class BLENDCAP_OT_apply_retarget(bpy.types.Operator):
         except Exception:
             pass
 
-        if self._src is not None and self._src_orig_scale is not None:
-            try:
-                self._src.scale = self._src_orig_scale
-            except Exception:
-                pass
+        # Normally already done right after the bake was primed (see
+        # _prepare); this catches the error/cancel paths before that.
+        self._restore_object_transforms()
 
         if self._scene is not None and self._frame_start is not None:
             try:

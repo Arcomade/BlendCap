@@ -1,6 +1,6 @@
 {
-  "name": "Mixamo → Mixamo Control Rig",
-  "version": 1,
+  "name": "Mixamo \u2192 Mixamo Control Rig",
+  "version": 2,
   "target_kind": "generic",
   "namespace_strip": "",
   "auto_bake_ik": false,
@@ -265,12 +265,6 @@
     },
     {
       "source": "Hips",
-      "target": "Ctrl_Hips_Free",
-      "channels": "ROT",
-      "influence": 1.0
-    },
-    {
-      "source": "Hips",
       "target": "Ctrl_Hips",
       "channels": "LOC",
       "influence": 1.0,
@@ -282,6 +276,12 @@
       "channels": "LOC",
       "influence": 1.0,
       "axes": "XY"
+    },
+    {
+      "source": "Hips",
+      "target": "Ctrl_Hips",
+      "channels": "ROT",
+      "influence": 1.0
     },
     {
       "source": "LeftUpLeg",
@@ -332,7 +332,7 @@
       "influence": 1.0
     }
   ],
-  "source_prefix": "mixamorig:",
+  "source_prefix": "mixamorig1:",
   "face_head_source": "Head",
   "face_capture_compensation": false,
   "face_amplification": {
@@ -343,6 +343,7 @@
     "lips": 1.0,
     "cheeks": 1.0,
     "nose": 1.0,
+    "tongue": 1.0,
     "global": 1.0
   },
   "use_world_location": true,

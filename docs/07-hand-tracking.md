@@ -10,7 +10,9 @@ This page explains what tools are available in BlendCap to capture and refine ha
 
 Hands and fingers are part of the body model, not a separate tracker, so they come along automatically whenever you capture the body. Because the model reads the fingers off the body it detects, some of the body has to be in frame for the hands to track, an extreme close-up of just hands is unlikely to be detected or tracked.
 
-**Refine Hand Tracking**, in [Preferences](11-preferences.md), is an optional extra pass at capture time that sharpens the finger poses. It runs automatically on NVIDIA hardware and is skipped on slower setups, but you can force it on or off in the preferences menu depending on your needs. The hands are captured either way, this only adds polish to the detail of the tracking itself.
+**Refine Hand Tracking**, a checkbox in the **Capture** section, is an optional extra pass at capture time that sharpens the finger poses. It starts enabled on NVIDIA hardware and disabled on slower setups, and you can tick or untick it before any capture. You can also change its default setting in [Preferences](11-preferences.md). The hands are captured either way, this only adds polish to the detail of the tracking itself.
+
+![The Refine Hand Tracking checkbox](images/24-3-refine-hand-tracking.png)
 
 Once you have your hand data captured, you have a few options to build on that data:
 
@@ -20,7 +22,7 @@ Once you have your hand data captured, you have a few options to build on that d
 
 ## Rebuilding finger motion
 
-**Rebuild Finger Motion (Experimental)** (a toggle in **BVH Settings**, available when **Hands** is enabled) takes a different approach to the hands. It reconstructs each finger from the 2D tracked finger keypoints (the markers that you see in the overlay preview of your tracked footage) to recover distinct hand poses like a pointing finger or a counted "three". This almost completely replaces the default finger motion, and is not currently compatible with **Finger Curl Strength**.
+**Rebuild Finger Motion (Experimental)** (a toggle in **BVH Settings**, available when **Hands** is enabled) takes a different approach to the hands. It reconstructs each finger from the 2D tracked finger keypoints (the markers that you see in the overlay preview of your tracked footage) to recover distinct hand poses like a pointing finger or a counted "three". This almost completely replaces the default finger motion, and is not currently compatible with **Finger Curl Strength**. It requires a capture that was run with **Refine Hand Tracking** enabled.
 
 ![Finger keypoints on the capture overlay](images/24-1-finger-overlay.png)
 
@@ -32,7 +34,9 @@ Once you have your hand data captured, you have a few options to build on that d
 
 Like the other post-processing controls, this applies when the BVH is generated, so it works on clips you've already captured, no re-capture needed, but it does cost extra processing time, and can be slow on longer clips.
 
-> **Not the same as Refine Hand Tracking.** The **Refine Hand Tracking** preference (see [Preferences](11-preferences.md)) sharpens the hand *capture* itself, an extra pass at tracking time. **Rebuild Finger Motion** uses that data (refined or not) afterwards, replacing the default finger construction method when the BVH is generated.
+> **Not the same as Refine Hand Tracking.** The **Refine Hand Tracking** checkbox in the **Capture** section sharpens the hand capture itself, it's an extra pass at tracking time. **Rebuild Finger Motion** uses that refined data afterwards, replacing the default finger construction method when the BVH is generated.
+
+Both work per person in the multi-person modes, and on multi-camera takes, Rebuild Finger Motion reads the fingers from every camera. When you're capturing multiple people, turning **Refine Hand Tracking** off is one of the biggest savings you can get in capture time, at the cost of finger accuracy.
 
 ---
 

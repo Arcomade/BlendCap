@@ -16,6 +16,8 @@ os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import cv2
 import numpy as np
 
+from pipeline.video_colour import frame_fix, apply_fix
+
 
 def progress(pct, msg=""):
     print(f"[PROGRESS {min(int(pct), 100)}] {msg}", flush=True)
@@ -106,7 +108,9 @@ def convert_image_sequence(args):
     # Load element list from file or auto-detect from directory
     elements = []
     if args.elements_file and os.path.exists(args.elements_file):
-        with open(args.elements_file) as f:
+        # utf-8 to match the writer (operators_pipeline): image filenames
+        # can carry non-ASCII, and the default is the system code page.
+        with open(args.elements_file, encoding='utf-8') as f:
             elements = [line.strip() for line in f if line.strip()]
 
     if not elements and args.image_dir:
@@ -187,8 +191,15 @@ def convert_video(args):
         out_w, out_h = compute_output_size(src_w, src_h)
         needs_resize = (out_w != src_w or out_h != src_h)
 
+        # OpenCV decodes every file as BT.601; correct frames from a
+        # source tagged otherwise (see pipeline/video_colour.py). The
+        # converted copy carries no tag, so nothing downstream needs to
+        # correct it again.
+        colour_fix = frame_fix(args.video,
+                               log=lambda m: print(m, flush=True))
+
         use_match = (args.mode == "match" and args.source_fps > 0
-                     and abs(args.source_fps - args.fps) > 0.5)
+                     and abs(args.source_fps - args.fps) > args.match_threshold)
 
         if use_match:
             # --- MATCH TIMING MODE ---
@@ -204,9 +215,12 @@ def convert_video(args):
                 print("[ERROR] No frames to convert.", file=sys.stderr)
                 sys.exit(1)
 
+            close = abs(args.source_fps - args.fps) < 0.5
+            src_txt = f"{args.source_fps:.3f}" if close else f"{args.source_fps:.0f}"
+            dst_txt = f"{args.fps:.3f}" if close else f"{args.fps:.0f}"
             progress(2, f"Resampling {source_count} source frames -> "
                      f"{n_output} output frames "
-                     f"({args.source_fps:.0f}fps -> {args.fps:.0f}fps)...")
+                     f"({src_txt}fps -> {dst_txt}fps)...")
 
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             writer = cv2.VideoWriter(args.output, fourcc, args.fps, (out_w, out_h))
@@ -232,6 +246,7 @@ def convert_video(args):
                         if not ret:
                             source_exhausted = True
                             break
+                        frame = apply_fix(frame, colour_fix)
                         if needs_resize:
                             frame = cv2.resize(frame, (out_w, out_h),
                                                interpolation=cv2.INTER_AREA)
@@ -283,6 +298,7 @@ def convert_video(args):
                     ret, frame = cap.read()
                     if not ret:
                         break
+                    frame = apply_fix(frame, colour_fix)
 
                     if needs_resize:
                         frame = cv2.resize(frame, (out_w, out_h),
@@ -316,6 +332,10 @@ def main():
     parser.add_argument("--max-frames", type=int, default=0, help="Max frames to convert (0 = all)")
     parser.add_argument("--offset-end", type=int, default=0, help="End trim offset (image sequences)")
     parser.add_argument("--source-fps", type=float, default=0, help="Source video FPS (for rate-aware conversion)")
+    parser.add_argument("--match-threshold", type=float, default=0.5,
+                        help="Smallest FPS difference that --mode match resamples "
+                             "(default 0.5; multi-camera capture lowers it to put "
+                             "a 29.97 fps camera on a 30 fps clock)")
     parser.add_argument("--mode", choices=["match", "keep"], default="keep",
                         help="Conversion mode: 'match' = temporal resampling (drop/duplicate frames), "
                              "'keep' = 1:1 sequential copy (default)")

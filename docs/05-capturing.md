@@ -6,6 +6,21 @@ A capture does **not** produce the final armature. Its output is the raw trackin
 
 ---
 
+## Capture modes
+
+The dropdown at the top of the **Capture** section sets what kind of capture you're running:
+
+- **Single-Camera Capture**: one person's performance from a single video. This is the regular capture, and what the rest of this page describes.
+- **Multi-Camera Capture**: one person's performance from up to 4 different angles, for a more accurate result. See [Multi-Camera Capture](05a-multi-camera-capture.md).
+- **Multi-Person Capture**: multiple people's performance from a single video. See [Multi-Person Capture](05b-multi-person-capture.md).
+- **Multi-Camera & Multi-Person**: multiple people's performance from up to 4 different angles. See [Multi-Camera & Multi-Person](05c-multi-camera-and-multi-person.md).
+
+![The four capture modes](images/25-capture-modes.png)
+
+Everything on this page applies to all four modes, unless a mode's own page says otherwise.
+
+---
+
 ## Video Source
 
 In the **Video Source** section you tell BlendCap where the footage is:
@@ -17,12 +32,12 @@ In the **Video Source** section you tell BlendCap where the footage is:
 
 ![The Video Source section](images/12-capture-video-source.png)
 
-> **Sequencer render setting:** when you set the Video Source to **Video Editor Strip**, BlendCap offers to turn off the Video Sequencer's render output so your capture footage doesn't show up in your final renders. You can change whether it asks, disables it automatically, or leaves it alone with the **Sequencer Render Warning** preference (see [Preferences](11-preferences.md)).
+> **Sequencer render setting:** when you set the Video Source to **Video Editor Strip**, BlendCap turns off the Video Sequencer's render output so your capture footage doesn't show up in your final renders. If you'd rather it left that setting alone, untick **Turn off Sequencer rendering** in the preferences (see [Preferences](11-preferences.md)).
 
 ### Frame rate
 BlendCap works best when the capture video's frame rate matches your scene's. If it detects a mismatch, it offers to convert the footage to your project's frame rate before capturing. The conversion keeps the clip's real-time duration, dropping or duplicating frames as needed so the performance still plays at the same speed and the captured timing stays correct. You can generally accept the conversion safely, unless you would rather scale the captured animation's keyframes yourself after importing it into Blender.
 
->Note that when you drop your first clip into Blender's Video Sequencer, Blender sets the project frame rate to match that clip. This is Blender's own behavior, and there is currently no way to turn it off, but you can change the rate afterward in **Output Properties ▸ Frame Rate** if you prefer to work in a specific framerate.
+>Normally, when you drop your first clip into Blender's Video Sequencer, Blender changes the project's frame rate and view transform to suit that clip. While BlendCap's **Performance Capture** workspace tab is active, your project keeps its own settings instead. The clip still plays at normal speed, and still looks the way it should under AgX or Filmic. Each of these behaviors can be switched off in [Preferences](11-preferences.md).
 
 ### Working in the Sequencer
 Click **Open Workspace** in the **Setup** section to load BlendCap's **Performance Capture** workspace: a ready-made layout with Blender's Video Sequencer and the 3D viewport set up side by side. BlendCap's capturing tools are built around this workspace, so you will find everything you need for a capture available here. If you would like to have this workspace ready in every new project, you can save it into Blender's startup file (see [Preferences](11-preferences.md)).
@@ -37,7 +52,6 @@ With a clip on the timeline and **Video Editor Strip** chosen as the Video Sourc
 > **Proxy clips:** edits to a BlendCap proxy strip don't carry back to the original. When the active strip is a proxy, the panel shows a **Revert to Original Video** button and a reminder, so revert first if you need to re-edit after running a capture.
 
 ---
-
 ## What to capture: Body and Face
 
 The **Capture** section has two toggles:
@@ -48,6 +62,10 @@ The **Capture** section has two toggles:
 You can capture both together from one clip, or either on its own from separate clips. Hands always come with the body, capturing them from their own separate clip isn't supported yet, though it's being explored for a future release.
 
 ![Body and Face capture toggles](images/13-capture-toggles.png)
+
+Just below the two toggles, **Refine Hand Tracking** adds an extra pass that sharpens the finger tracking (see [Hand & Finger Tracking](07-hand-tracking.md)). It starts enabled on NVIDIA hardware and disabled everywhere else, where it's slow. You can change it here before any capture, and your choice lasts until you close Blender. Where it starts each session is set by **Refine Hand Tracking Default** in [Preferences](11-preferences.md).
+
+If a Body and Face capture can't find a face anywhere in the clip, BlendCap keeps the body capture and finishes without the face, and lets you know.
 
 ---
 
@@ -91,6 +109,8 @@ This setting skips a set number of frames between each captured frame and interp
 
 ## How long captures take
 Body capture is the heavy step and requires a GPU for usable speeds; face capture is much faster and runs on the CPU. Which hardware runs the capture is set by the **Capture Backend** preference (see [Preferences](11-preferences.md)). BlendCap caches each result, so re-capturing an unchanged clip with the same name is fast (see [BVH Library & Cache](10-bvh-library-and-cache.md)).
+
+Capture time also grows with the number of people in the picture, in every capture mode, because the body model works on everybody it sees. On a modern NVIDIA card, expect roughly 0.3 seconds per frame for one person, 0.4 for two, 0.55 for three and 0.7 for four. Multi-camera captures multiply that by the number of cameras.
 
 The very first capture after installing can sit quietly for a minute or two while the models load; this is normal. If one seems genuinely stuck, you can **cancel** and try again, see [Troubleshooting & FAQ](12-troubleshooting-and-faq.md).
 

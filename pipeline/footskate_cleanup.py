@@ -564,7 +564,7 @@ def apply_footskate_cleanup(parents, bvh_offsets, local_rots, hips_pos,
                              pin_locomotion_xz=None,
                              robust_floor=False,
                              local_height_base=False,
-                             progress_range=None):
+                             progress_range=None, valid_feet=None):
     """Modify `local_rots` in place: replace leg rotations during
     detected foot plants with Y-only-locked 2-bone IK + knee damping.
 
@@ -627,7 +627,8 @@ def apply_footskate_cleanup(parents, bvh_offsets, local_rots, hips_pos,
 
     left_stances, right_stances, foot_y = detect_stances_per_foot(
         joint_coords, translation, fps, sensitivity=sensitivity,
-        robust_floor=robust_floor, local_height_base=local_height_base)
+        robust_floor=robust_floor, local_height_base=local_height_base,
+        valid_feet=valid_feet)
     if not left_stances and not right_stances:
         print("       Footskate cleanup: no plants detected, skipping")
         return

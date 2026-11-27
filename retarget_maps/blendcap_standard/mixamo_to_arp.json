@@ -1,32 +1,9 @@
 {
-  "name": "Mixamo → Auto-Rig Pro",
-  "version": 1,
+  "name": "Mixamo \u2192 Auto-Rig Pro",
+  "version": 2,
   "target_kind": "generic",
   "namespace_strip": "",
   "auto_bake_ik": false,
-  "_note": "Body + hands mapping for transferring an already-animated Mixamo skeleton onto an ARP rig (source = mixamorig:Hips/Spine/Spine1/Spine2/.../LeftToeBase, target = ARP c_*). Derived from arp.json (BlendCap BVH source) with the Mixamo-source substitutions used in mixamo_to_mixamo_ctrl.json: source_prefix='mixamorig:' for namespace handling, use_world_location for IK source position lookups, custom_ik_sources block for any later manual IK bake. SPINE remap: Mixamo has 3 spine bones (Spine/Spine1/Spine2) plus Hips where BlendCap BVH has 4 (Spine/Spine1/Spine2/Spine3) — Mixamo Hips drives the bottom spine target (c_root.x) that BlendCap Spine drove, and the rest shift down one slot. LOCOMOTION: Mixamo has no Root bone, so Hips alone drives c_pos (LOC XY) and c_root_master.x (LOC Z) in addition to c_root.x (ROT). NO FACE: Mixamo capture never carries face data, so all face pairs are omitted.",
-  "ik_chains": [
-    {
-      "owner": "leg_ik_nostr.l",
-      "ik_control": "c_foot_ik.l",
-      "pole_control": "c_leg_pole.l"
-    },
-    {
-      "owner": "leg_ik_nostr.r",
-      "ik_control": "c_foot_ik.r",
-      "pole_control": "c_leg_pole.r"
-    },
-    {
-      "owner": "forearm_ik_nostr.l",
-      "ik_control": "c_hand_ik.l",
-      "pole_control": "c_arms_pole.l"
-    },
-    {
-      "owner": "forearm_ik_nostr.r",
-      "ik_control": "c_hand_ik.r",
-      "pole_control": "c_arms_pole.r"
-    }
-  ],
   "pairs": [
     {
       "source": "Head",
@@ -288,7 +265,7 @@
     },
     {
       "source": "Hips",
-      "target": "c_root.x",
+      "target": "c_root_master.x",
       "channels": "ROT",
       "influence": 1.0
     },
@@ -296,15 +273,15 @@
       "source": "Hips",
       "target": "c_pos",
       "channels": "LOC",
-      "axes": "XY",
-      "influence": 1.0
+      "influence": 1.0,
+      "axes": "XY"
     },
     {
       "source": "Hips",
       "target": "c_root_master.x",
       "channels": "LOC",
-      "axes": "Z",
-      "influence": 1.0
+      "influence": 1.0,
+      "axes": "Z"
     },
     {
       "source": "LeftUpLeg",
@@ -355,7 +332,19 @@
       "influence": 1.0
     }
   ],
-  "source_prefix": "mixamorig:",
+  "source_prefix": "mixamorig1:",
+  "face_capture_compensation": false,
+  "face_amplification": {
+    "jaw": 1.0,
+    "gaze": 1.0,
+    "lids": 1.0,
+    "brows": 1.0,
+    "lips": 1.0,
+    "cheeks": 1.0,
+    "nose": 1.0,
+    "tongue": 1.0,
+    "global": 1.0
+  },
   "use_world_location": true,
   "custom_ik_sources": {
     "enabled": true,
@@ -367,5 +356,36 @@
     "right_forearm": "RightForeArm",
     "left_shin": "LeftLeg",
     "right_shin": "RightLeg"
-  }
+  },
+  "ik_chains": [
+    {
+      "limb_kind": "ARM",
+      "side": "L",
+      "owner": "forearm_ik_nostr.l",
+      "ik_control": "c_hand_ik.l",
+      "pole_control": "c_arms_pole.l"
+    },
+    {
+      "limb_kind": "ARM",
+      "side": "R",
+      "owner": "forearm_ik_nostr.r",
+      "ik_control": "c_hand_ik.r",
+      "pole_control": "c_arms_pole.r"
+    },
+    {
+      "limb_kind": "LEG",
+      "side": "L",
+      "owner": "leg_ik_nostr.l",
+      "ik_control": "c_foot_ik.l",
+      "pole_control": "c_leg_pole.l"
+    },
+    {
+      "limb_kind": "LEG",
+      "side": "R",
+      "owner": "leg_ik_nostr.r",
+      "ik_control": "c_foot_ik.r",
+      "pole_control": "c_leg_pole.r"
+    }
+  ],
+  "_note": "Body + hands mapping for transferring an already-animated Mixamo skeleton onto an ARP rig (source = mixamorig:Hips/Spine/Spine1/Spine2/.../LeftToeBase, target = ARP c_*). Derived from arp.json (BlendCap BVH source) with the Mixamo-source substitutions used in mixamo_to_mixamo_ctrl.json: source_prefix='mixamorig:' for namespace handling, use_world_location for IK source position lookups, custom_ik_sources block for any later manual IK bake. SPINE remap: Mixamo has 3 spine bones (Spine/Spine1/Spine2) plus Hips where BlendCap BVH has 4 (Spine/Spine1/Spine2/Spine3) \u2014 Mixamo Hips drives the bottom spine target (c_root.x) that BlendCap Spine drove, and the rest shift down one slot. LOCOMOTION: Mixamo has no Root bone, so Hips alone drives c_pos (LOC XY) and c_root_master.x (LOC Z) in addition to c_root.x (ROT). NO FACE: Mixamo capture never carries face data, so all face pairs are omitted."
 }

@@ -281,6 +281,11 @@ FDF_CONTACT_BAND_M = 0.10
 # body-frame heights) without visibly flattening jump arcs.
 FDF_SMOOTH_SIGMA = 2.0
 
+# A gap that keeps the take's measured height (multi-camera takes,
+# see compute_feet_defined_vertical's measured_vertical) meets the
+# plant levels on either side over this long.
+FDF_MEASURED_BLEND_SEC = 0.10
+
 # SAM joint indices for ankles AND toes. Bottom-of-foot per frame =
 # min(ankle_y, toe_y). Why both, not just one:
 # - During heel strike the ankle dips below the toe; during push-off
@@ -354,7 +359,8 @@ def sensitivity_to_thresholds(sensitivity, fps):
 
 
 def detect_stances_per_foot(joint_coords, translation, fps, sensitivity=0.5,
-                            robust_floor=False, local_height_base=False):
+                            robust_floor=False, local_height_base=False,
+                            valid_feet=None):
     """Detect per-foot stance phases on the BVH source data.
 
     Shared primitive used by Pass 1 (body grounding correction) and
@@ -372,6 +378,10 @@ def detect_stances_per_foot(joint_coords, translation, fps, sensitivity=0.5,
         Floor, where the plants themselves are the ground truth (see
         LOCAL_BASE_WINDOW_SEC). Takes precedence over robust_floor's
         percentile base (the median pre-filter still applies).
+    valid_feet: optional (n_frames, 2) bool (L, R). False = the foot
+        was not in the picture that frame (Hold Cropped Limbs), so it
+        is no evidence: no plant is detected on it and no stance is
+        extended into it. None = every frame counts.
 
     Returns:
         (left_stances, right_stances, foot_y)
@@ -468,6 +478,16 @@ def detect_stances_per_foot(joint_coords, translation, fps, sensitivity=0.5,
             (velocities[:, foot_idx] < v_thresh_per_frame)
             & (foot_y[:, foot_idx] < base_y[:, foot_idx] + h_thresh_m)
         )
+    # Feet that were not in the picture are no evidence (Hold Cropped
+    # Limbs): never planted, and the Y-only extension below must not
+    # walk into them either (their height cap goes to -inf).
+    height_cap = np.array(base_y, dtype=np.float64) + h_thresh_m
+    if valid_feet is not None:
+        valid = np.asarray(valid_feet, dtype=bool)
+        if valid.ndim == 1:
+            valid = np.stack([valid, valid], axis=1)
+        planted &= valid
+        height_cap = np.where(valid, height_cap, -np.inf)
 
     left_stances = _find_runs(planted[:, 0], min_stance_frames)
     right_stances = _find_runs(planted[:, 1], min_stance_frames)
@@ -492,17 +512,17 @@ def detect_stances_per_foot(joint_coords, translation, fps, sensitivity=0.5,
     y_velocities = np.concatenate([y_deltas[:1], y_deltas], axis=0)
     left_stances = _extend_stances_y_only(
         left_stances, y_velocities[:, 0], foot_y[:, 0],
-        base_y[:, 0] + h_thresh_m,
+        height_cap[:, 0],
         v_thresh_per_frame, n_frames)
     right_stances = _extend_stances_y_only(
         right_stances, y_velocities[:, 1], foot_y[:, 1],
-        base_y[:, 1] + h_thresh_m,
+        height_cap[:, 1],
         v_thresh_per_frame, n_frames)
     return left_stances, right_stances, foot_y
 
 
 def compute_per_stance_correction(joint_coords, translation, fps,
-                                   sensitivity=0.5):
+                                   sensitivity=0.5, valid_feet=None):
     """Return per-frame Y delta to add to body_y for foot-plant grounding.
 
     joint_coords: (n_frames, n_joints, 3) — SAM-frame joint positions.
@@ -515,7 +535,8 @@ def compute_per_stance_correction(joint_coords, translation, fps,
         stances and outside blend regions.
     """
     left_stances, right_stances, foot_y = detect_stances_per_foot(
-        joint_coords, translation, fps, sensitivity=sensitivity)
+        joint_coords, translation, fps, sensitivity=sensitivity,
+        valid_feet=valid_feet)
     n_frames = foot_y.shape[0]
 
     if not left_stances and not right_stances:
@@ -552,7 +573,8 @@ def compute_per_stance_correction(joint_coords, translation, fps,
 
 def compute_feet_defined_vertical(joint_coords, translation, fps,
                                   sensitivity=0.5,
-                                  translation_raw=None):
+                                  translation_raw=None, valid_feet=None,
+                                  measured_vertical=False, details=None):
     """Feet Define the Floor: rebuild the body's vertical translation
     from foot plants + ballistic flight, discarding the video's
     vertical channel (which cannot distinguish a jump from camera
@@ -626,10 +648,29 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
     data shifted the whole vote system's operating point and let
     mid-roll segments pass flight votes. None (the CLI without
     smoothing, or sliders at 0) means the two series coincide.
+
+    measured_vertical: the take's vertical translation is a
+    MEASUREMENT, not one camera's reading (a multi-camera merge: every
+    camera sees height directly, and the merged height sits within half
+    a centimetre of the triangulated one, in the air included). A
+    voted flight then keeps the take's own height instead of the
+    gravity arc, blended into the takeoff and landing plant levels
+    over FDF_MEASURED_BLEND_SEC, and so does a "held blink" (a short
+    gap with no rise: a deep squat the detector lost the feet in).
+    The arc and the hold exist because one camera cannot tell the
+    body's vertical motion from its own; over a measured take the arc
+    came out 18 cm too high on a 44 cm jump and two frames early on
+    another (12 cm off in the air on average, against 3 with this),
+    and the hold left a squat 18 to 29 cm shallow. The votes, the
+    plants and every other kind of gap are unchanged.
+
+    details: optional dict. Receives "measured_gaps" (the gaps that
+    kept the measured height) and "measured_blend_frames", for the
+    plant reconciliation in modes.py.
     """
     left_stances, right_stances, foot_y = detect_stances_per_foot(
         joint_coords, translation, fps, sensitivity=sensitivity,
-        robust_floor=True, local_height_base=True)
+        robust_floor=True, local_height_base=True, valid_feet=valid_feet)
     if not left_stances and not right_stances:
         return None
 
@@ -710,6 +751,9 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
 
     idx = np.flatnonzero(any_plant)
     first, last = int(idx[0]), int(idx[-1])
+    # How planted feet sit in the video's own vertical, take-wide (the
+    # measured flights below are placed by it).
+    plant_offset = float(np.median(v[any_plant] - video_y[any_plant]))
 
     # Leading / trailing plant-free spans: video shape, anchored to
     # the nearest plant.
@@ -899,9 +943,33 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
                 continue
         f = g1 + 2
 
+    def _keep_measured(g0, g1, a, b):
+        """A gap on a take whose height is MEASURED (see the docstring):
+        the take's height stands. It is the video's own level, placed
+        by how planted feet sit in it over the WHOLE take
+        (plant_offset), not by the two plants beside this gap. Those
+        are a deep crouch and a landing, where the legs are read
+        worst, and tying a jump to them tilted it (a 44 cm jump came
+        out 38). Their levels are met over a short blend at each end
+        instead."""
+        r = float(max(2, int(round(FDF_MEASURED_BLEND_SEC * fps))))
+        fr = np.arange(g0, g1 + 1)
+        w_a = np.clip(1.0 - (fr - a) / r, 0.0, 1.0)
+        w_b = np.clip(1.0 - (b - fr) / r, 0.0, 1.0)
+        w_sum = np.maximum(w_a + w_b, 1.0)
+        w_a, w_b = w_a / w_sum, w_b / w_sum
+        v[g0:g1 + 1] = (
+            video_y[g0:g1 + 1] + plant_offset
+            + w_a * (v[a] - video_y[a] - plant_offset)
+            + w_b * (v[b] - video_y[b] - plant_offset))
+        if details is not None:
+            details.setdefault("measured_gaps", []).append((g0, g1))
+            details["measured_blend_frames"] = int(r)
+
     # Interior gaps: flight arcs, soft-plants, held levels, or
     # anchored-video fallback.
     n_flights = 0
+    n_measured = 0
     n_assisted = 0
     n_cleared = 0
     n_implausible = 0
@@ -944,14 +1012,21 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
             # feet SHOULD clear exactly the apex; crouch-lowered
             # chords inflate the gap side) — the arc is capped at
             # what the feet's clearance supports (see _gap_evidence).
-            v[g0:g1 + 1] = base + 4.0 * ev["arc_apex"] * ts * (1.0 - ts)
+            if measured_vertical:
+                _keep_measured(g0, g1, a, b)
+                n_measured += 1
+                apex = float((v[g0:g1 + 1] - base).max())
+            else:
+                v[g0:g1 + 1] = (base
+                                + 4.0 * ev["arc_apex"] * ts * (1.0 - ts))
+                apex = ev["arc_apex"]
             flight_spans.append((g0, g1))
             n_flights += 1
             if ev["assisted"]:
                 n_assisted += 1
             if ev["cleared"]:
                 n_cleared += 1
-            max_apex = max(max_apex, ev["arc_apex"])
+            max_apex = max(max_apex, apex)
         elif hang_sec <= FDF_MAX_FLIGHT_SEC and ev["took_off"]:
             # TUCKED flight failing consistency: the clearance
             # already includes the leg fold, yet still falls far
@@ -998,7 +1073,18 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
                 # No on-screen rise, feet not verifiably still: a
                 # detection blink during a held pose. Hold the level
                 # instead of launching the performer.
-                v[g0:g1 + 1] = base
+                if measured_vertical:
+                    # ...unless the height is measured: then the body
+                    # went where the take says it went. The detector
+                    # loses the feet in a deep squat, and holding the
+                    # level through one left the hips 18 to 29 cm above
+                    # where two cameras saw them; the foot pinning then
+                    # un-bent the knees to reach the floor (135 degrees
+                    # of bend where both cameras read 155).
+                    _keep_measured(g0, g1, a, b)
+                    n_measured += 1
+                else:
+                    v[g0:g1 + 1] = base
                 n_holds += 1
             else:
                 # Not a plausible jump: keep the video's motion shape,
@@ -1058,6 +1144,8 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
         # are analytically smooth already, and blurring them shaves a
         # short hop's apex by a third. Restore arc interiors, blending
         # back into the smoothed series over a couple of edge frames.
+        # (Measured flights too: Vertical Smoothing has already been
+        # applied to them, and that slider is the user's say on it.)
         v_arcs = v.copy()
         v = gaussian_filter1d(v, sigma=FDF_SMOOTH_SIGMA)
         edge = 2
@@ -1076,7 +1164,10 @@ def compute_feet_defined_vertical(joint_coords, translation, fps,
           f"{n_deplanted} airborne frame(s) de-planted, "
           f"{n_implausible} implausible arc(s) kept video motion, "
           f"{n_inferred} inferred contact(s) split over-long gaps, "
-          f"{n_anchored} standing tail(s) anchored")
+          f"{n_anchored} standing tail(s) anchored"
+          + (f"; multi-camera take: {n_measured} flight(s) and held "
+             f"blink(s) kept the measured height"
+             if measured_vertical else ""))
     return v, planted
 
 
@@ -1086,14 +1177,20 @@ def _anchor_value(v, any_plant, i, direction):
     (direction -1 = takeoff side, +1 = landing side) and read v there.
     The edge-most planted frames often carry the same perception drift
     that opened the gap; a few frames in, the level is clean."""
+    return v[_anchor_index(any_plant, i, direction)]
+
+
+def _anchor_index(any_plant, i, direction):
+    """The frame _anchor_value reads: up to FDF_ANCHOR_BACKOFF_FRAMES
+    deeper into the stance next to a gap."""
     j = i
     for _ in range(FDF_ANCHOR_BACKOFF_FRAMES):
         k = j + direction
-        if 0 <= k < len(v) and any_plant[k]:
+        if 0 <= k < len(any_plant) and any_plant[k]:
             j = k
         else:
             break
-    return v[j]
+    return j
 
 
 def _still_feet_cols(toe_xz, g0, g1):

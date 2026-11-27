@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import threading
 
+from bpy_extras.io_utils import orientation_helper
+
 from .helpers import (
     blendcap_state, arkit_state,
     _cache_dir, _bvh_library_dir, _addon_dir, _python_exe,
@@ -18,6 +20,7 @@ from .helpers import (
     _resolve_clip_name, _file_mode_source, _progress_re,
     format_workspace_status,
     _seq_accessors, _tag_redraw, _import_bvh, _active_video_strip,
+    bvh_importer_state,
     _bake_root_into_hips_for_export,
 )
 from .properties import _sync_bvh_library
@@ -146,7 +149,11 @@ def _smooth_face_npz_via_venv(input_npz, output_npz, smooth_s):
     cmd = _host_spawn_prefix() + cmd
     print(f"[ARKit] Running smoothing subprocess: {' '.join(cmd)}")
     try:
+        # utf-8 on BOTH sides: _subprocess_env pins the child's
+        # PYTHONIOENCODING, so decoding with the system code page here
+        # would just move the UnicodeError from the writer to the reader.
         result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace',
                                 check=False, env=_subprocess_env(),
                                 creationflags=getattr(
                                     subprocess, 'CREATE_NO_WINDOW', 0))
@@ -258,8 +265,10 @@ def _smooth_face_npz_worker(input_npz, output_npz, smooth_s, state):
     cmd = _host_spawn_prefix() + cmd
     print(f"[ARKit] Running face-processing subprocess: {' '.join(cmd)}")
     try:
+        # utf-8 on BOTH sides - see the note in the sibling call above.
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
+                                encoding='utf-8', errors='replace',
                                 env=_subprocess_env(),
                                 creationflags=getattr(
                                     subprocess, 'CREATE_NO_WINDOW', 0))
@@ -814,6 +823,42 @@ class BLENDCAP_OT_save_arkit_csv(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _clear_person_folders(cache_dir, vid_name):
+    """A multi-person capture's people each get a capture folder of
+    their own at export (Capture_<clip>_P<n>, marked with .person_of).
+    They go with the capture. Returns the number of files removed."""
+    count = 0
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return 0
+    for name in names:
+        tail = name[len(vid_name):]
+        if not (name.startswith(vid_name) and tail.startswith("_P") and tail[2:].isdigit()):
+            continue
+        folder = os.path.join(cache_dir, name)
+        if not os.path.isfile(os.path.join(folder, ".person_of")):
+            continue        # a clip of the user's that only happens to be named like one
+        # (a person of a multi-camera take: the person as each camera
+        # saw them is in cam_a, cam_b, ... inside it)
+        subs = [os.path.join(folder, s) for s in os.listdir(folder)
+                if s.startswith("cam_") and os.path.isdir(os.path.join(folder, s))]
+        for where in subs + [folder]:
+            for fname in os.listdir(where):
+                if fname in (".person_of", ".person_sig", ".cache_params") or fname.endswith(
+                        (".npz", ".npy", ".json", ".bvh")):
+                    try:
+                        os.remove(os.path.join(where, fname))
+                        count += 1
+                    except Exception:
+                        pass
+            try:
+                os.rmdir(where)
+            except OSError:
+                pass
+    return count
+
+
 class BLENDCAP_OT_clear_current_cache(bpy.types.Operator):
     bl_idname = "blendcap.clear_current_cache"
     bl_label = "Clear Cache?"
@@ -869,6 +914,15 @@ class BLENDCAP_OT_clear_current_cache(bpy.types.Operator):
                     if "blendcap_source" in s:
                         stamped = str(s.get("blendcap_source_strip", "") or "")
                         if stamped and stamped == clip_name:
+                            from . import multicam
+                            if multicam.is_multicam_strip(s):
+                                back, why = multicam.revert_multicam(s, seq_ed)
+                                if back:
+                                    last_reverted = back[0]
+                                    reverted += 1
+                                elif why:
+                                    print(f"[BlendCap] Clear Cache: {why}")
+                                continue
                             new_strip = _revert_proxy_strip(s, seq_coll, seq_all)
                             if new_strip:
                                 last_reverted = new_strip
@@ -908,6 +962,22 @@ class BLENDCAP_OT_clear_current_cache(bpy.types.Operator):
                         os.remove(os.path.join(output_dir, f))
                         count += 1
                     except Exception: pass
+            # A multi-camera capture keeps each camera's own capture in
+            # a subfolder.
+            from .multicam import cache_subdirs
+            for sub in cache_subdirs(output_dir):
+                if not os.path.isdir(sub):
+                    continue
+                for f in os.listdir(sub):
+                    if f in (".cache_params", ".no_face") or f.endswith(
+                            (".npz", ".npy", ".json", ".mp4", ".bvh", ".log")):
+                        try:
+                            os.remove(os.path.join(sub, f))
+                            count += 1
+                        except Exception: pass
+                try: os.rmdir(sub)
+                except OSError: pass
+            count += _clear_person_folders(_cache_dir(), vid_name)
             try:
                 os.rmdir(output_dir)
                 self.report({'INFO'}, f"Cleared {count} cache files and deleted folder.")
@@ -947,9 +1017,16 @@ class BLENDCAP_OT_clear_all_caches(bpy.types.Operator):
             if not seq_coll:
                 continue
             had_proxy = False
+            from . import multicam
             for s in list(seq_all):
                 if s.type in ('MOVIE', 'IMAGE') and "blendcap_source" in s:
-                    _revert_proxy_strip(s, seq_coll, seq_all)
+                    if multicam.is_multicam_strip(s):
+                        # a multi-camera capture: all its clips come back
+                        _back, why = multicam.revert_multicam(s, seq_ed)
+                        if why:
+                            print(f"[BlendCap] Clear All: {why}")
+                    else:
+                        _revert_proxy_strip(s, seq_coll, seq_all)
                     had_proxy = True
             if had_proxy:
                 seq_ed.active_strip = None
@@ -1073,12 +1150,14 @@ class BLENDCAP_OT_clear_all_caches(bpy.types.Operator):
                 except Exception as e:
                     print(f"[BlendCap] Failed to delete {fp}: {e}")
                     failed += 1
-                    for leftover in (".cache_params", "mhr_frames.npz",
-                                     "face_frames.npz"):
-                        try:
-                            os.remove(os.path.join(fp, leftover))
-                        except OSError:
-                            pass
+                    from .multicam import cache_subdirs
+                    for sub in [fp] + cache_subdirs(fp):
+                        for leftover in (".cache_params", "mhr_frames.npz",
+                                         "face_frames.npz"):
+                            try:
+                                os.remove(os.path.join(sub, leftover))
+                            except OSError:
+                                pass
 
         if failed:
             self.report({'WARNING'},
@@ -1106,6 +1185,16 @@ class BLENDCAP_OT_revert_strip(bpy.types.Operator):
         if not strip or "blendcap_source" not in strip:
             self.report({'ERROR'}, "No BlendCap proxy strip selected.")
             return {'CANCELLED'}
+
+        from . import multicam
+        if multicam.is_multicam_strip(strip):
+            back, why = multicam.revert_multicam(strip, seq_ed)
+            if not back:
+                self.report({'ERROR'}, why or "Failed to revert strip.")
+                return {'CANCELLED'}
+            self.report({'INFO'},
+                        f"Reverted to the {len(back)} original clips, still synced.")
+            return {'FINISHED'}
 
         original_path = bpy.path.abspath(str(strip["blendcap_source"]))
         original_type = str(strip.get("blendcap_original_type", "MOVIE"))
@@ -1163,6 +1252,16 @@ class BLENDCAP_OT_show_warnings(bpy.types.Operator):
                     or ("flickering tracking" in t))
 
         if any(_is_multi_subject(w) for w in warnings):
+            # A capture that finished body-only after its face step
+            # failed (mocap._face_fallback_lines) still says so here.
+            # Only lines that are in THIS warning list count, so an
+            # earlier capture's notice can't show up in a later dialog.
+            fallback = blendcap_state.get('face_fallback_lines') or []
+            shown = [w for w in warnings if w in fallback]
+            for i, w in enumerate(shown):
+                layout.label(text=w, icon=('ERROR' if i == 0 else 'NONE'))
+            if shown:
+                layout.separator()
             layout.label(text="Multiple people detected, or flickering tracking.",
                          icon='ERROR')
             layout.label(text="Continuity compensation has been applied.")
@@ -1173,90 +1272,6 @@ class BLENDCAP_OT_show_warnings(bpy.types.Operator):
 
     def execute(self, context):
         return {'FINISHED'}
-
-
-class BLENDCAP_OT_sequencer_warning(bpy.types.Operator):
-    """Pops when Source flips File Path -> Video Editor Strip while
-    Output > Post Processing > Sequencer is enabled. OK disables the
-    Sequencer checkbox; Cancel leaves it on. Triggered from
-    properties.update_video_source. Once-per-session — the warned flag
-    is set in invoke() so re-toggling Source won't re-pop.
-    """
-    bl_idname = "blendcap.sequencer_warning"
-    bl_label = "Disable Sequencer for Rendering?"
-    bl_options = {'REGISTER', 'INTERNAL'}
-
-    def invoke(self, context, event):
-        blendcap_state['sequencer_warned'] = True
-        return context.window_manager.invoke_props_dialog(self, width=420)
-
-    def draw(self, context):
-        layout = self.layout
-        col = layout.column(align=True)
-        col.label(text="Output > Post Processing > Sequencer is enabled.",
-                  icon='ERROR')
-        col.separator()
-        col.label(text="When this is on, rendering the scene exports the VSE")
-        col.label(text="strips (your source video clips) instead of rendering")
-        col.label(text="the Blender scene.")
-        col.separator()
-        col.label(text="Click OK to disable it now, or Cancel to leave it on.")
-
-    def execute(self, context):
-        context.scene.render.use_sequencer = False
-        self.report({'INFO'}, "Disabled Output > Post Processing > Sequencer.")
-        return {'FINISHED'}
-
-
-class BLENDCAP_OT_vse_default_prompt(bpy.types.Operator):
-    """Pops when the Default Source pref is switched to Video Editor Strip
-    while Sequencer Render Warning is on 'Ask each time'. New files can't
-    pop the ask-each-time dialog (no interactive switch happens), so this
-    converts the pref to one of the two options that DO work for new
-    files: OK -> Turn off automatically, Cancel/ESC -> Leave it alone.
-    'Ask each time' is greyed out in the prefs UI while the default is
-    VSE (see _draw in the root __init__). Triggered from the root
-    __init__'s _update_default_video_source via a deferred timer.
-    """
-    bl_idname = "blendcap.vse_default_prompt"
-    bl_label = "Turn Off Sequencer Render in New Files?"
-    bl_options = {'REGISTER', 'INTERNAL'}
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=420)
-
-    def draw(self, context):
-        layout = self.layout
-        col = layout.column(align=True)
-        col.label(text="New files will start on the Video Editor strip, and",
-                  icon='INFO')
-        col.label(text="Blender's Output > Post Processing > Sequencer option")
-        col.label(text="is on in new files by default. When it's on, renders")
-        col.label(text="export the strip instead of your 3D scene.")
-        col.separator()
-        col.label(text="Click OK to turn it off automatically in new files,")
-        col.label(text="or Cancel to leave it alone.")
-        col.separator()
-        col.label(text="(This sets the Sequencer Render Warning preference;")
-        col.label(text="you can change it there any time.)")
-
-    def _set_behavior(self, context, value):
-        from .helpers import addon_prefs
-        prefs = addon_prefs(context)
-        if prefs is not None:
-            prefs.sequencer_export_behavior = value
-
-    def execute(self, context):
-        self._set_behavior(context, 'AUTO_DISABLE')
-        self.report({'INFO'},
-                    "New files will start with Sequencer render off.")
-        return {'FINISHED'}
-
-    def cancel(self, context):
-        # Cancel/ESC is a real choice here, not a dismissal: 'Ask each
-        # time' can't stay selected (it never fires for new files), so
-        # declining the auto-off means opting out entirely.
-        self._set_behavior(context, 'LEAVE')
 
 
 def _parse_vid_from_stem(stem):
@@ -1272,19 +1287,21 @@ def _parse_vid_from_stem(stem):
     Returned vid lets the Bake button rebuild the cache folder path
     (Capture_{vid}) and locate the source NPZs.
     """
+    from .helpers import stem_clip, stem_parts
     s = stem
     # Strip optional separate-face suffix '-{face_source}_F' so what's
-    # left is the body part {vid}_{codes}. Use rpartition so the last
-    # '-' wins (vid names are allowed to contain '-').
-    if "-" in s and s.endswith("_F"):
-        body_part, _, _ = s.rpartition("-")
-        s = body_part
-    if "_" not in s:
-        return None
-    vid, _, codes = s.rpartition("_")
-    if codes and all(c in "BHRF" for c in codes):
-        return vid
-    return None
+    # left is the body part. Use rpartition so the last '-' wins (vid
+    # names are allowed to contain '-'), and only when both halves are
+    # names of their own: a clip called 'cam-a' has a face-only BVH
+    # 'cam-a_F', which is one name, not two.
+    if "-" in s:
+        body_part, _, face_part = s.rpartition("-")
+        face = stem_parts(face_part)
+        if face is not None and face[1] == "F" and stem_parts(body_part) is not None:
+            s = body_part
+    # (helpers.stem_clip: a multi-camera take's number of cameras sits
+    # in front of the letters, 'Demo_4cBHR' is the capture 'Demo_4cam')
+    return stem_clip(s, _cache_dir())
 
 
 class BLENDCAP_OT_import_lib_bvh(bpy.types.Operator):
@@ -1295,7 +1312,18 @@ class BLENDCAP_OT_import_lib_bvh(bpy.types.Operator):
 
     def execute(self, context):
         full_path = os.path.join(_bvh_library_dir(), self.filename)
+        # Windows path limit (item 10): Blender can't see the file past it.
+        from .helpers import block_if_path_too_long
+        if block_if_path_too_long([(full_path, False, 'library')]):
+            return {'CANCELLED'}
         if os.path.exists(full_path):
+            # The library file is already on disk, so the dialog carries
+            # its path either way - a user whose Blender has no BVH
+            # importer at all can still go and fetch it.
+            if bvh_importer_state() != 'OK':
+                bpy.ops.blendcap.bvh_importer_missing('INVOKE_DEFAULT',
+                                                      bvh_path=full_path)
+                return {'CANCELLED'}
             stem = os.path.splitext(self.filename)[0]
             _import_bvh(full_path, stem)
             # Stamp the same provenance + baked-totals custom props the
@@ -1328,12 +1356,297 @@ class BLENDCAP_OT_import_lib_bvh(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class BLENDCAP_OT_export_lib_bvh(bpy.types.Operator):
+# --- Save BVH / Save FBX: what the two dialogs offer ------------------------
+EXPORT_POSE_REST = '__REST__'
+_EXPORT_POSE_ITEMS = []     # keeps the dynamic enum's strings alive
+
+
+def _export_pose_items(self, context):
+    """BlendCap's own rest pose, then every rest pose preset that was saved
+    from BlendCap's skeleton (the file written is always that skeleton)."""
+    global _EXPORT_POSE_ITEMS
+    items = [(EXPORT_POSE_REST, "BlendCap Rest Pose",
+              "The pose BlendCap's own skeleton rests in")]
+    try:
+        from .properties import get_rest_pose_preset_items
+        from .operators_rest_pose import preset_fits_blendcap
+        for item in get_rest_pose_preset_items(None, context):
+            if not item:            # (a separator line of that list)
+                continue
+            ident, label = item[0], item[1]
+            if ident.startswith('__') or not os.path.isfile(ident):
+                continue
+            if not preset_fits_blendcap(ident):
+                continue
+            label = label.strip()
+            if label.startswith("BlendCap"):
+                label = os.path.splitext(os.path.basename(ident))[0]
+            items.append((ident, label, "Rest pose preset"))
+    except Exception as e:
+        print(f"[BlendCap] rest pose presets not listed: {e}")
+    _EXPORT_POSE_ITEMS = items
+    return items
+
+
+def _action_span(obj):
+    """(first, last) frame of the motion on `obj`, or None."""
+    action = obj.animation_data.action if obj.animation_data else None
+    if action is None:
+        return None
+    a, b = action.frame_range
+    return int(round(a)), int(round(b))
+
+
+def _add_pose_frame(context, obj, preset):
+    """One extra frame in front of the motion on `obj`, holding a rest
+    pose: BlendCap's own (every bone at rest) or a rest pose preset. The
+    body stands where the motion starts, at the pose's own height, not
+    turned. The motion keeps its frame numbers and the pose goes on the
+    frame before it, except when that would be a negative frame: then the
+    motion moves one frame later. Returns an error text, or None."""
+    from mathutils import Matrix
+    from .retarget.fcurves import _iter_action_fcurves
+    from .operators_rest_pose import pose_rig_from_preset
+    span = _action_span(obj)
+    if span is None:
+        return "The motion has no keyframes."
+    action = obj.animation_data.action
+    fcurves = list(_iter_action_fcurves(action))
+    first = span[0]
+    pose_f = first - 1
+    if pose_f < 0:
+        shift = -pose_f
+        for fc in fcurves:
+            for kp in fc.keyframe_points:
+                kp.co.x += shift
+                kp.handle_left.x += shift
+                kp.handle_right.x += shift
+            fc.update()
+        first += shift
+        pose_f = 0
+    scene = context.scene
+    saved_frame = scene.frame_current
+    ts = scene.tool_settings
+    prev_auto = ts.use_keyframe_insert_auto
+    ts.use_keyframe_insert_auto = False
+    try:
+        # where the motion starts
+        scene.frame_set(first)
+        context.view_layer.update()
+        mw = obj.matrix_world.copy()
+        roots = [pb for pb in obj.pose.bones if pb.parent is None]
+        starts = {pb.name: (mw @ pb.matrix).translation.copy() for pb in roots}
+        # the pose
+        scene.frame_set(pose_f)
+        for pb in obj.pose.bones:
+            pb.matrix_basis = Matrix()
+        context.view_layer.update()
+        if preset != EXPORT_POSE_REST:
+            _n, err = pose_rig_from_preset(obj, preset)
+            if err:
+                return err
+            context.view_layer.update()
+        # stand it where the motion starts (across the floor only)
+        turn = mw.to_3x3().inverted()
+        for pb in roots:
+            d = starts[pb.name] - (mw @ pb.matrix).translation
+            d.z = 0.0
+            pb.location = pb.location + (
+                pb.bone.matrix_local.to_3x3().inverted() @ (turn @ d))
+        context.view_layer.update()
+        located = {fc.data_path for fc in fcurves
+                   if fc.data_path.endswith('.location')}
+        for pb in obj.pose.bones:
+            mode = pb.rotation_mode
+            path = ('rotation_quaternion' if mode == 'QUATERNION'
+                    else 'rotation_axis_angle' if mode == 'AXIS_ANGLE'
+                    else 'rotation_euler')
+            pb.keyframe_insert(path, frame=pose_f)
+            if (pb.parent is None
+                    or f'pose.bones["{pb.name}"].location' in located):
+                pb.keyframe_insert('location', frame=pose_f)
+    finally:
+        ts.use_keyframe_insert_auto = prev_auto
+        scene.frame_set(saved_frame)
+    return None
+
+
+def _save_name(source_bvh):
+    """The name a saved file carries: the take's, with "_e1" on the end.
+
+    An FBX keeps two names somebody opening it elsewhere gets to see:
+    the rig's (the name of the object it was saved from) and the
+    animation's (the name of the scene it was saved from). Both get
+    this one. The take's bare name cannot be used: a take loaded in the
+    project already has it, and Blender would hand out ".001".
+
+    The number is the first one nothing in the project has, and that is
+    not cosmetic. _import_bvh REPLACES an armature that already has the
+    name it is given, and gives the new rig the old one's place,
+    rotation and scale (what a re-import of a take wants). A rig read
+    back from one of our FBX files has the name the next save would
+    use: with a fixed name, saving again deleted that rig from the
+    project and wrote its rotation into the new file (found 2026-11-20
+    in a check: a take saved again after its FBX had been read back and
+    turned came out lying down). So "_e2" with "_e1" in the project."""
+    base = os.path.splitext(source_bvh)[0]
+    n = 1
+    while True:
+        name = f"{base}_e{n}"
+        # (objects for the rig, scenes for the animation; data nobody is
+        # using any more does not count, or the number would climb with
+        # every rig read back and deleted again)
+        if name not in bpy.data.objects and name not in bpy.data.scenes:
+            return name
+        n += 1
+
+
+def _scene_frames(scene):
+    return scene.frame_start, scene.frame_end, scene.frame_current
+
+
+def _scene_frames_restore(scene, saved):
+    """The save dialogs import the BVH into a throwaway rig, which lengthens
+    the scene to fit it, and the FBX exporter reads its range from the
+    scene: put the user's own range back."""
+    try:
+        start, end, current = saved
+        scene.frame_end = max(end, scene.frame_start)
+        scene.frame_start = start
+        scene.frame_end = end
+        if scene.frame_current != current:
+            scene.frame_set(current)
+    except Exception as e:
+        print(f"[BlendCap] scene frame range not put back: {e}")
+
+
+def _save_scene_make(scene, name):
+    """A throwaway scene for a save to work in.
+
+    The save imports the BVH into a temporary rig, bakes Root into Hips,
+    may add the rest pose frame, and hands the rig to Blender's exporter.
+    Three of those four step through every frame of the motion, and in
+    the user's own scene every step re-evaluates the whole project: with
+    a heavy project open (character rigs, constraints, drivers) a save
+    that takes seconds took minutes, Blender not responding meanwhile
+    (found live 2026-11-20). In a scene that holds nothing but the
+    temporary rig a step costs the same whatever is open. It also means
+    the user's scene, selection and frame range are never touched.
+    Frame rate and units are copied: both exporters read them. The
+    scene's name is what the FBX exporter calls the animation in the
+    file, hence the take's (see _save_name)."""
+    work = bpy.data.scenes.new(name)
+    try:
+        work.render.fps = scene.render.fps
+        work.render.fps_base = scene.render.fps_base
+        work.unit_settings.system = scene.unit_settings.system
+        work.unit_settings.scale_length = scene.unit_settings.scale_length
+    except Exception as e:
+        print(f"[BlendCap] save scene: settings not copied: {e}")
+    return work
+
+
+def _save_scene_drop(work):
+    try:
+        for o in list(work.collection.all_objects):
+            data = o.data
+            bpy.data.objects.remove(o, do_unlink=True)
+            if (data is not None and data.users == 0
+                    and isinstance(data, bpy.types.Armature)):
+                bpy.data.armatures.remove(data)
+        bpy.data.scenes.remove(work)
+    except Exception as e:
+        print(f"[BlendCap] save scene not removed: {e}")
+
+
+def _save_in_own_scene(op, context):
+    """Run op._save in a throwaway scene (see _save_scene_make)."""
+    src = os.path.join(_bvh_library_dir(), op.source_bvh)
+    if os.path.exists(src) and bvh_importer_state() != 'OK':
+        # (asked here, in the user's own scene: the window it opens
+        # must not belong to a scene that is about to be removed)
+        bpy.ops.blendcap.bvh_importer_missing('INVOKE_DEFAULT',
+                                              bvh_path=src)
+        return {'CANCELLED'}
+    own = context.scene
+    saved = _scene_frames(own)
+    name = _save_name(op.source_bvh)
+    win = context.window
+    if win is None:
+        wins = context.window_manager.windows
+        win = wins[0] if wins else None
+    if win is None or win.scene is not own:
+        # No window to show another scene in: work in the user's own
+        # scene, as the save always did.
+        try:
+            return op._save(context, name)
+        finally:
+            _scene_frames_restore(own, saved)
+    # The window shows the throwaway scene for the length of the save.
+    # (Overriding the scene alone is not enough: Blender's BVH importer
+    # switches the rig into edit mode, which only works in the scene the
+    # window is really showing.) Nothing is drawn meanwhile: the save
+    # does not hand control back until the window is on its own scene.
+    layer = win.view_layer.name
+    work = _save_scene_make(own, name)
+    try:
+        win.scene = work
+        with context.temp_override(window=win):
+            return op._save(bpy.context, name)
+    finally:
+        try:
+            win.scene = own
+            if layer in own.view_layers:
+                win.view_layer = own.view_layers[layer]
+        except Exception as e:
+            print(f"[BlendCap] the window was not put back on its scene: {e}")
+        _save_scene_drop(work)
+        _scene_frames_restore(own, saved)
+
+
+class _LibSaveOptions:
+    """What both save dialogs offer."""
+    add_pose_frame: bpy.props.BoolProperty(
+        name="Add Rest Pose Frame",
+        default=False,
+        description=("Put one extra frame at the start of the file holding "
+                     "a rest pose, for software that sets up retargeting "
+                     "from the first frame"))
+    pose_preset: bpy.props.EnumProperty(
+        name="Pose",
+        items=_export_pose_items,
+        description="The pose the extra first frame holds")
+    export_scale: bpy.props.FloatProperty(
+        name="Scale",
+        default=1.0, min=0.001, max=1000.0,
+        description=("Size of the saved skeleton and its motion. BlendCap "
+                     "works in metres; 100 gives centimetres"))
+
+    def _draw_shared(self, layout):
+        """Draws what both dialogs share. Returns (the column for a
+        checkbox, the column for a labelled field): the dialog's side
+        panel is narrow, and a checkbox's name only fits at full width."""
+        layout.use_property_decorate = False
+        col = layout.column()
+        col.prop(self, "add_pose_frame")
+        sub = col.column()
+        sub.use_property_split = True
+        sub.enabled = self.add_pose_frame
+        sub.prop(self, "pose_preset")
+        col.separator()
+        fields = col.column()
+        fields.use_property_split = True
+        fields.prop(self, "export_scale")
+        return col, fields
+
+
+@orientation_helper(axis_forward='-Z', axis_up='Y')
+class BLENDCAP_OT_export_lib_bvh(_LibSaveOptions, bpy.types.Operator):
     bl_idname = "blendcap.export_lib_bvh"
-    bl_label = "Export BVH"
+    bl_label = "Save BVH"
     bl_description = ("Save the selected BVH from the library to a chosen "
                       "location (Root locomotion well baked into the hip bone).")
-    source_bvh: bpy.props.StringProperty()
+    source_bvh: bpy.props.StringProperty(options={'HIDDEN'})
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
     filter_glob: bpy.props.StringProperty(default="*.bvh", options={'HIDDEN'})
 
@@ -1342,7 +1655,20 @@ class BLENDCAP_OT_export_lib_bvh(bpy.types.Operator):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
+    def draw(self, context):
+        _col, fields = self._draw_shared(self.layout)
+        fields.prop(self, "axis_forward")
+        fields.prop(self, "axis_up")
+
     def execute(self, context):
+        if self.axis_forward[-1] == self.axis_up[-1]:
+            # (the dialog cannot get here: picking one moves the other)
+            self.report({'ERROR'},
+                        "Forward and Up cannot be the same axis.")
+            return {'CANCELLED'}
+        return _save_in_own_scene(self, context)
+
+    def _save(self, context, tmp_name):
         src = os.path.join(_bvh_library_dir(), self.source_bvh)
         if not os.path.exists(src):
             self.report({'ERROR'}, f"Source BVH not found: {self.source_bvh}")
@@ -1358,8 +1684,10 @@ class BLENDCAP_OT_export_lib_bvh(bpy.types.Operator):
         prev_active = context.view_layer.objects.active
         prev_selected = [o for o in context.view_layer.objects
                          if o.select_get()]
-        tmp_name = (f"_BlendCap_BVH_TMP_"
-                    f"{os.path.splitext(self.source_bvh)[0]}")
+        if bvh_importer_state() != 'OK':
+            bpy.ops.blendcap.bvh_importer_missing('INVOKE_DEFAULT',
+                                                  bvh_path=src)
+            return {'CANCELLED'}
         try:
             _import_bvh(src, tmp_name)
         except Exception as e:
@@ -1378,6 +1706,15 @@ class BLENDCAP_OT_export_lib_bvh(bpy.types.Operator):
         except Exception as e:
             restructure_err = str(e)
 
+        pose_err = None
+        if restructure_err is None and self.add_pose_frame:
+            try:
+                pose_err = _add_pose_frame(context, tmp_obj, self.pose_preset)
+            except Exception as e:
+                pose_err = f"The rest pose frame could not be added ({e})"
+        # The whole motion, whatever the scene's frame range is.
+        span = _action_span(tmp_obj)
+
         tmp_action = (tmp_obj.animation_data.action
                       if tmp_obj.animation_data else None)
         tmp_data = tmp_obj.data
@@ -1390,9 +1727,9 @@ class BLENDCAP_OT_export_lib_bvh(bpy.types.Operator):
         tmp_obj.select_set(True)
         context.view_layer.objects.active = tmp_obj
 
-        export_ok = restructure_err is None
+        export_ok = restructure_err is None and pose_err is None
         export_err = (f"Restructure failed: {restructure_err}"
-                      if restructure_err else None)
+                      if restructure_err else pose_err)
         if export_ok:
             # Blender's BVH exporter writes bone.head_local verbatim with
             # no axis conversion (export_bvh.py around line 81), so a
@@ -1419,8 +1756,11 @@ class BLENDCAP_OT_export_lib_bvh(bpy.types.Operator):
                 # that turns the exported skeleton around. Invert to
                 # undo the import's rotation; this matrix is not
                 # self-inverse.
+                # The dialog's Forward and Up; -Z and Y (the default)
+                # is the frame described above. Y and Z is Blender's
+                # own, where this rotation is no rotation at all.
                 M = axis_conversion(
-                    from_forward='-Z', from_up='Y'
+                    from_forward=self.axis_forward, from_up=self.axis_up
                 ).to_4x4()
                 tmp_obj.matrix_world = M.inverted()
                 context.view_layer.update()
@@ -1441,9 +1781,11 @@ class BLENDCAP_OT_export_lib_bvh(bpy.types.Operator):
                         location=False, rotation=True, scale=False)
                     bpy.ops.export_anim.bvh(
                         filepath=dst,
-                        global_scale=1.0,
-                        frame_start=context.scene.frame_start,
-                        frame_end=context.scene.frame_end,
+                        global_scale=self.export_scale,
+                        frame_start=(span[0] if span
+                                     else context.scene.frame_start),
+                        frame_end=(span[1] if span
+                                   else context.scene.frame_end),
                         rotate_mode='NATIVE',
                         root_transform_only=False,
                     )
@@ -1489,21 +1831,44 @@ class BLENDCAP_OT_export_lib_bvh(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class BLENDCAP_OT_export_lib_fbx(bpy.types.Operator):
+@orientation_helper(axis_forward='-Z', axis_up='Y')
+class BLENDCAP_OT_export_lib_fbx(_LibSaveOptions, bpy.types.Operator):
     bl_idname = "blendcap.export_lib_fbx"
-    bl_label = "Export FBX"
+    bl_label = "Save FBX"
     bl_description = ("Convert the selected BVH to an FBX file and save it to "
                       "a chosen location (Root locomotion well baked into the hip bone).")
-    source_bvh: bpy.props.StringProperty()
+    source_bvh: bpy.props.StringProperty(options={'HIDDEN'})
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
     filter_glob: bpy.props.StringProperty(default="*.fbx", options={'HIDDEN'})
+    add_leaf_bones: bpy.props.BoolProperty(
+        name="Add Leaf Bones",
+        default=True,
+        description=("Add an end bone to every chain (the ends of the "
+                     "fingers, the toes, the head). Some software needs "
+                     "them to draw the last bone at its real length; "
+                     "others show them as extra bones"))
 
     def invoke(self, context, event):
         self.filepath = os.path.splitext(self.source_bvh)[0] + ".fbx"
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
+    def draw(self, context):
+        col, fields = self._draw_shared(self.layout)
+        fields.prop(self, "axis_forward")
+        fields.prop(self, "axis_up")
+        col.separator()
+        col.prop(self, "add_leaf_bones")
+
     def execute(self, context):
+        if self.axis_forward[-1] == self.axis_up[-1]:
+            # (the dialog cannot get here: picking one moves the other)
+            self.report({'ERROR'},
+                        "Forward and Up cannot be the same axis.")
+            return {'CANCELLED'}
+        return _save_in_own_scene(self, context)
+
+    def _save(self, context, tmp_name):
         src = os.path.join(_bvh_library_dir(), self.source_bvh)
         if not os.path.exists(src):
             self.report({'ERROR'}, f"Source BVH not found: {self.source_bvh}")
@@ -1517,7 +1882,10 @@ class BLENDCAP_OT_export_lib_fbx(bpy.types.Operator):
         prev_selected = [o for o in context.view_layer.objects if o.select_get()]
 
         # Quietly import the BVH.
-        tmp_name = f"_BlendCap_FBX_TMP_{os.path.splitext(self.source_bvh)[0]}"
+        if bvh_importer_state() != 'OK':
+            bpy.ops.blendcap.bvh_importer_missing('INVOKE_DEFAULT',
+                                                  bvh_path=src)
+            return {'CANCELLED'}
         try:
             _import_bvh(src, tmp_name)
         except Exception as e:
@@ -1538,6 +1906,15 @@ class BLENDCAP_OT_export_lib_fbx(bpy.types.Operator):
         except Exception as e:
             restructure_err = str(e)
 
+        pose_err = None
+        if restructure_err is None and self.add_pose_frame:
+            try:
+                pose_err = _add_pose_frame(context, tmp_obj, self.pose_preset)
+            except Exception as e:
+                pose_err = f"The rest pose frame could not be added ({e})"
+        # The whole motion, whatever the scene's frame range is.
+        span = _action_span(tmp_obj)
+
         tmp_action = None
         if tmp_obj.animation_data and tmp_obj.animation_data.action:
             tmp_action = tmp_obj.animation_data.action
@@ -1552,9 +1929,9 @@ class BLENDCAP_OT_export_lib_fbx(bpy.types.Operator):
         tmp_obj.select_set(True)
         context.view_layer.objects.active = tmp_obj
 
-        export_ok = restructure_err is None
+        export_ok = restructure_err is None and pose_err is None
         export_err = (f"Restructure failed: {restructure_err}"
-                      if restructure_err else None)
+                      if restructure_err else pose_err)
         if export_ok:
             try:
                 # Same frozen-context issue as the BVH export above, but
@@ -1562,6 +1939,12 @@ class BLENDCAP_OT_export_lib_fbx(bpy.types.Operator):
                 # selection, so this could silently export the user's
                 # selected objects instead of the temp armature. Override
                 # pins both to the temp armature.
+                if span:
+                    # The exporter bakes the scene's frame range.
+                    context.scene.frame_end = max(span[1],
+                                                  context.scene.frame_start)
+                    context.scene.frame_start = span[0]
+                    context.scene.frame_end = span[1]
                 with context.temp_override(
                         object=tmp_obj, active_object=tmp_obj,
                         selected_objects=[tmp_obj],
@@ -1574,7 +1957,10 @@ class BLENDCAP_OT_export_lib_fbx(bpy.types.Operator):
                         bake_anim_use_all_bones=True,
                         bake_anim_use_nla_strips=False,
                         bake_anim_use_all_actions=False,
-                        add_leaf_bones=True,
+                        add_leaf_bones=self.add_leaf_bones,
+                        global_scale=self.export_scale,
+                        axis_forward=self.axis_forward,
+                        axis_up=self.axis_up,
                     )
             except Exception as e:
                 export_ok = False

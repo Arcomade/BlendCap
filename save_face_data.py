@@ -27,6 +27,7 @@ import os
 import argparse
 import bisect
 import json
+import math
 import numpy as np
 import cv2
 from pathlib import Path
@@ -45,7 +46,12 @@ os.environ.setdefault("YOLO_OFFLINE", "true")
 
 # ── Project root = directory containing this script ──────────
 SCRIPT_DIR = Path(__file__).parent.absolute()
-CKPT_DIR = SCRIPT_DIR / "checkpoints"
+# Model files live in the addon's dependency storage location; the
+# addon passes it via BLENDCAP_CHECKPOINTS (helpers._subprocess_env).
+# Fallback: next to this script - the pre-1.0.6 layout, and what a
+# bare manual run of this script should still use.
+CKPT_DIR = Path(os.environ.get("BLENDCAP_CHECKPOINTS")
+                or (SCRIPT_DIR / "checkpoints"))
 MEDIAPIPE_DIR = CKPT_DIR / "mediapipe"
 
 # Lazy-loaded mediapipe module
@@ -889,10 +895,21 @@ def _nearest_sample(idx, sample_indices):
     return pos
 
 
+def _status_text(frame, text, colour, right=False):
+    """The preview's status line, top left of the picture, or top right
+    (a multi-camera preview: the camera letter takes the top left of
+    each tile). Mirror of save_mhr_data._status_text."""
+    x = 20
+    if right:
+        (tw, _th), _base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)
+        x = max(20, frame.shape[1] - tw - 20)
+    cv2.putText(frame, text, (x, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.5, colour, 3)
+
+
 def run_preview(video_path, landmarker, output_path, body_data=None,
                 pose_estimator=None, face_detector=None, detector_type=None,
                 step=10, max_frames=0, start_frame=0, bg_video=None,
-                body_boxes=None):
+                body_boxes=None, status_right=False):
     """Preview face detection on video, in two passes. Green = face
     found, red = no face.
 
@@ -1060,12 +1077,27 @@ def run_preview(video_path, landmarker, output_path, body_data=None,
         print(f"ERROR: Cannot create output video {output_path}")
         sys.exit(1)
 
+    # Colour: OpenCV decodes every file as BT.601. The source frames
+    # drawn here are corrected for a source tagged otherwise, so the
+    # preview shows the same colours as the original strip
+    # (pipeline/video_colour.py). Render pass only - detection above saw
+    # the frames as before. A body-preview background is already a
+    # corrected, untagged file and is left alone. A bare copy of this
+    # script without pipeline/ renders uncorrected.
+    try:
+        from pipeline.video_colour import frame_fix, apply_fix
+        colour_fix = frame_fix(video_path, log=print)
+    except Exception:
+        colour_fix = None
+
     cap.set(cv2.CAP_PROP_POS_FRAMES, render_start)
     n_render = max(1, render_end - render_start)
     for idx in range(render_start, render_end):
         ret, frame = cap.read()
         if not ret:
             break
+        if colour_fix is not None:
+            frame = apply_fix(frame, colour_fix)
 
         # Canvas: the body preview frame in combined mode, else the source.
         if bg_cap is not None:
@@ -1086,11 +1118,9 @@ def run_preview(video_path, landmarker, output_path, body_data=None,
                 bx1, by1, bx2, by2 = (int(v) for v in bbox[:4])
                 cv2.rectangle(draw_frame, (bx1, by1), (bx2, by2),
                               (0, 255, 0), 3, cv2.LINE_AA)
-                cv2.putText(draw_frame, "BODY OK", (20, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                _status_text(draw_frame, "BODY OK", (0, 255, 0), status_right)
             else:
-                cv2.putText(draw_frame, "NO PERSON", (20, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+                _status_text(draw_frame, "NO PERSON", (0, 0, 255), status_right)
 
         a, b, t = _preview_payload_at(idx, sample_indices, sample_payloads)
         if a is not None and b is not None:
@@ -1118,8 +1148,7 @@ def run_preview(video_path, landmarker, output_path, body_data=None,
                 cv2.putText(draw_frame, f"FACE {x2-x1}x{y2-y1}",
                             (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             else:
-                cv2.putText(draw_frame, "FACE OK", (20, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
+                _status_text(draw_frame, "FACE OK", color, status_right)
             if lms is not None:
                 draw_face_landmarks(draw_frame, lms)
         else:
@@ -1141,8 +1170,7 @@ def run_preview(video_path, landmarker, output_path, body_data=None,
                 cv2.putText(draw_frame, label, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             else:
-                cv2.putText(draw_frame, label, (20, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
+                _status_text(draw_frame, label, color, status_right)
 
         cv2.putText(draw_frame, f"Frame {idx}", (20, height - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -1176,6 +1204,257 @@ def run_preview(video_path, landmarker, output_path, body_data=None,
         if missed > total_checked * 0.3:
             print("  MediaPipe is not finding a face in many frames.")
             print("  The subject may be facing away or the face may be too small.")
+
+
+# =====================================================================
+#  PREVIEW, MULTI-PERSON
+# =====================================================================
+
+def load_face_landmarker_image(model_path):
+    """The face landmarker in IMAGE mode: every call stands on its own.
+    The multi-person preview looks at several people's crops on one
+    frame; the VIDEO-mode landmarker follows ONE face from call to call
+    and needs rising timestamps, so it cannot be asked about a second
+    person on the same frame."""
+    mp = _get_mp()
+    options = mp.tasks.vision.FaceLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
+        running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        num_faces=1,
+    )
+    return mp.tasks.vision.FaceLandmarker.create_from_options(options)
+
+
+def _face_in_body_box(lm_image, face_detector, detector_type, frame_bgr, body_box):
+    """Look for the face of the person in `body_box`: (crop box, landmarks
+    in frame pixels) or None. The face detector is asked about the top of
+    the box first (a standing person's head), then about the whole box
+    (bent over, sitting, lying); the landmarker then has to find a face
+    in what the detector pointed at."""
+    mp = _get_mp()
+    fh, fw = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = (int(round(v)) for v in body_box[:4])
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(fw, x2), min(fh, y2)
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 8 or bh < 8:
+        return None
+    pad = int(0.1 * bw)
+    regions = [(max(0, x1 - pad), max(0, y1 - int(0.05 * bh)),
+                min(fw, x2 + pad), y1 + max(8, int(0.45 * bh))),
+               (x1, y1, x2, y2)]
+    for rx1, ry1, rx2, ry2 in regions:
+        region = frame_bgr[ry1:ry2, rx1:rx2]
+        if region.size == 0:
+            continue
+        found, _n = detect_face_box(face_detector, detector_type, region)
+        if found is None:
+            continue
+        cx1, cy1 = max(0, int(found[0]) + rx1), max(0, int(found[1]) + ry1)
+        cx2, cy2 = min(fw, int(found[2]) + rx1), min(fh, int(found[3]) + ry1)
+        if cx2 - cx1 < 8 or cy2 - cy1 < 8:
+            continue
+        crop = frame_bgr[cy1:cy2, cx1:cx2]
+        try:
+            res = lm_image.detect(mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
+        except Exception:
+            continue
+        if not res.face_landmarks:
+            continue
+        raw = res.face_landmarks[0]
+        lms = np.empty((len(raw), 3), dtype=np.float32)
+        for i, lm in enumerate(raw):
+            lms[i] = (lm.x, lm.y, lm.z)
+        lms[:, 0] = lms[:, 0] * (cx2 - cx1) + cx1
+        lms[:, 1] = lms[:, 1] * (cy2 - cy1) + cy1
+        lms[:, 2] *= (cx2 - cx1)
+        return [float(cx1), float(cy1), float(cx2), float(cy2)], lms
+    return None
+
+
+def _match_people(a, b):
+    """Which body boxes of two checked frames are the same person:
+    [(i, j)]. Mirror of save_mhr_data._match_people (these scripts stay
+    standalone): nearest centres first, only while the centres are
+    closer than half the larger box's diagonal."""
+    cand = []
+    for i, p in enumerate(a):
+        for j, q in enumerate(b):
+            d = math.hypot((p[0] + p[2] - q[0] - q[2]) / 2.0,
+                           (p[1] + p[3] - q[1] - q[3]) / 2.0)
+            reach = 0.5 * max(math.hypot(p[2] - p[0], p[3] - p[1]),
+                              math.hypot(q[2] - q[0], q[3] - q[1]))
+            if d <= reach:
+                cand.append((d, i, j))
+    pairs, used_a, used_b = [], set(), set()
+    for _d, i, j in sorted(cand):
+        if i not in used_a and j not in used_b:
+            pairs.append((i, j))
+            used_a.add(i)
+            used_b.add(j)
+    return pairs
+
+
+def _lerp_face(fa, fb, t, first_half):
+    """A person's face between two checked frames: moved from one to the
+    other when it was found on both, else the nearer frame's (which may
+    be none)."""
+    if fa is not None and fb is not None:
+        ca, la = fa
+        cb, lb = fb
+        crop = [av + (bv - av) * t for av, bv in zip(ca, cb)]
+        lms = la + (lb - la) * t if la.shape == lb.shape else (la if first_half else lb)
+        return crop, lms
+    return fa if first_half else fb
+
+
+def _people_at(idx, sample_indices, samples, pairs_cache):
+    """Everybody on frame `idx`: [(body box, face or None)], from the
+    checked frames either side (samples[i] = [(box, face), ...])."""
+    n = len(sample_indices)
+    if n == 0:
+        return []
+    pos = bisect.bisect_right(sample_indices, idx)
+    if pos == 0:
+        return samples[0]
+    if pos >= n:
+        return samples[n - 1]
+    i0, i1 = pos - 1, pos
+    a, b = samples[i0], samples[i1]
+    f0, f1 = sample_indices[i0], sample_indices[i1]
+    if i0 not in pairs_cache:
+        pairs_cache.clear()
+        pairs_cache[i0] = _match_people([p[0] for p in a], [p[0] for p in b])
+    pairs = pairs_cache[i0]
+    t = (idx - f0) / float(f1 - f0)
+    first_half = (idx - f0) <= (f1 - idx)
+    out = [([av + (bv - av) * t for av, bv in zip(a[i][0], b[j][0])],
+            _lerp_face(a[i][1], b[j][1], t, first_half)) for i, j in pairs]
+    if first_half:
+        seen = {i for i, _j in pairs}
+        out += [p for i, p in enumerate(a) if i not in seen]
+    else:
+        seen = {j for _i, j in pairs}
+        out += [p for j, p in enumerate(b) if j not in seen]
+    return out
+
+
+def run_people_preview(video_path, lm_image, output_path, side, face_detector,
+                       detector_type, status_right=False):
+    """The combined body + face preview of a multi-person mode: a box on
+    EVERYBODY the body preview found (`side`: its sidecar, written by
+    save_mhr_data --preview --people --boxes-out), and on each of them
+    the face that was found, or NO FACE in red.
+
+    The same two passes as run_preview: faces are looked for on the
+    checked frames only, then every frame is written with the boxes and
+    face markers moved between them. No numbers on anybody: who is who
+    comes from the capture. The capture finds each face from that
+    person's tracked head, which is surer than a detector asked about a
+    box, so a NO FACE here is not the capture's last word."""
+    print(f"\nReading video: {video_path}")
+    cap = open_video(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    vid_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    sample_indices = [int(i) for i in side.get("sample_indices", [])]
+    people = list(side.get("people", []))
+    k = min(len(sample_indices), len(people))
+    sample_indices, people = sample_indices[:k], people[:k]
+    render_start = int(side.get("start_frame", sample_indices[0] if sample_indices else 0))
+    render_end = min(int(side.get("end_frame", vid_total)), vid_total)
+
+    max_edge = 1920
+    if max(width, height) > max_edge:
+        scale = max_edge / max(width, height)
+        out_w = int(width * scale) // 2 * 2
+        out_h = int(height * scale) // 2 * 2
+    else:
+        out_w, out_h = width, height
+    print(f"  {k} frames to check (everybody's face)")
+    print(f"  Preview resolution: {out_w}x{out_h}")
+
+    # -- Pass 1: a face for every body box of every checked frame
+    samples = []
+    last_read_idx = None
+    seen = found = 0
+    for count, vid_idx in enumerate(sample_indices):
+        frame, last_read_idx = _read_frame(cap, vid_idx, last_read_idx)
+        if frame is None:
+            samples.append([])
+            continue
+        here = []
+        for box in people[count]:
+            face = _face_in_body_box(lm_image, face_detector, detector_type, frame, box)
+            here.append(([float(v) for v in box[:4]], face))
+            seen += 1
+            found += face is not None
+        samples.append(here)
+        if k > 0:
+            emit_progress(15 + (count + 1) / k * 55, f"Face preview {count + 1}/{k}")
+        if count % 10 == 0:
+            got = sum(1 for _b, f in here if f is not None)
+            print(f"  Frame {vid_idx} - {len(here)} people, {got} with a face")
+
+    # -- Pass 2: every frame, boxes and faces moved between the checked ones
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                             fps, (out_w, out_h))
+    if not writer.isOpened():
+        print(f"ERROR: Cannot create output video {output_path}")
+        sys.exit(1)
+    try:
+        from pipeline.video_colour import frame_fix, apply_fix
+        colour_fix = frame_fix(video_path, log=print)
+    except Exception:
+        colour_fix = None
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, render_start)
+    n_render = max(1, render_end - render_start)
+    pairs_cache = {}
+    green, red = (0, 255, 0), (0, 0, 255)
+    for idx in range(render_start, render_end):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if colour_fix is not None:
+            frame = apply_fix(frame, colour_fix)
+        here = _people_at(idx, sample_indices, samples, pairs_cache)
+        for box, face in here:
+            bx1, by1, bx2, by2 = (int(v) for v in box[:4])
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), green, 3, cv2.LINE_AA)
+            if face is not None:
+                crop, lms = face
+                x1, y1, x2, y2 = (int(v) for v in crop)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), green, 2)
+                cv2.putText(frame, f"FACE {x2 - x1}x{y2 - y1}", (x1, max(20, y1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, green, 2)
+                draw_face_landmarks(frame, lms)
+            else:
+                cv2.putText(frame, "NO FACE", (bx1, max(25, by1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, red, 2)
+        if here:
+            _status_text(frame, "1 PERSON" if len(here) == 1 else f"{len(here)} PEOPLE",
+                         green, status_right)
+        else:
+            _status_text(frame, "NO PERSON", red, status_right)
+        cv2.putText(frame, f"Frame {idx}", (20, height - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        if (out_w, out_h) != (width, height):
+            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        writer.write(frame)
+        done = idx - render_start + 1
+        if done % 50 == 0 or done == n_render:
+            emit_progress(70 + done / n_render * 30, f"Rendering preview {done}/{n_render}")
+
+    cap.release()
+    writer.release()
+    size_mb = os.path.getsize(str(output_path)) / (1024 * 1024)
+    print(f"\nPreview saved: {output_path} ({size_mb:.1f} MB)")
+    print(f"  {k} frames checked: a face on {found} of {seen} people seen")
 
 
 # =====================================================================
@@ -1400,6 +1679,67 @@ def run_inference(video_path, landmarker, output, body_data=None,
 
 
 # =====================================================================
+#  MULTI-PERSON CAPTURE
+# =====================================================================
+
+def run_people(video, landmarker, folder, output):
+    """One face capture per person of a multi-person capture, one after
+    the other, each cropped to that person's own head (their body
+    track's keypoints, exactly as a body + face capture crops). Written
+    next to each track (people/track_NN_face.npz); `output` gets the
+    most prominent person's, so the folder still reads as an ordinary
+    capture. A person whose face is never found has no file, and only a
+    take where NOBODY's face is found counts as a failed face step."""
+    global emit_progress
+    import json
+    import shutil
+    from pipeline.people_tracks import track_path, face_path
+    with open(os.path.join(str(folder), "people.json"), encoding="utf-8") as fh:
+        table = json.load(fh)
+    ids = [int(t["id"]) for t in table.get("tracks", [])]
+    real = emit_progress
+    got = []
+    for i, tid in enumerate(ids):
+        body_path = track_path(str(folder), tid)
+        out = face_path(str(folder), tid)
+        if os.path.isfile(out):
+            os.remove(out)
+        if not os.path.isfile(body_path):
+            continue
+
+        def scaled(pct, msg="", i=i):
+            done = (i + max(0.0, min(100.0, float(pct))) / 100.0) / max(1, len(ids))
+            real(15 + done * 85, f"Person {i + 1}/{len(ids)}: {msg}")
+        emit_progress = scaled
+        print(f"\n--- Person {tid} ({i + 1} of {len(ids)}) ---")
+        try:
+            body_data, issues = validate_body_npz(body_path, video)
+            if body_data is None:
+                print(f"  Person {tid}: body track not usable ({'; '.join(issues)})")
+                continue
+            run_inference(video, landmarker, out, body_data=body_data)
+            got.append(tid)
+        except SystemExit:
+            print(f"  Person {tid}: no face found, left without face data")
+            if os.path.isfile(out):
+                os.remove(out)
+        finally:
+            emit_progress = real
+    if not got:
+        print("\nERROR: No frames with detected faces!")
+        print("  Check that the subjects' faces are visible in the video.")
+        sys.exit(1)
+    main_id = int(table.get("main", got[0]))
+    if output:
+        if main_id in got:
+            shutil.copyfile(face_path(str(folder), main_id), str(output))
+        elif os.path.isfile(str(output)):
+            os.remove(str(output))
+    print(f"\nFace data for {len(got)} of {len(ids)} people: "
+          + ", ".join(f"Person {t}" for t in got))
+
+
+# =====================================================================
 #  MAIN
 # =====================================================================
 
@@ -1421,10 +1761,20 @@ def main():
                         help="Max frames to process (0 = all)")
     parser.add_argument("--bg-video", default="",
                         help="Background video for combined preview (draws face annotations on top)")
+    parser.add_argument("--people", default="",
+                        help="Multi-Person Capture: the capture's folder. A "
+                             "face capture is run for each person in it, "
+                             "cropped to that person (see run_people)")
     parser.add_argument("--body-boxes", default="",
                         help="JSON sidecar of body-preview detections (from save_mhr_data "
                              "--boxes-out): draws the interpolated body box under the face "
-                             "markers, so the combined preview renders in one pass")
+                             "markers, so the combined preview renders in one pass. A "
+                             "sidecar that lists EVERYBODY (save_mhr_data --people) gets "
+                             "a face marked on each person (run_people_preview)")
+    parser.add_argument("--preview-status-right", action="store_true",
+                        help="Preview mode: draw the status line top right instead of "
+                             "top left (a multi-camera preview: the camera letter takes "
+                             "the top left of each tile)")
     args = parser.parse_args()
 
     video = Path(args.video)
@@ -1432,10 +1782,38 @@ def main():
         print(f"ERROR: Video not found: {video}")
         sys.exit(1)
 
+    # ── A multi-person preview: a face on everybody the body preview
+    # found. Its own landmarker (IMAGE mode) and no pose estimator.
+    if args.preview and args.body_boxes:
+        side = None
+        try:
+            with open(args.body_boxes, "r", encoding="utf-8") as f:
+                side = json.load(f)
+        except Exception:
+            side = None
+        if isinstance(side, dict) and isinstance(side.get("people"), list):
+            emit_progress(2, "Loading face model")
+            print("Loading face landmarker (everybody's face)...")
+            lm_image = load_face_landmarker_image(_download_model("face", fatal=True))
+            emit_progress(10, "Loading face detector")
+            face_detector, detector_type = load_face_detector()
+            output = Path(args.output) if args.output else Path("face_preview.mp4")
+            emit_progress(15, "Starting face preview")
+            run_people_preview(video, lm_image, output, side, face_detector,
+                               detector_type,
+                               status_right=bool(args.preview_status_right))
+            emit_progress(100, "Face preview complete")
+            return
+
     # ── Load face model ───────────────────────────────────────
     emit_progress(2, "Loading face model")
     print("Loading face landmarker...")
     landmarker = load_face_landmarker(_download_model("face", fatal=True))
+
+    if args.people and not args.preview:
+        run_people(video, landmarker, Path(args.people), args.output)
+        emit_progress(100, "Face tracking complete")
+        return
 
     # ── Load and validate body data ───────────────────────────
     emit_progress(5, "Loading body data")
@@ -1469,7 +1847,8 @@ def main():
                     step=max(1, args.preview_step), start_frame=args.start_frame,
                     max_frames=args.max_frames,
                     bg_video=Path(args.bg_video) if args.bg_video else None,
-                    body_boxes=Path(args.body_boxes) if args.body_boxes else None)
+                    body_boxes=Path(args.body_boxes) if args.body_boxes else None,
+                    status_right=bool(args.preview_status_right))
         emit_progress(100, "Face preview complete")
         return
 

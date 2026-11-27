@@ -19,15 +19,23 @@ from .helpers import (
     blendcap_state, bvh_state,
     _cache_dir, _bvh_library_dir, _addon_dir, _python_exe,
     _resolve_video_path, _resolve_clip_name, _strip_capture_prefix,
+    bvh_stem, stem_parts, stem_clip,
     _next_free_clip_name, _active_video_strip, _file_mode_source,
-    source_mode_error,
+    source_mode_error, _seq_accessors,
+    _strip_frame_start, _strip_set_frame_start,
     _strip_visible_start, _strip_visible_end,
     check_npz_coverage, _show_warning_popup,
     _cache_params_match, _SUPPORTED_VIDEO_EXTS,
     _installer_dir, _install_marker_path, _license_path,
+    _install_marker_path_legacy, deps_root, checkpoints_dir,
+    deps_uninstall_roots, _inside_addon_dir, deps_unreachable_path, _lp,
+    _invalidate_deps_cache, storage_speed_warning,
+    DEPS_REVISION, write_deps_stamp,
+    smart_app_control_blocking, SAC_FIX, SAC_ANTIVIRUS,
     _host_spawn_prefix, _host_spawn_ok, _host_spawn_grant_cmd, _in_flatpak,
     _subprocess_env,
     read_install_marker, is_dependencies_installed,
+    bvh_importer_state, _bvh_importer_module,
     addon_prefs, _tag_redraw, _terminate_state_process,
 )
 from .mocap import (
@@ -146,6 +154,84 @@ def _bvh_face_amp_args(props):
             args += [f"--face-amp-{region}", f"{val:.4f}"]
             any_non_unit = True
     return args if any_non_unit else []
+
+
+# ============================================================
+# Refine Hand Tracking - session checkbox over a prefs master
+# ============================================================
+# The capture panel's "Refine Hand Tracking" checkbox is SESSION
+# state: every Blender launch it re-derives from the prefs master
+# (Automatic = on for NVIDIA, off for non-NVIDIA/CPU, following the
+# live Capture Backend), and a click overrides it for this session
+# only (user decision 2026-08-29: hardware should win again next
+# launch, not a year-old click). Backing store: an int on the
+# WindowManager (-1 follow master / 0 off / 1 on) - WM state dies
+# with the session, which is exactly the lifetime wanted.
+
+_REFINE_HW_DEFAULT = None
+
+
+def _refine_hands_hw_default(context):
+    """Hardware half of 'Automatic', cached per session (it reads the
+    install marker from disk). Invalidated when the Capture Backend
+    pref changes."""
+    global _REFINE_HW_DEFAULT
+    if _REFINE_HW_DEFAULT is None:
+        _REFINE_HW_DEFAULT = not (
+            bool(_capture_force_cpu(context))
+            or _capture_use_ort_override(context) == "1")
+    return _REFINE_HW_DEFAULT
+
+
+def invalidate_refine_hw_default():
+    global _REFINE_HW_DEFAULT
+    _REFINE_HW_DEFAULT = None
+
+
+def refine_hands_effective(context):
+    """The capture-time truth: the session override when the user
+    clicked the checkbox this session, else the prefs master
+    (Automatic resolved against the hardware)."""
+    st = getattr(context.window_manager,
+                 "blendcap_refine_hands_state", -1)
+    if st >= 0:
+        return bool(st)
+    _ap = addon_prefs(context)
+    hr = getattr(_ap, "refine_hands", 'AUTO') if _ap else 'AUTO'
+    if hr == 'ON':
+        return True
+    if hr == 'OFF':
+        return False
+    return _refine_hands_hw_default(context)
+
+
+def _refine_checkbox_get(self):
+    try:
+        return refine_hands_effective(bpy.context)
+    except Exception:
+        return True
+
+
+def _refine_checkbox_set(self, value):
+    self.blendcap_refine_hands_state = 1 if value else 0
+
+
+def _bvh_head_denoise_args(props):
+    """Build the CLI args for BVH head rotation noise filtering.
+
+    Sliders are in degrees per axis (nod/turn/tilt). Returns an empty
+    list when the master toggle is off or every axis is 0.
+    """
+    if not getattr(props, "bvh_head_denoise_enabled", False):
+        return []
+    args = []
+    any_on = False
+    for axis in ("nod", "turn", "tilt"):
+        val = float(getattr(props, f"bvh_head_denoise_{axis}", 0.0))
+        if val > 0.0:
+            args += [f"--head-denoise-{axis}", f"{val:.2f}"]
+            any_on = True
+    return args if any_on else []
 
 
 def _bvh_depth_denoise_args(props):
@@ -331,7 +417,7 @@ def _wizard_license(context, layout):
     layout.prop(wm, "blendcap_install_agreed")
 
 
-def _wizard_confirm(layout, verb):
+def _wizard_confirm(context, layout, verb):
     layout.label(text=f"Ready to {verb}", icon='IMPORT')
     layout.separator()
     col = layout.column(align=True)
@@ -362,6 +448,38 @@ def _wizard_confirm(layout, verb):
     ]
     for line in lines:
         col.label(text=line)
+
+    # Pick the install location RIGHT HERE (user request 2026-08-30) -
+    # the same shared preference the Dependencies section edits, so no
+    # move is ever needed for a fresh install: choose, then Install.
+    prefs = addon_prefs(context)
+    layout.separator()
+    if prefs is not None:
+        loc = layout.column(align=True)
+        loc.prop(prefs, "deps_use_custom")
+        if prefs.deps_use_custom:
+            loc.prop(prefs, "deps_custom_path")
+            p = (prefs.deps_custom_path or "").strip()
+            if p and _inside_addon_dir(p):
+                bad = loc.column(align=True)
+                bad.alert = True
+                bad.label(text="That folder is inside the BlendCap "
+                               "addon, where updates", icon='ERROR')
+                bad.label(text="can delete files. Pick a folder "
+                               "outside the addon.")
+                bad.label(text="(This setting is ignored until you "
+                               "do.)")
+    dest = layout.column(align=True)
+    dest.label(text="Everything installs to:")
+    dest.label(text="    " + deps_root())
+    # Slow/removable-drive heads-up BEFORE the user commits to a
+    # multi-hour attempt (the 2026-07-31 exFAT ticket, addon-side).
+    hint = storage_speed_warning(deps_root())
+    if hint:
+        wcol = layout.column(align=True)
+        wcol.alert = hint[0] == 'slow_fs'
+        for i, line in enumerate(hint[1]):
+            wcol.label(text=line, icon=('ERROR' if i == 0 else 'NONE'))
 
 
 def _draw_flatpak_grant_warning(layout):
@@ -423,7 +541,7 @@ def draw_install_wizard(context, layout):
     if page == 'LICENSE':
         _wizard_license(context, box)
     elif page == 'CONFIRM':
-        _wizard_confirm(box, verb)
+        _wizard_confirm(context, box, verb)
     else:
         _wizard_intro(box)
 
@@ -468,6 +586,16 @@ class BLENDCAP_OT_install_dependencies(bpy.types.Operator):
         default=False, options={'HIDDEN', 'SKIP_SAVE'})
 
     def execute(self, context):
+        # Re-read the Windows setting on every click: a user who just
+        # turned Smart App Control off shouldn't need a Blender restart.
+        if smart_app_control_blocking(refresh=True):
+            self.report({'ERROR'},
+                        "Smart App Control has blocked part of BlendCap's "
+                        "capture engine. You will need to turn it off in "
+                        "order to run BlendCap: " + SAC_FIX + ". "
+                        + SAC_ANTIVIRUS)
+            _tag_redraw('PREFERENCES', 'VIEW_3D', 'SEQUENCE_EDITOR')
+            return {'CANCELLED'}
         # Start (or restart) the inline wizard at the intro page.
         if not self.force and is_dependencies_installed():
             self.report({'INFO'},
@@ -486,6 +614,21 @@ class BLENDCAP_OT_install_dependencies(bpy.types.Operator):
         wm.blendcap_install_page = 'INTRO'
         _load_license_lines(context, "SAM_LICENSE.txt")
         wm.blendcap_install_active = True
+        # The wizard is drawn inside the Preferences panel. Started from
+        # the sidebar (the Rebuild button on the red strip) with no
+        # Preferences window open, nothing would appear and the button
+        # looks dead - so open Preferences at BlendCap first.
+        if not any(a.type == 'PREFERENCES'
+                   for w in wm.windows for a in w.screen.areas):
+            try:
+                root_pkg = (__package__ or "").rpartition('.')[0]
+                bpy.ops.preferences.addon_show(module=root_pkg)
+            except Exception:
+                try:
+                    bpy.ops.screen.userpref_show('INVOKE_DEFAULT')
+                    context.preferences.active_section = 'ADDONS'
+                except Exception:
+                    pass
         # The Preferences window doesn't auto-redraw when an operator changes a
         # WindowManager prop, so the panel would keep showing the idle view
         # ("nothing happens") without this nudge.
@@ -532,13 +675,34 @@ class BLENDCAP_OT_install_run(bpy.types.Operator):
                         + _host_spawn_grant_cmd())
             return {'CANCELLED'}
 
+        # Where the installer should put the venv + model files. The
+        # scripts read BLENDCAP_DEPS_DIR and fall back to the addon
+        # root when it's absent (a bare manual run keeps today's
+        # behaviour). deps_root() resolves the configured storage
+        # location - or the addon folder itself on an unmigrated
+        # legacy install, so a Reinstall repairs in place.
+        deps_target = deps_root()
         try:
             if sys.platform == "win32":
                 # Launch in its own console so the user can watch progress;
                 # install.bat runs as the invoking user and pauses when
                 # finished (only a missing VC++ runtime triggers a Windows
                 # permission prompt, from inside install.ps1).
-                os.startfile(launcher)  # noqa: Windows-only, guarded at intro
+                # Popen instead of os.startfile because startfile can't
+                # pass environment - and the deps location travels by env.
+                # BLENDCAP_ADDON_ROOT: the installer no longer sits
+                # inside the addon folder (relocate_installer), so it
+                # can't derive the addon root from its own location.
+                # BLENDCAP_DEPS_REVISION: the installer stamps the venv
+                # with it when it finishes (helpers.DEPS_REVISION).
+                subprocess.Popen(
+                    ["cmd.exe", "/c", launcher],
+                    cwd=installer_dir,
+                    env=_subprocess_env(
+                        {"BLENDCAP_DEPS_DIR": deps_target,
+                         "BLENDCAP_ADDON_ROOT": _addon_dir(),
+                         "BLENDCAP_DEPS_REVISION": str(DEPS_REVISION)}),
+                    creationflags=subprocess.CREATE_NEW_CONSOLE)
             else:
                 # Linux: launch in a VISIBLE terminal so install.sh's own
                 # git/sudo bootstrap can prompt for a password and the user
@@ -571,7 +735,10 @@ class BLENDCAP_OT_install_run(bpy.types.Operator):
                     'exec xterm -e bash -lc "$BLENDCAP_RUN$SUF"; '
                     'else bash -lc "$BLENDCAP_RUN"; fi'
                 )
-                launch_env = {"BLENDCAP_RUN": run}
+                launch_env = {"BLENDCAP_RUN": run,
+                              "BLENDCAP_DEPS_DIR": deps_target,
+                              "BLENDCAP_ADDON_ROOT": _addon_dir(),
+                              "BLENDCAP_DEPS_REVISION": str(DEPS_REVISION)}
                 # Forward the display env so a host terminal can open under
                 # Flatpak (flatpak-spawn gives the host process a bare env).
                 # Deliberately NOT forwarding XAUTHORITY: in the sandbox it
@@ -594,7 +761,11 @@ class BLENDCAP_OT_install_run(bpy.types.Operator):
                     # without that, the terminal emulator itself (and every
                     # host tool install.sh runs) starts against the Steam
                     # runtime's old libs and can fail or misdetect the GPU.
-                    native_env = _subprocess_env({"BLENDCAP_RUN": run})
+                    native_env = _subprocess_env(
+                        {"BLENDCAP_RUN": run,
+                         "BLENDCAP_DEPS_DIR": deps_target,
+                         "BLENDCAP_ADDON_ROOT": _addon_dir(),
+                         "BLENDCAP_DEPS_REVISION": str(DEPS_REVISION)})
                     subprocess.Popen(["bash", "-lc", pick],
                                      cwd=installer_dir, env=native_env)
         except Exception as e:
@@ -636,6 +807,74 @@ class BLENDCAP_OT_install_open_prefs(bpy.types.Operator):
             self.report({'INFO'},
                         "Open Edit > Preferences > Add-ons > BlendCap to "
                         "install dependencies.")
+        return {'FINISHED'}
+
+
+class BLENDCAP_OT_sac_recheck(bpy.types.Operator):
+    """The Check Again button under the Smart App Control notice:
+    re-read the Windows setting (one registry read) and redraw."""
+    bl_idname = "blendcap.sac_recheck"
+    bl_label = "Check Again"
+    bl_description = ("Check whether Smart App Control is still on. Click "
+                      "after turning it off in Windows Security")
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    def execute(self, context):
+        from .helpers import smart_app_control_on
+        blocking = smart_app_control_blocking(refresh=True)
+        _tag_redraw('PREFERENCES', 'VIEW_3D', 'SEQUENCE_EDITOR')
+        if blocking:
+            self.report({'WARNING'}, "Smart App Control is still on, and it "
+                                     "blocked BlendCap earlier.")
+        elif smart_app_control_on():
+            self.report({'INFO'}, "Smart App Control is on. BlendCap will "
+                                  "say so if it blocks anything.")
+        else:
+            self.report({'INFO'}, "Smart App Control is off. You can "
+                                  "install and run BlendCap now.")
+        return {'FINISHED'}
+
+
+class BLENDCAP_OT_deps_mark_rebuilt(bpy.types.Operator):
+    """The 'Dependencies Rebuilt' button under the rebuild banner: for
+    environments upgraded in place (or rebuilt by an installer too old
+    to write the stamp itself), record that they now match this
+    BlendCap. A venv deleted and recreated clears the banner without
+    this button (the stamp went with it)."""
+    bl_idname = "blendcap.deps_mark_rebuilt"
+    bl_label = "Dependencies Rebuilt"
+    bl_description = ("Tell BlendCap the dependencies have been rebuilt for "
+                      "this version. Only click this after rebuilding them; "
+                      "the notice is removed either way")
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    def execute(self, context):
+        if not write_deps_stamp():
+            self.report({'ERROR'}, "No dependency environment found to mark.")
+            return {'CANCELLED'}
+        _tag_redraw('PREFERENCES', 'VIEW_3D', 'SEQUENCE_EDITOR')
+        self.report({'INFO'}, "Dependencies marked as built for this BlendCap.")
+        return {'FINISHED'}
+
+
+DOCS_URL = "https://github.com/Arcomade/BlendCap/tree/main/docs"
+
+
+class BLENDCAP_OT_open_docs(bpy.types.Operator):
+    bl_idname = "blendcap.open_docs"
+    bl_label = "Documentation"
+    bl_description = ("Open the BlendCap documentation on GitHub in your "
+                      "browser. Needs an internet connection. If you bought "
+                      "BlendCap, your order also came with a PDF copy of the "
+                      "latest documentation")
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    def execute(self, context):
+        try:
+            bpy.ops.wm.url_open(url=DOCS_URL)
+        except Exception as e:
+            self.report({'ERROR'}, f"Couldn't open the browser: {e}")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
 
@@ -687,15 +926,23 @@ class BLENDCAP_OT_uninstall_dependencies(bpy.types.Operator):
             _tag_redraw('PREFERENCES')
             return {'CANCELLED'}
 
-        addon_dir = _addon_dir()
-        targets = [os.path.join(addon_dir, "venv"),
-                   os.path.join(addon_dir, "checkpoints")]
+        # Sweep every location an environment could plausibly sit:
+        # resolved storage, the default, the addon folder (legacy),
+        # and a custom path left in the (possibly unticked) pref
+        # field - see helpers.deps_uninstall_roots.
+        roots = deps_uninstall_roots()
+        targets = [os.path.join(r, name)
+                   for r in roots
+                   for name in ("venv", "checkpoints")]
         removed, failed = [], []
         for path in targets:
             if not os.path.isdir(path):
                 continue
             try:
-                shutil.rmtree(path, onerror=_rm_readonly)
+                # _lp: extended-length path - the venv holds files past
+                # the 260-char Windows limit, and a plain rmtree left
+                # exactly those behind (live report 2026-08-30).
+                shutil.rmtree(_lp(path), onerror=_rm_readonly)
             except Exception as e:
                 failed.append(f"{os.path.basename(path)} ({e})")
                 continue
@@ -707,14 +954,18 @@ class BLENDCAP_OT_uninstall_dependencies(bpy.types.Operator):
 
         # Drop the marker so the panel resets to "Install" and stale GPU /
         # version details clear (is_dependencies_installed keys off the venv,
-        # but the marker still drives the display text).
-        try:
-            marker = _install_marker_path()
-            if os.path.isfile(marker):
-                os.remove(marker)
-        except Exception:
-            pass
+        # but the marker still drives the display text). Every swept
+        # root, plus the legacy installer/ spot.
+        for marker in ([os.path.join(r, "install_marker.json")
+                        for r in roots]
+                       + [_install_marker_path_legacy()]):
+            try:
+                if os.path.isfile(marker):
+                    os.remove(marker)
+            except Exception:
+                pass
 
+        _invalidate_deps_cache()
         _tag_redraw('PREFERENCES')
 
         if failed:
@@ -746,18 +997,152 @@ class BLENDCAP_OT_deps_missing(bpy.types.Operator):
     def draw(self, context):
         layout = self.layout
         col = layout.column(align=True)
-        col.label(text="BlendCap's AI tracking isn't installed yet.",
-                  icon='ERROR')
-        col.separator()
-        col.label(text="Capturing needs a one-time setup: a bundled Python")
-        col.label(text="environment and the AI models (about "
-                       f"{_INSTALL_DOWNLOAD_GB} GB).")
-        col.separator()
-        col.label(text="Open the Add-on Preferences and click")
-        col.label(text="\"Install Dependencies\", then try again.")
+        # Two different stories behind a missing environment. An
+        # unreachable custom folder (unplugged external drive) must
+        # NOT be told to reinstall - the files exist, the drive is
+        # just absent, and "Install Dependencies" would start an
+        # 11 GB re-download onto the wrong drive.
+        missing_at = deps_unreachable_path()
+        if missing_at:
+            col.label(text="Dependencies not found.", icon='ERROR')
+            col.separator()
+            col.label(text="BlendCap's dependency files are set to "
+                           "live at:")
+            col.label(text="    " + missing_at)
+            col.label(text="but that folder can't be reached right "
+                           "now.")
+            col.separator()
+            col.label(text="If it's on an external drive, connect the "
+                           "drive and")
+            col.label(text="try again. Otherwise, check the folder "
+                           "setting in the")
+            col.label(text="Add-on Preferences, or reinstall from "
+                           "there.")
+        else:
+            col.label(text="BlendCap's AI tracking isn't installed yet.",
+                      icon='ERROR')
+            col.separator()
+            col.label(text="Capturing needs a one-time setup: a bundled Python")
+            col.label(text="environment and the AI models (about "
+                           f"{_INSTALL_DOWNLOAD_GB} GB).")
+            col.separator()
+            col.label(text="Open the Add-on Preferences and click")
+            col.label(text="\"Install Dependencies\", then try again.")
         layout.separator()
         layout.operator("blendcap.install_open_prefs",
                         text="Open Preferences", icon='PREFERENCES')
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+class BLENDCAP_OT_enable_bvh_importer(bpy.types.Operator):
+    """Switch Blender's own BVH importer back on, permanently.
+
+    Only ever offered when bvh_importer_state() already reported
+    'DISABLED', i.e. the add-on is confirmed present - so there is no
+    "tried to repair and found nothing" path to handle. addon_utils.
+    enable() returns None instead of raising when a module is missing,
+    which is checked anyway rather than trusted."""
+    bl_idname = "blendcap.enable_bvh_importer"
+    bl_label = "Enable It"
+    bl_description = ("Enable Blender's BioVision Motion Capture (BVH) "
+                      "add-on, which BlendCap needs to import animation")
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    def execute(self, context):
+        import addon_utils
+        module = _bvh_importer_module()
+        if module is None:
+            self.report({'ERROR'},
+                        "Blender's BVH importer isn't available in this build.")
+            return {'CANCELLED'}
+        try:
+            addon_utils.enable(module, default_set=True, persistent=True)
+        except Exception as e:
+            self.report({'ERROR'}, f"Couldn't enable the BVH importer: {e}")
+            return {'CANCELLED'}
+        if bvh_importer_state() != 'OK':
+            self.report({'ERROR'},
+                        "The BVH importer didn't register. Enable it under "
+                        "Edit > Preferences > Add-ons (search for \"BVH\").")
+            return {'CANCELLED'}
+        self.report({'INFO'}, "BVH importer enabled.")
+        return {'FINISHED'}
+
+
+class BLENDCAP_OT_bvh_importer_missing(bpy.types.Operator):
+    """Shown when Blender can't import a BVH. Two different messages,
+    because the two causes need two different answers: switched off is
+    a one-click fix, missing from the build is not fixable here and the
+    user needs to know the capture itself survived."""
+    bl_idname = "blendcap.bvh_importer_missing"
+    bl_label = "BVH Importer Required"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    # Set by the caller; blank when the file doesn't exist yet (the
+    # pre-flight check runs before the export).
+    bvh_path: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+        absent = bvh_importer_state() == 'ABSENT'
+
+        if absent:
+            col.label(text="This Blender build doesn't include the BVH "
+                           "importer.", icon='ERROR')
+        else:
+            col.label(text="Blender's BVH importer is switched off.",
+                      icon='ERROR')
+        col.label(text="BlendCap needs it to bring the animation into "
+                       "your scene.")
+        col.separator()
+
+        if absent:
+            # Deliberately NOT "install a BVH importer add-on to fix
+            # this": _import_bvh calls bpy.ops.import_anim.bvh with six
+            # specific arguments, so only Blender's own io_anim_bvh
+            # satisfies it - a third-party importer would have to squat
+            # on that exact operator ID, which add-ons do not do. Any
+            # importer can still open the file by hand, which is what
+            # the path below is for.
+            col.label(text="To fix this issue, reinstall Blender from "
+                           "blender.org.")
+            col.label(text="BlendCap can only use Blender's own importer, "
+                           "but any")
+            col.label(text="BVH importer can open the file below by hand.")
+        else:
+            # EXACT bl_info["name"] of Blender's io_anim_bvh add-on.
+            # 4.2+ lists add-ons by that name alone (the older
+            # "Category: Name" form is the pre-extensions UI), and the
+            # search box matches a substring of the name or tagline, so
+            # "BVH" finds it. Getting this string wrong sends people
+            # hunting for something that does not exist - it already
+            # cost one round of confusion in testing.
+            col.label(text="To fix this issue, enable the add-on")
+            col.label(text="\"BioVision Motion Capture (BVH) format\" "
+                           "under")
+            col.label(text="Edit > Preferences > Add-ons (search for "
+                           "\"BVH\"),")
+            col.label(text="or click the button below.")
+
+        if self.bvh_path:
+            col.separator()
+            col.label(text="Your capture is safe. The file was saved to:",
+                      icon='CHECKMARK')
+            # Split so a long path doesn't get clipped by the dialog width.
+            folder, name = os.path.split(self.bvh_path)
+            col.label(text=f"  {name}")
+            col.label(text=f"  in {folder}")
+
+        if not absent:
+            layout.separator()
+            layout.operator("blendcap.enable_bvh_importer",
+                            text="Enable It", icon='CHECKMARK')
 
     def execute(self, context):
         return {'FINISHED'}
@@ -947,6 +1332,43 @@ def _snapshot_strip_props(strip):
     return props
 
 
+# Multi-Camera Capture (syncing mode, the capture itself, the multiview
+# strip, Revert as a group) lives in multicam.py.
+
+def _strip_source(strip):
+    """(video_path, start_frame, max_frames) for one strip.
+
+    Mirrors the VSE branch of _resolve_video_path, which resolves only
+    the ACTIVE strip.
+    """
+    if "blendcap_source" in strip:
+        path = bpy.path.abspath(str(strip["blendcap_source"]))
+        start = int(strip.get("blendcap_original_offset_start", 0))
+        maxf = int(strip.get("blendcap_original_duration", 0))
+    elif strip.type == 'IMAGE':
+        path = bpy.path.abspath(strip.directory)
+        start, maxf = 0, 0
+    else:
+        path = bpy.path.abspath(strip.filepath)
+        import warnings as _ws
+        with _ws.catch_warnings():
+            _ws.simplefilter("ignore", DeprecationWarning)
+            start = int(strip.frame_offset_start)
+            maxf = int(strip.frame_final_duration)
+    return path, start, maxf
+
+
+def _multicam_capture_block(context):
+    """The message to show when the single-camera capture is pointed at
+    a multi-camera capture (multicam.single_capture_block), or ""."""
+    try:
+        from .multicam import single_capture_block
+        lines = single_capture_block(context)
+        return " ".join(lines) if lines else ""
+    except Exception:
+        return ""
+
+
 class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
     bl_idname = "blendcap.generate_mocap"
     bl_label = "Generate Mocap & Preview"
@@ -957,6 +1379,15 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
         if properties.is_update_only:
             return ("Run a stepped, lower-quality preview of the "
                     "selected tracking methods")
+        try:
+            # greyed out in a multi-person mode with Body off: say why
+            from .multicam import is_people_mode
+            from .people import FACE_ONLY_RUN_TIP
+            props = context.scene.blendcap_props
+            if is_people_mode(props) and not props.track_body:
+                return FACE_ONLY_RUN_TIP
+        except Exception:
+            pass
         return ("Run the full motion-capture process with the "
                 "selected tracking methods")
     fps_mode: bpy.props.EnumProperty(
@@ -992,6 +1423,10 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
         # a cryptic "Cannot find Python" message.
         if not is_dependencies_installed():
             bpy.ops.blendcap.deps_missing('INVOKE_DEFAULT')
+            return {'CANCELLED'}
+        blocked = _multicam_capture_block(context)
+        if blocked:
+            self.report({'ERROR'}, blocked)
             return {'CANCELLED'}
         props = context.scene.blendcap_props
         if props.track_body or props.track_face:
@@ -1097,10 +1532,28 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
             self.report({'WARNING'}, "A capture is already running. Wait for it to finish.")
             return {'CANCELLED'}
 
+        blocked = _multicam_capture_block(context)
+        if blocked:
+            self.report({'ERROR'}, blocked)
+            return {'CANCELLED'}
+
         props = context.scene.blendcap_props
         if not props.track_body and not props.track_face:
             self.report({'ERROR'}, "Enable at least one tracking type (Body or Face).")
             return {'CANCELLED'}
+
+        # Multi-Person Capture: everybody in the clip, each followed and
+        # saved (save_mhr_data --people, pipeline/people_tracks.py).
+        from .multicam import is_people_mode
+        people_mode = is_people_mode(props)
+        if people_mode and not props.track_body:
+            from .people import FACE_ONLY_RUN_TIP
+            self.report({'ERROR'}, FACE_ONLY_RUN_TIP + ".")
+            return {'CANCELLED'}
+        # (a multi-person PREVIEW boxes everybody the detector finds,
+        # and with Face on marks a face on each of them: no numbers,
+        # those come from the capture)
+        people_preview = people_mode and self.is_update_only
 
         # Resolve video source
         resolved = _resolve_video_path(context)
@@ -1131,6 +1584,14 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
         # Blender-split source produces separate caches per split.
         clip_name = _resolve_clip_name(context) or "sequence"
         vid_name = f"Capture_{clip_name}"
+
+        # Blender can't use paths past the Windows limit (item 10): say
+        # so now instead of failing somewhere down the line.
+        from .helpers import block_if_path_too_long, capture_folder_checks
+        if block_if_path_too_long(
+                [(video_path, False, 'video')]
+                + capture_folder_checks(os.path.join(_cache_dir(), vid_name))):
+            return {'CANCELLED'}
 
         # Snap playhead to active strip so the user sees which clip is being
         # processed - unless they turned it off (Disable playhead auto-snap).
@@ -1290,7 +1751,12 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
             if is_image_seq:
                 # Write elements list to temp file for the conversion script
                 elements_file = os.path.join(export_dir, "_elements.txt")
-                with open(elements_file, 'w') as f:
+                # Explicit utf-8: image filenames can carry non-ASCII, and
+                # the default here is the system code page, which raises
+                # UnicodeEncodeError on the write. convert_source.py reads
+                # it back as utf-8 to match. (Same reasoning as the
+                # .cache_params writer below.)
+                with open(elements_file, 'w', encoding='utf-8') as f:
                     f.write('\n'.join(img_elements))
                 convert_cmd = [python_exe, convert_script,
                                "--image-dir", video_path,
@@ -1359,17 +1825,9 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
         # and the monitor writes .cache_params for any run with a body or
         # face step — an unconditional read of a capture-branch-only
         # variable crashed the Preview button with an UnboundLocalError.
-        _ap = addon_prefs(context)
-        _hr = getattr(_ap, "refine_hands", 'AUTO') if _ap else 'AUTO'
         _cap_ort = _capture_use_ort_override(context)
         _cap_cpu = _capture_force_cpu(context)
-        _non_nvidia = bool(_cap_cpu or _cap_ort == "1")
-        if _hr == 'ON':
-            capture_no_hands = False
-        elif _hr == 'OFF':
-            capture_no_hands = True
-        else:  # AUTO: refine on NVIDIA, skip on non-NVIDIA / CPU
-            capture_no_hands = _non_nvidia
+        capture_no_hands = not refine_hands_effective(context)
         # Legacy scenes saved with the removed 'AUTO' item resolve to the
         # enum default ('FIRST') when Blender reads the property.
         capture_fov = props.fov_mode
@@ -1377,6 +1835,10 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
         capture_sig = (f"nh={int(capture_no_hands)};fov={capture_fov};"
                        f"focal={_focal};skip={props.capture_skip};"
                        f"ort={_cap_ort};cpu={int(bool(_cap_cpu))}")
+        if people_mode:
+            # only ever added: every ordinary capture's signature is as
+            # it was, so none of them is captured again for nothing
+            capture_sig += ";people=1"
 
         if self.is_update_only:
             # ===== PREVIEW MODE =====
@@ -1398,6 +1860,8 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
                 _append_frame_args(cmd, start_frame, max_frames)
                 if both_previews:
                     cmd.extend(["--boxes-out", preview_boxes])
+                if people_preview:
+                    cmd.append("--people")
                 cmds.append(cmd)
                 proxy_path = body_preview
 
@@ -1444,6 +1908,12 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
             if props.track_body:
                 if params_match:
                     cov, _, _ = check_npz_coverage(body_npz, start_frame, max_frames)
+                    if people_mode:
+                        # the folder's own body file is one person, who
+                        # may not be there for the whole clip: the people
+                        # table is what says the capture is complete
+                        cov = ('covers' if os.path.isfile(body_npz) and os.path.isfile(
+                            os.path.join(output_dir, "people.json")) else 'none')
                     if cov == 'covers':
                         body_cached = True
                         print("[BlendCap] Body tracking data already cached, skipping.")
@@ -1459,6 +1929,8 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
                         cmd.extend(["--focal-mm", f"{props.fov_focal_mm:.4f}"])
                     if props.capture_skip > 0:
                         cmd.extend(["--capture-skip", str(props.capture_skip)])
+                    if people_mode:
+                        cmd.append("--people")
                     cmds.append(cmd)
                     # The ORT (non-PyTorch) backbone path loads a ~1.7 GB
                     # ONNX export that cuda-type installs treat as optional.
@@ -1469,15 +1941,17 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
                     # demotes to the PyTorch backbone and still completes.
                     # Also self-heals "Non-NVIDIA" picked on a cuda install.
                     if _cap_ort == "1":
-                        _bb = os.path.join(addon_dir, "checkpoints", "onnx",
+                        _ckpt = checkpoints_dir()
+                        _bb = os.path.join(_ckpt, "onnx",
                                            "backbone_dinov3_fp16.onnx")
-                        _dl = os.path.join(addon_dir, "installer",
+                        _dl = os.path.join(_installer_dir(),
                                            "download_models.py")
                         if (os.path.isfile(_dl)
                                 and not (os.path.isfile(_bb)
                                          and os.path.isfile(_bb + "_data"))):
                             cmds.insert(0, [python_exe, _dl,
                                             "--project-root", addon_dir,
+                                            "--checkpoints-dir", _ckpt,
                                             "--ensure-backbone-onnx"])
 
             face_cached = False
@@ -1505,13 +1979,27 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
                                           "mouth-stats v3 capture; re-tracking face.")
                         except Exception:
                             pass
+                    if people_mode and not face_cached and body_cached:
+                        # the folder's own face file is the most
+                        # prominent person's, and is only there when
+                        # THEIR face was found: the faces that were
+                        # found are next to the tracks
+                        from .multicam import _people_faces, _face_cache_ok
+                        _found = _people_faces(output_dir)
+                        face_cached = bool(_found) and all(
+                            _face_cache_ok(p) for p in _found)
                     if face_cached:
                         print("[BlendCap] Face tracking data already cached, skipping.")
                 if not face_cached:
                     cmd = [python_exe, os.path.join(addon_dir, "save_face_data.py"),
                            "--video", actual_video, "--output", face_npz]
                     use_body_crops = False
-                    if props.track_body and not body_cached:
+                    if people_mode:
+                        # one face pass per person, each cropped to their
+                        # own head from their own body track
+                        cmd.extend(["--people", output_dir])
+                        use_body_crops = True
+                    elif props.track_body and not body_cached:
                         cmd.extend(["--body", body_npz])
                         use_body_crops = True
                     elif os.path.exists(body_npz):
@@ -1537,6 +2025,8 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
             if props.track_face or os.path.exists(face_npz):
                 overlay_cmd.extend(["--face", face_npz])
                 has_input = True
+            if people_mode:
+                overlay_cmd.extend(["--people", output_dir])
             if has_input:
                 cmds.append(overlay_cmd)
             proxy_path = overlay_mp4
@@ -1560,6 +2050,7 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
             w, lbl, out = _classify_step(sn, cmd, wmap)
             step_weights.append(w); step_labels.append(lbl); step_outputs.append(out)
 
+        blendcap_state['multicam'] = None      # a single-camera run
         blendcap_state['track_body'] = props.track_body
         blendcap_state['track_face'] = props.track_face
         blendcap_state['output_dir'] = output_dir
@@ -1610,6 +2101,14 @@ class BLENDCAP_OT_generate_mocap(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _people_queue_active():
+    try:
+        from . import people_ui
+        return people_ui.queue_active()
+    except Exception:
+        return False
+
+
 class BLENDCAP_OT_cancel(bpy.types.Operator):
     bl_idname = "blendcap.cancel"
     bl_label = "Cancel Running Process"
@@ -1627,9 +2126,16 @@ class BLENDCAP_OT_cancel(bpy.types.Operator):
             _terminate_state_process(blendcap_state)
             self.report({'INFO'}, "Cancelling... please wait.")
         elif bvh_state['running']:
+            # (a Generate/Reload All in progress ends with it: the
+            # monitor reports the cancelled run to people_ui)
             bvh_state['cancel_requested'] = True
             _terminate_state_process(bvh_state)
             self.report({'INFO'}, "Cancelling BVH export... please wait.")
+        elif _people_queue_active():
+            # between two people's exports of Generate/Reload All
+            from . import people_ui
+            people_ui.queue_cancel()
+            self.report({'INFO'}, "BVH export cancelled.")
         else:
             self.report({'INFO'}, "Nothing running to cancel.")
         return {'FINISHED'}
@@ -1715,7 +2221,7 @@ class BLENDCAP_OT_cancel_cleanup(bpy.types.Operator):
 
 class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
     bl_idname = "blendcap.generate_bvh"
-    bl_label = "Generate & Import BVH"
+    bl_label = "Generate/Reload BVH"
     bl_description = ("Generate a BVH (and/or hands/root/face variants) "
                       "from the cached tracking data of the currently "
                       "selected clip and import it into the scene")
@@ -1764,10 +2270,22 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
         clip_name = _resolve_clip_name(context) or "sequence"
         vid_name = f"Capture_{clip_name}"
         output_dir = os.path.join(cache_dir, vid_name)
+        # Windows path limit (item 10): past it Blender can't see the
+        # tracking data, and the check below would call it "missing".
+        from .helpers import block_if_path_too_long, capture_folder_checks
+        if block_if_path_too_long(capture_folder_checks(output_dir)):
+            return {'CANCELLED'}
         body_npz = os.path.join(output_dir, "mhr_frames.npz")
         face_npz = os.path.join(output_dir, "face_frames.npz")
         has_body = os.path.exists(body_npz)
         has_face = os.path.exists(face_npz)
+        # A multi-person capture: the BVH is for the person selected in
+        # the People list, and it is THEIR face data that counts.
+        from . import people_ui
+        person = people_ui.selected_person(context, output_dir)
+        if person is not None:
+            has_body = True
+            has_face = person['has_face']
 
         has_separate = False
         if props.use_separate_face and props.separate_face_data != 'NONE':
@@ -1792,6 +2310,12 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
             return {'CANCELLED'}
 
         if needs_own_face and not has_face:
+            if person is not None:
+                _show_warning_popup([
+                    f"There is no face data for {person['name']} in this capture.",
+                    "Untick Face under BVH Settings to export them without it.",
+                ])
+                return {'CANCELLED'}
             _show_warning_popup([
                 "Face tracking data is missing for this clip.",
                 "Run Capture (with face tracking) first.",
@@ -1853,8 +2377,40 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
         face_npz = os.path.join(output_dir, "face_frames.npz")
         bvh_path = os.path.join(output_dir, "output.bvh")
 
+        # A multi-person capture: the export is for the person selected
+        # in the People list. They get a clip name and a capture folder
+        # of their own (people_ui.person_clip), filled by the export
+        # itself from the saved tracks and the list's corrections
+        # (npz_to_bvh --people-capture). From here on that folder IS the
+        # capture, so naming, the BVH library, Bake and Add Camera work
+        # on a person exactly as on any clip.
+        from . import people_ui
+        capture_dir = output_dir
+        person = people_ui.selected_person(context, output_dir)
+        people_args = []
+        if person is not None:
+            people_args = ["--people-capture", capture_dir,
+                           "--person", str(person['number'])]
+            clip_name = people_ui.person_clip(clip_name, person['number'])
+            vid_name = f"Capture_{clip_name}"
+            output_dir = os.path.join(cache_dir, vid_name)
+            os.makedirs(output_dir, exist_ok=True)
+            body_npz = os.path.join(output_dir, "mhr_frames.npz")
+            face_npz = os.path.join(output_dir, "face_frames.npz")
+            bvh_path = os.path.join(output_dir, "output.bvh")
+
+        # Windows path limit (item 10): past it Blender can't see the
+        # tracking data and would report it as missing.
+        from .helpers import block_if_path_too_long, capture_folder_checks
+        if block_if_path_too_long(capture_folder_checks(output_dir)):
+            return {'CANCELLED'}
+
         has_body = os.path.exists(body_npz)
         has_face = os.path.exists(face_npz)
+        if person is not None:
+            # written by the export; what the capture holds decides
+            has_body = True
+            has_face = person['has_face']
 
         separate_face_npz = ""
         if props.use_separate_face and props.separate_face_data != 'NONE':
@@ -1866,6 +2422,19 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
             self.report({'ERROR'}, "No tracking data found. Run Capture first.")
             return {'CANCELLED'}
 
+        # Stop BEFORE the export when the BVH importer is merely switched
+        # off: it is a one-click fix, and running the whole export first
+        # only to fail at the import step is exactly the "nothing
+        # happens" experience this check exists to remove.
+        #
+        # 'ABSENT' deliberately does NOT stop here. We cannot fix that
+        # one, and the BVH file is still worth producing so the user can
+        # import it in another Blender - the post-export handler in
+        # mocap.py tells them where it landed.
+        if bvh_importer_state() == 'DISABLED':
+            bpy.ops.blendcap.bvh_importer_missing('INVOKE_DEFAULT')
+            return {'CANCELLED'}
+
         addon_dir = _addon_dir()
         python_exe = _python_exe()
         script_path = os.path.join(addon_dir, "npz_to_bvh.py")
@@ -1873,13 +2442,25 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
             self.report({'ERROR'}, f"npz_to_bvh.py not found at {script_path}")
             return {'CANCELLED'}
 
-        mhr_model = os.path.join(addon_dir, "checkpoints",
+        # BVH generation runs npz_to_bvh.py in the dependency venv (the
+        # pipeline modules import scipy, which Blender's bundled Python
+        # does not have), so a missing venv breaks it exactly like it
+        # breaks capture. Capture has always shown the friendly dialog
+        # here; this operator was missing it and surfaced the raw
+        # "[WinError 2] The system cannot find the file specified"
+        # instead.
+        if not os.path.exists(python_exe):
+            bpy.ops.blendcap.deps_missing('INVOKE_DEFAULT')
+            return {'CANCELLED'}
+
+        mhr_model = os.path.join(checkpoints_dir(),
                                  "sam-3d-body-dinov3", "assets", "mhr_model.pt")
 
         # Resolve face source (own face or separate-clip face). Mutually
         # exclusive in the UI, but check explicit existence for safety.
         face_path = ""
-        if props.export_face and os.path.exists(face_npz):
+        if props.export_face and (person['has_face'] if person is not None
+                                  else os.path.exists(face_npz)):
             face_path = face_npz
         elif (props.use_separate_face and separate_face_npz
               and os.path.exists(separate_face_npz)):
@@ -1887,7 +2468,7 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
 
         # Common args every sub-command shares
         def _common():
-            return [python_exe, script_path, "--mhr-model", mhr_model]
+            return [python_exe, script_path, "--mhr-model", mhr_model] + people_args
 
         # Face source identity for filename annotation. Bare clip
         # identifier (no Capture_ prefix) — the prefix only exists on
@@ -1905,6 +2486,8 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
         # where output_stem is the final filename (without .bvh extension)
         # following the convention: {clip}_{BHRF codes}[-{face_clip}_F].
         jobs = []
+        camera_job = None
+        placement = None
 
         if has_body and props.export_body:
             codes = "B"
@@ -1912,13 +2495,15 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
                 codes += "H"
             if props.export_root:
                 codes += "R"
+            # (helpers.bvh_stem: a multi-camera take's number of
+            # cameras goes in front of the letters)
             if face_path and face_source_name == clip_name:
                 codes += "F"
-                stem = f"{clip_name}_{codes}"
+                stem = bvh_stem(clip_name, codes)
             elif face_path:
-                stem = f"{clip_name}_{codes}-{face_source_name}_F"
+                stem = f"{bvh_stem(clip_name, codes)}-{bvh_stem(face_source_name, 'F')}"
             else:
-                stem = f"{clip_name}_{codes}"
+                stem = bvh_stem(clip_name, codes)
 
             cmd = _common()
             cmd.extend(["--input", body_npz, "--rest-pose", "tpose"])
@@ -1933,14 +2518,18 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
             if props.smoothing_enabled and props.smooth_vertical > 0:
                 cmd.extend(["--smooth-vertical", str(props.smooth_vertical)])
             cmd.extend(["--smooth-face", str(props.smooth_face if props.smoothing_enabled else 0)])
+            cmd.extend(["--smooth-head", str(props.smooth_head if props.smoothing_enabled else 0)])
             cmd.extend(_bvh_face_denoise_args(props))
             cmd.extend(_bvh_face_amp_args(props))
+            cmd.extend(_bvh_head_denoise_args(props))
             cmd.extend(_bvh_depth_denoise_args(props))
             if props.finger_curl_multiplier > 1.0:
                 cmd.extend(["--finger-boost",
                             f"{props.finger_curl_multiplier:.1f}"])
             if props.bvh_hand_solver:
                 cmd.extend(["--hand-solver", "on"])
+            if props.bvh_hold_cropped_limbs:
+                cmd.append("--hold-cropped-limbs")
             cmd.extend(["--face-boost",
                         f"{_bvh_face_boost_value(props):.1f}"])
             if not props.export_hands:
@@ -1977,6 +2566,19 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
             # Camera angle offset is per-rig (Object.blendcap_camera_offset)
             # and applied via Bake Offset to BVH after the rig is imported,
             # not here.
+            # Where the capture's camera(s) stood is written by every
+            # body export and kept on the rig at import
+            # (scene_camera.remember), so the Add Camera button can make
+            # the camera afterwards without exporting again.
+            cam_sidecar = os.path.join(output_dir, "camera.json")
+            cmd.extend(["--camera-sidecar", cam_sidecar, "--camera-view", "all"])
+            camera_job = {'stem': stem, 'sidecar': cam_sidecar,
+                          'footage': _camera_footage(context, capture_dir)}
+            if person is not None and props.bvh_people_in_place:
+                # Keep Captured Position: where the camera stood, seen
+                # from this person's rig, is what puts everybody of the
+                # capture in the same room (mocap._place_person).
+                placement = {'stem': stem}
             cmd.extend(["--output", bvh_path])
             jobs.append((cmd, bvh_path, stem))
         else:
@@ -1997,8 +2599,10 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
                                 f"{props.finger_curl_multiplier:.1f}"])
                 if props.bvh_hand_solver:
                     cmd.extend(["--hand-solver", "on"])
+                if props.bvh_hold_cropped_limbs:
+                    cmd.append("--hold-cropped-limbs")
                 cmd.extend(["--output", hands_bvh])
-                jobs.append((cmd, hands_bvh, f"{clip_name}_H"))
+                jobs.append((cmd, hands_bvh, bvh_stem(clip_name, "H")))
 
             # Standalone root armature
             if props.export_root:
@@ -2015,7 +2619,7 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
                 if props.smoothing_enabled and props.smooth_vertical > 0:
                     cmd.extend(["--smooth-vertical", str(props.smooth_vertical)])
                 cmd.extend(["--output", root_bvh])
-                jobs.append((cmd, root_bvh, f"{clip_name}_R"))
+                jobs.append((cmd, root_bvh, bvh_stem(clip_name, "R")))
 
             # Standalone face armature (own face or separate).
             # Base name follows the face source — separate face from clipX
@@ -2030,13 +2634,20 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
                 cmd.extend(["--face-boost",
                             f"{_bvh_face_boost_value(props):.1f}"])
                 cmd.extend(["--output", face_bvh])
-                jobs.append((cmd, face_bvh, f"{face_source_name}_F"))
+                jobs.append((cmd, face_bvh, bvh_stem(face_source_name, "F")))
         # face_source_name here is already the bare clip identifier.
 
         if not jobs:
             self.report({'ERROR'},
                         "Nothing selected to export. Enable at least one of: "
                         "Body, Hands, Root, Face, or Use Separate Face Data.")
+            return {'CANCELLED'}
+
+        # Windows path limit (item 10): the BVH would be written, or not,
+        # and Blender could not find it - Generate used to do nothing at
+        # all, with no message.
+        from .helpers import block_if_path_too_long, bvh_job_checks
+        if block_if_path_too_long(bvh_job_checks(jobs, _bvh_library_dir())):
             return {'CANCELLED'}
 
         # Generate path: no baked-in camera offset on the new rig.
@@ -2047,6 +2658,8 @@ class BLENDCAP_OT_generate_bvh(bpy.types.Operator):
         bvh_state['baked_head_pitch_deg'] = 0.0
         bvh_state['baked_head_roll_deg'] = 0.0
         bvh_state['baked_height_m'] = 0.0
+        bvh_state['camera'] = camera_job
+        bvh_state['placement'] = placement
         # Resolve the BVH library dir on THIS (main) thread - run_bvh_thread
         # can't safely read add-on prefs from the worker.
         _bvh_lib = _bvh_library_dir()
@@ -2081,36 +2694,97 @@ def _parse_bake_flags(stem, vid_name):
     file). Caller is responsible for falling back to scene props in
     that case.
     """
-    # Body with separate face: vid_<codes>-<face_source>_F
-    if stem.startswith(vid_name + "_") and "-" in stem[len(vid_name) + 1:]:
-        suffix = stem[len(vid_name) + 1:]
-        codes, sep = suffix.split("-", 1)
-        if sep.endswith("_F"):
+    # What this capture's names start with (helpers.bvh_stem): "Demo_"
+    # for a clip, "Demo_4c" for a four-camera take. And the clip id
+    # itself with "_", which is how a take's names started before
+    # 2026-11-25 ("Demo_4cam_BHR"): rigs made then still bake.
+    for prefix in (bvh_stem(vid_name, ""), vid_name + "_"):
+        if not stem.startswith(prefix):
+            continue
+        codes, sep, face = stem[len(prefix):].partition("-")
+        if not codes or any(c not in "BHRF" for c in codes):
+            continue
+        if not sep:
+            # Body / standalone with own clip: <name>_<codes>
             return {
                 "hands": "H" in codes,
                 "root": "R" in codes,
-                "face": True,
-                "face_source": sep[:-2],
+                "face": "F" in codes,
+                "face_source": "",
             }
-        return None
-    # Body / standalone with own clip: vid_<codes>
-    if stem.startswith(vid_name + "_"):
-        codes = stem[len(vid_name) + 1:]
+        # Body with separate face: <name>_<codes>-<face source's name>_F
+        got = stem_parts(face)
+        if got is None or got[1] != "F":
+            return None
         return {
             "hands": "H" in codes,
             "root": "R" in codes,
-            "face": "F" in codes,
-            "face_source": "",
+            "face": True,
+            "face_source": stem_clip(face, _cache_dir()),
         }
-    # Standalone face from a separate clip: <face_source>_F
-    if stem.endswith("_F"):
+    # Standalone face from a separate clip: <face source's name>_F
+    got = stem_parts(stem)
+    if got is not None and got[1] == "F":
         return {
             "hands": False,
             "root": False,
             "face": True,
-            "face_source": stem[:-2],
+            "face_source": stem_clip(stem, _cache_dir()),
         }
     return None
+
+
+def _camera_footage(context, output_dir):
+    """For Add Camera: the video each capture camera shows and the
+    clip's trim, by view letter ({'a': {'video', 'start'}}, or one
+    entry per camera of a multi-camera take; multicam.camera_sources).
+    Recorded on the rig at Generate.
+
+    A capture that had to convert its source (frame-rate mismatch,
+    image sequence, unsupported codec) tracked the converted copy in
+    its cache folder; that copy is frame-for-frame what was captured,
+    so it is preferred and needs no trim offset."""
+    props = context.scene.blendcap_props
+    video, start = '', 0
+    try:
+        # a multi-camera take, from either source: every merged camera
+        from .multicam import camera_sources
+        multi = camera_sources(context, output_dir)
+        if multi:
+            return multi
+        if props.video_source == 'FILE':
+            video, _empty = _file_mode_source(context)
+        else:
+            seq_ed = context.scene.sequence_editor
+            strip = _active_video_strip(seq_ed)
+            if strip is not None and strip.type in ('MOVIE', 'IMAGE'):
+                video, start, _maxf = _strip_source(strip)
+    except Exception as e:
+        print(f"[BlendCap] Camera footage source not resolved: {e}")
+    exported = os.path.join(output_dir, "source_export.mp4")
+    if os.path.isfile(exported):
+        video, start = exported, 0
+    return {'a': {'video': video or '', 'start': int(start or 0)}}
+
+
+def _bake_camera_job(rig, stem, output_dir, cmd):
+    """Bake re-exports a rig's BVH. Like Generate, the export records
+    where the capture's camera(s) stood (inserted into `cmd` in place),
+    so the rig keeps carrying them and a camera it already has takes the
+    baked tilt. The footage each camera shows is carried over from the
+    rig being replaced. None for a hands / root / face bake."""
+    if "--export" in cmd:
+        return None
+    footage = {}
+    try:
+        from .scene_camera import stored
+        footage = (stored(rig) or {}).get("footage") or {}
+    except Exception:
+        pass
+    sidecar = os.path.join(output_dir, "camera.json")
+    i = cmd.index("--output") if "--output" in cmd else len(cmd)
+    cmd[i:i] = ["--camera-sidecar", sidecar, "--camera-view", "all"]
+    return {'stem': stem, 'sidecar': sidecar, 'footage': footage}
 
 
 class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
@@ -2158,8 +2832,8 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
         vid_name = str(rig.get("blendcap_source_video", "") or "")
         if not vid_name:
             self.report({'ERROR'},
-                        "Active rig has no source-clip tag — generate "
-                        "the BVH first via 'Generate & Import BVH'.")
+                        "Active rig has no source-clip tag - generate "
+                        "the BVH first via 'Generate/Reload BVH'.")
             return {'CANCELLED'}
 
         # Resolve the output stem from the BVH path the rig was
@@ -2207,6 +2881,11 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
         output_dir = os.path.join(cache_dir, f"Capture_{vid_name}")
         body_npz = os.path.join(output_dir, "mhr_frames.npz")
         face_npz = os.path.join(output_dir, "face_frames.npz")
+        # Windows path limit (item 10): Blender can't see the capture
+        # folder's files past it.
+        from .helpers import block_if_path_too_long, capture_folder_checks
+        if block_if_path_too_long(capture_folder_checks(output_dir)):
+            return {'CANCELLED'}
 
         # Detect export type from the rig structure. Bake should
         # preserve whatever the rig was originally generated with —
@@ -2226,7 +2905,7 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
         addon_dir = _addon_dir()
         python_exe = _python_exe()
         script_path = os.path.join(addon_dir, "npz_to_bvh.py")
-        mhr_model = os.path.join(addon_dir, "checkpoints",
+        mhr_model = os.path.join(checkpoints_dir(),
                                  "sam-3d-body-dinov3", "assets",
                                  "mhr_model.pt")
 
@@ -2288,14 +2967,18 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
             if props.smoothing_enabled and props.smooth_vertical > 0:
                 cmd.extend(["--smooth-vertical", str(props.smooth_vertical)])
             cmd.extend(["--smooth-face", str(props.smooth_face if props.smoothing_enabled else 0)])
+            cmd.extend(["--smooth-head", str(props.smooth_head if props.smoothing_enabled else 0)])
             cmd.extend(_bvh_face_denoise_args(props))
             cmd.extend(_bvh_face_amp_args(props))
+            cmd.extend(_bvh_head_denoise_args(props))
             cmd.extend(_bvh_depth_denoise_args(props))
             if props.finger_curl_multiplier > 1.0:
                 cmd.extend(["--finger-boost",
                             f"{props.finger_curl_multiplier:.1f}"])
             if props.bvh_hand_solver:
                 cmd.extend(["--hand-solver", "on"])
+            if props.bvh_hold_cropped_limbs:
+                cmd.append("--hold-cropped-limbs")
             cmd.extend(["--face-boost",
                         f"{_bvh_face_boost_value(props):.1f}"])
             if not use_hands:
@@ -2378,6 +3061,8 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
                             f"{props.finger_curl_multiplier:.1f}"])
             if props.bvh_hand_solver:
                 cmd.extend(["--hand-solver", "on"])
+            if props.bvh_hold_cropped_limbs:
+                cmd.append("--hold-cropped-limbs")
             cmd.extend(["--output", bvh_path])
 
         elif has_root and not has_hips and not has_head:
@@ -2403,6 +3088,11 @@ class BLENDCAP_OT_bake_camera_offset(bpy.types.Operator):
             return {'CANCELLED'}
 
         jobs = [(cmd, bvh_path, stem)]
+        # Windows path limit (item 10), as in Generate.
+        from .helpers import block_if_path_too_long, bvh_job_checks
+        if block_if_path_too_long(bvh_job_checks(jobs, _bvh_library_dir())):
+            return {'CANCELLED'}
+        bvh_state['camera'] = _bake_camera_job(rig, stem, output_dir, cmd)
         # Stash the cumulative baked totals BEFORE starting the
         # worker thread. The worker's bvh_state.update inside
         # run_bvh_thread does NOT touch these keys, so setting them

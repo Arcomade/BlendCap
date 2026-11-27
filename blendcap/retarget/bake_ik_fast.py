@@ -43,6 +43,7 @@ from mathutils import Matrix, Quaternion, Vector
 
 from .fcurve_eval import _extract_source_fcurves, _eval_basis
 from .constraint_sim import (
+    child_of_delta,
     _SUPPORTED_TYPES,
     _scan_supported_constraints,
     _apply_constraint_chain,
@@ -300,7 +301,7 @@ def _pole_dbg_trace_frame(rd, frame, pre_comp_arm, post_comp_arm,
             print(f"[BlendCap pole-comp]   chain_len={chain.length:.4f} "
                   f"upper_len={(mid_head - root_head).length:.4f} "
                   f"lower_len={(mid_tail - mid_head).length:.4f} "
-                  f"perp_t=<none — straight chain fallback>")
+                  f"perp_t=<none - straight chain fallback>")
     t_pb = tgt_rig.pose.bones[rd['t_name']]
     for cof in rd['child_of']:
         sub_name = cof['target_pb'].name
@@ -1158,7 +1159,7 @@ def _compute_reval_names(rest_data, walk_names, parent_name_of,
         rd['parent_needs_reval'] = needs
         if needs:
             print(f"[BlendCap] FK->IK: {rd['t_name']!r} parent "
-                  f"{ctrl_parent!r} depends on baked pair target(s) — "
+                  f"{ctrl_parent!r} depends on baked pair target(s) - "
                   f"re-evaluating per frame with baked poses "
                   f"(chain: {_reval_names})")
     return _reval_names
@@ -1473,12 +1474,12 @@ def _bake_pairs_for_frame(frame, rest_data, arm_local,
                     sub_arm = child_of_subtarget_arm.get(sub_name)
                 if sub_arm is None:
                     continue
-                target_world = tgt_mw @ sub_arm
-                inverse = cof['inverse_matrix']
-                Xi = (tgt_mw_inv
-                      @ inverse.inverted()
-                      @ target_world.inverted()
-                      @ tgt_mw)
+                # Owner-space aware (constraint_sim.child_of_delta):
+                # a Pose-space Child Of ignores where the rig object
+                # sits, so the rig's world matrix must not enter here.
+                Xi = child_of_delta(
+                    sub_arm, cof['inverse_matrix'], tgt_mw, tgt_mw_inv,
+                    cof.get('owner_space', 'POSE')).inverted()
                 X = Xi @ X
             desired_arm = X @ desired_arm
 

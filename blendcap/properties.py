@@ -1,8 +1,8 @@
 """PropertyGroups, dynamic enum/update callbacks, BVH library sync.
 
-The BVH library sync timer (_sync_bvh_library + _bvh_library_timer)
-lives here too because it's mutating the BlendCapBVHEntry collection
-defined here.
+The BVH library sync (_sync_bvh_library + the event-driven
+bvh_library_check / _bvh_library_resync pair) lives here too because
+it's mutating the BlendCapBVHEntry collection defined here.
 """
 import bpy
 import json
@@ -13,6 +13,7 @@ import mathutils
 import numpy as np
 
 from . import preview_ground
+from .people import FACE_ONLY_FACE_TIP
 from .helpers import _cache_dir, _bvh_library_dir, _strip_capture_prefix, _tag_redraw
 
 
@@ -29,15 +30,40 @@ _FACE_DATA_ITEMS_CACHE = []
 _ARKIT_FACE_DATA_ITEMS_CACHE = []
 
 
+# Face-data folder list, rebuilt only when the cache folder's contents
+# (its subfolder names) change or a capture finishes (face data can
+# land inside an EXISTING capture folder, which a name listing can't
+# see - mocap's capture monitor bumps the epoch on completion). Per
+# redraw this costs one listing of the cache folder; the per-folder
+# stat of face_frames.npz runs only on a rebuild.
+_FACE_CACHE = {'key': None, 'folders': []}
+_FACE_CACHE_EPOCH = [0]
+
+
+def face_cache_changed():
+    """Call after anything that can add face data to an existing
+    capture folder (capture completion)."""
+    _FACE_CACHE_EPOCH[0] += 1
+
+
 def _face_cache_folders():
     """(folder, label) pairs for every cache folder holding face data."""
     cd = _cache_dir()
+    try:
+        names = tuple(sorted(os.listdir(cd)))
+    except OSError:
+        names = ()
+    key = (cd, names, _FACE_CACHE_EPOCH[0])
+    if key == _FACE_CACHE['key']:
+        return _FACE_CACHE['folders']
     out = []
-    if os.path.exists(cd):
-        for folder in os.listdir(cd):
-            fp = os.path.join(cd, folder)
-            if os.path.isdir(fp) and folder != "bvh_exports" and os.path.exists(os.path.join(fp, "face_frames.npz")):
-                out.append((folder, _strip_capture_prefix(folder)))
+    for folder in names:
+        fp = os.path.join(cd, folder)
+        if (folder != "bvh_exports" and os.path.isdir(fp)
+                and os.path.exists(os.path.join(fp, "face_frames.npz"))):
+            out.append((folder, _strip_capture_prefix(folder)))
+    _FACE_CACHE['key'] = key
+    _FACE_CACHE['folders'] = out
     return out
 
 
@@ -85,16 +111,15 @@ def get_arkit_face_data_items(self, context):
 _REST_POSE_PRESET_ITEMS_CACHE = []
 
 def _rest_pose_presets_dir_user():
-    """Rest-pose presets directory inside the addon folder.
+    """Rest-pose presets directory for USER SAVES.
 
-    Sits next to retarget_maps/ in the addon directory, matching how
-    saved presets were located in pre-refactor versions of the tool.
-    The "_user" suffix is a holdover from a brief detour through
-    Blender's user config dir; kept here so existing callers and the
-    delete-operator's path-protection check don't need to ripple.
-    """
-    from .helpers import _addon_dir
-    d = os.path.join(_addon_dir(), "rest_pose_presets")
+    Lives in the extension user folder (helpers.presets_root), which
+    survives addon updates - saves used to land inside the addon folder
+    and every update wiped them. The addon-folder location is still
+    read (see _rest_pose_presets_dir_legacy) and migrated out of at
+    register by helpers.migrate_user_data."""
+    from .helpers import presets_root
+    d = os.path.join(presets_root(), "rest_pose_presets")
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
@@ -107,30 +132,112 @@ def _rest_pose_presets_dir():
     return _rest_pose_presets_dir_user()
 
 
-def get_rest_pose_preset_items(self, context):
-    items = [('__NONE__', "(none — use source rig's edit-bone rest)",
-              "Don't apply a custom rest pose. Equivalent to leaving "
-              "'Use Custom Rest Pose' unchecked.")]
+def _rest_pose_presets_dir_legacy():
+    """The old save location inside the addon folder. READ-ONLY: still
+    listed in the dropdown so a preset that migration couldn't move
+    keeps showing up, but nothing writes here any more."""
+    from .helpers import _addon_dir
+    return os.path.join(_addon_dir(), "rest_pose_presets")
 
-    user_dir = _rest_pose_presets_dir_user()
-    if os.path.isdir(user_dir):
+
+def _rest_pose_presets_dir_bundled():
+    """Presets that ship with the addon live in the ADDON's
+    rest_pose_presets/bundled/ (they update with the addon), separate
+    from the user-save folder - so a user preset named "T-POSE" is its
+    own file and can never overwrite or shadow a shipped one. Anything
+    under bundled/ displays with the "BlendCap →" prefix (they pose
+    bones BY NAME, so they only do anything on a rig with BlendCap's
+    bone names) and is delete-protected in the delete operator."""
+    return os.path.join(_rest_pose_presets_dir_legacy(), "bundled")
+
+
+_REST_POSE_PRESET_SIG = {'sig': None}
+
+
+def get_rest_pose_preset_items(self, context):
+    # Sectioned like the bone-map preset dropdown: sentinel up top,
+    # then "── Standard Presets ──" (bundled/) and "── Custom Presets
+    # ──" (user saves) with indented entries. Header/empty rows are
+    # non-selectable — update_custom_rest_pose_preset reverts them to
+    # the sentinel, same scheme as retarget.update_preset_selection.
+    #
+    # Rebuilt only when the folders changed (see helpers.
+    # dir_tree_signature): this callback runs on every redraw.
+    from .helpers import preset_read_dirs, dir_tree_signature
+    bundled_dir = _rest_pose_presets_dir_bundled()
+    read_dirs = list(preset_read_dirs("rest_pose_presets"))
+    sig = dir_tree_signature(
+        [bundled_dir, *read_dirs, _rest_pose_presets_dir_legacy()], '.json')
+    if sig == _REST_POSE_PRESET_SIG['sig'] and _REST_POSE_PRESET_ITEMS_CACHE:
+        return _REST_POSE_PRESET_ITEMS_CACHE
+    _REST_POSE_PRESET_SIG['sig'] = sig
+
+    standard = []
+    custom = []
+    if os.path.isdir(bundled_dir):
+        for fn in sorted(os.listdir(bundled_dir)):
+            if not fn.endswith('.json'):
+                continue
+            display = os.path.splitext(fn)[0]
+            standard.append((os.path.join(bundled_dir, fn),
+                             f"BlendCap → {display}",
+                             "Bundled preset for BlendCap's own "
+                             "source rig. Poses bones by name, so "
+                             "it only works when the source uses "
+                             "BlendCap bone names (no effect on "
+                             "Mixamo or other rigs)"))
+    # The save home first, then the default location when a custom one
+    # is set (so changing the location never hides anything), then the
+    # legacy addon-folder location - read-only leftovers awaiting a
+    # consented move. Dedupe by filename, first hit wins.
+    seen = set()
+    legacy_dir = _rest_pose_presets_dir_legacy()
+    for user_dir in (*read_dirs, legacy_dir):
+        if not os.path.isdir(user_dir):
+            continue
         # Walk subfolders so the user can organize presets into nested
         # folders. Save path is unchanged — presets still write into the
         # top-level folder.
         for root, dirs, files in os.walk(user_dir):
+            if (root == user_dir
+                    and bundled_dir.startswith(user_dir + os.sep)):
+                dirs[:] = [d for d in dirs if d != "bundled"]
             dirs.sort()
             files.sort()
             for fn in files:
-                if not fn.endswith('.json'):
+                if not fn.endswith('.json') or fn in seen:
                     continue
+                seen.add(fn)
                 path = os.path.join(root, fn)
                 display = os.path.splitext(fn)[0]
                 rel = os.path.relpath(path, user_dir).replace("\\", "/")
-                items.append((path, display,
-                              f"Saved rest-pose preset: {rel}"))
+                custom.append((path, display,
+                               f"Saved rest-pose preset: {rel}"))
+    standard.sort(key=lambda t: t[1].lower())
+    custom.sort(key=lambda t: t[1].lower())
 
-    if len(items) == 1:
-        items.append(('__EMPTY_RP__', "(no presets saved yet)",
+    items = [
+        ('__NONE__', "(none — use source rig's edit-bone rest)",
+         "Don't apply a custom rest pose. Equivalent to leaving "
+         "'Use Custom Rest Pose' unchecked."),
+        None,
+        ('__HDR_STD__', "── Standard Presets ──",
+         "Rest poses bundled with the addon (read-only)"),
+    ]
+    if standard:
+        for path, name, tip in standard:
+            items.append((path, "   " + name, tip))
+    else:
+        items.append(('__EMPTY_STD__', "   (none)", ""))
+
+    items.append(None)
+    items.append(('__HDR_CUS__', "── Custom Presets ──",
+                  "User-saved rest poses"))
+    if custom:
+        for path, name, tip in custom:
+            items.append((path, "   " + name, tip))
+    else:
+        items.append(('__EMPTY_CUS__', "   (none saved yet)",
                       "Pose your source rig and click 'Save Current "
                       "Pose as Preset'."))
 
@@ -153,84 +260,67 @@ def update_use_separate_face(self, context):
 
 # Set True while the "Default Video Source" add-on pref is being applied to a
 # fresh scene (registration.py's _blendcap_apply_default_video_source). It lets
-# update_video_source skip the NOTIFY warning dialog: a programmatic default is
-# not an interactive source switch, and a new scene has render.use_sequencer ON
-# by default, so a VSE default would otherwise pop the dialog on every
-# new/startup file. AUTO_DISABLE is NOT skipped - it's silent, so the
-# no-dialog-spam rationale doesn't apply, and it's how a VSE-default user gets
-# new files' Sequencer export turned off without a startup-file edit.
+# update_video_source skip its Sequencer-rendering trigger: a programmatic
+# default is not an interactive source switch. Those users are covered by
+# the clip-appears trigger in sequencer_guard the moment they drop a video.
 _SETTING_DEFAULT_SOURCE = False
+
+
+def update_capture_mode(self, context):
+    """Leaving Multi-Camera Capture ends any open syncing session: the
+    tiled view belongs to that mode, so it goes when the mode does."""
+    from . import multicam
+    if not multicam.is_multi_mode(self) and multicam.sync_active(context.scene):
+        multicam.sync_restore(context.scene)
+
+
+def _multicam_slide_update(index, name):
+    """Update callback for one camera's Sync Slide (multicam.apply_slide)."""
+    def _update(self, context):
+        from . import multicam
+        multicam.apply_slide(context, index, getattr(self, name))
+    return _update
+
+
+def _multicam_view_items(self, context):
+    from . import multicam
+    return multicam.camera_view_items(self, context)
+
+
+_SLIDE_TIP = ("Slides camera {0}'s footage in time to line it up with "
+              "camera A")
+_FOCAL_TIP = ("Focal length camera {0} was shot at, in millimetres "
+              "(35mm / full-frame equivalent){1}")
 
 
 def update_video_source(self, context):
     """When the user switches Source from File Path -> Video Editor Strip
-    and Output > Post Processing > Sequencer is currently on, pop a
-    warning dialog asking whether to disable it. Reason: with the
-    Sequencer checkbox enabled, Blender's render output is whatever the
-    VSE is showing — so if the user kicks off a render of the actual
-    Blender scene, Blender silently re-encodes their source video clips
-    instead. The trap is most likely to bite right after this exact
-    source switch.
+    while Output > Post Processing > Sequencer is on, turn it off (with
+    a status-bar line). Reason: with the Sequencer checkbox enabled,
+    Blender's render output is whatever the VSE is showing, so a render
+    of the Blender scene silently re-encodes the source clips instead.
+    The trap is most likely to bite right after this exact switch.
 
-    Governed by the "Sequencer Render Warning" add-on pref
-    (sequencer_export_behavior): NOTIFY (default) pops the dialog once per
-    session (blendcap_state['sequencer_warned'], cleared on reload /
-    restart); AUTO_DISABLE turns the Sequencer toggle off silently; LEAVE
-    does nothing.
-
-    Also fires when the "Default Source" pref applies VSE to a new file
-    (_SETTING_DEFAULT_SOURCE): AUTO_DISABLE still runs there — it's silent,
-    and a user who sets both prefs expects new files covered — but the
-    NOTIFY dialog is skipped, so a VSE default never pops a warning on
-    every File > New.
+    Governed by the 'Turn off Sequencer rendering' preference and the
+    workspace gate, both in sequencer_guard (the other trigger for the
+    same option is a clip appearing in the sequencer). A programmatic
+    default-source apply on a new file (_SETTING_DEFAULT_SOURCE) is not
+    an interactive switch and is skipped; the clip-appears trigger
+    covers those users the moment they drop a video.
     """
     if self.video_source != 'VSE':
         return
-    # The scene that owns this property group — NOT context.scene, which
+    if _SETTING_DEFAULT_SOURCE:
+        return
+    # The scene that owns this property group - NOT context.scene, which
     # can be a different scene when the default-source handler loops over
     # bpy.data.scenes at load time.
     scene = self.id_data
-    if not getattr(scene.render, 'use_sequencer', False):
-        return
-    from .helpers import blendcap_state, addon_prefs
-    prefs = addon_prefs(context)
-    behavior = (getattr(prefs, "sequencer_export_behavior", 'NOTIFY')
-                if prefs else 'NOTIFY')
-    if behavior == 'LEAVE':
-        # User opted out: don't warn, don't touch the Sequencer toggle.
-        return
-    if behavior == 'AUTO_DISABLE':
-        # Silently turn it off, no dialog. Runs for interactive switches
-        # AND the default-source apply on new files.
-        scene.render.use_sequencer = False
-        return
-    # NOTIFY from here down. A programmatic default apply is not an
-    # interactive switch - don't pop the warning dialog for it.
-    if _SETTING_DEFAULT_SOURCE:
-        return
-    # NOTIFY (default): warn once per session. DEFER the dialog out of this
-    # update callback. Launching invoke_props_dialog synchronously here fires
-    # mid-click on the Source enum (drawn expand=True), so the button's drag
-    # interaction never finalizes - after dismissing the dialog, sliding the
-    # mouse back over "File Path" silently flips the selection back (the most
-    # natural mouse direction, so it bit constantly). A one-shot timer lets
-    # the click commit first, then pops the dialog. sequencer_warn_pending
-    # coalesces rapid re-toggles into a single dialog.
-    if (blendcap_state.get('sequencer_warned')
-            or blendcap_state.get('sequencer_warn_pending')):
-        return
-    blendcap_state['sequencer_warn_pending'] = True
-
-    def _deferred_sequencer_warning():
-        blendcap_state['sequencer_warn_pending'] = False
-        try:
-            bpy.ops.blendcap.sequencer_warning('INVOKE_DEFAULT')
-        except RuntimeError:
-            # Context can be invalid (e.g. a script-driven change); skip.
-            pass
-        return None  # one-shot
-
-    bpy.app.timers.register(_deferred_sequencer_warning, first_interval=0.05)
+    try:
+        from . import sequencer_guard
+        sequencer_guard.on_source_switched_to_vse(scene)
+    except Exception as e:
+        print(f"[BlendCap] sequencer render check skipped: {e}")
 
 
 def update_custom_rest_pose_preset(self, context):
@@ -243,6 +333,13 @@ def update_custom_rest_pose_preset(self, context):
     Legacy v5 files without the field default to True (matches their
     historical preview behavior, which always applied loc/scale)."""
     path = getattr(self, "custom_rest_pose_preset", None)
+    # Non-selectable section rows: revert to the sentinel so the
+    # dropdown never displays a header/placeholder as the selection.
+    # The re-fired update returns via the '__' guard below (no loop).
+    if path and (path.startswith('__HDR_')
+                 or path.startswith('__EMPTY_')):
+        self.custom_rest_pose_preset = '__NONE__'
+        return
     if not path or path.startswith('__'):
         return
     if not os.path.isfile(path):
@@ -581,6 +678,14 @@ def update_camera_offset(self, context):
     # viewport shows what the bake will produce (see the auto-grounding
     # block below _apply_height_offset_to_rig).
     _apply_autoground_to_rig(rig)
+    # A camera added by Add Camera tilts and re-grounds with the body,
+    # so the view through it stays the footage's view while the sliders
+    # move. After the auto-grounding: it reads the shift that applied.
+    try:
+        from .scene_camera import follow_live_tilt
+        follow_live_tilt(rig)
+    except Exception:
+        pass
 
 
 def _apply_height_offset_to_rig(rig):
@@ -732,6 +837,12 @@ def _shift_hips_keys_world_z(rig, delta):
 def update_height_offset(self, context):
     """PropertyGroup update callback for height_offset_m."""
     _apply_height_offset_to_rig(self.id_data)
+    # The rig's camera (Add Camera) rises and sinks with the body.
+    try:
+        from .scene_camera import follow_live_tilt
+        follow_live_tilt(self.id_data)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -1362,7 +1473,30 @@ def _sync_bvh_library(scene):
         scene.blendcap_bvh_index = max(0, len(disk) - 1)
     return True
 
-def _bvh_library_timer():
+# BVH library freshness, event-driven. There used to be a timer that
+# re-listed the library folder every second for the whole session,
+# panel open or not. Now the BVH Library panel does the comparison
+# itself while it is expanded and redrawing (one directory listing,
+# read-only), and only when the listing differs from the scene's list
+# does a one-shot timer perform the resync outside the draw call
+# (draw functions may not write to scene data). File load and the end
+# of a BVH generation resync directly. Nothing runs while the panel
+# is collapsed. (A directory-timestamp shortcut was tried first and
+# proved unreliable on Windows: the folder's mtime lagged the file.)
+
+def _bvh_library_listing():
+    bvh_dir = _bvh_library_dir()
+    if not os.path.isdir(bvh_dir):
+        return []
+    try:
+        return sorted(f for f in os.listdir(bvh_dir) if f.endswith('.bvh'))
+    except OSError:
+        return []
+
+
+def _bvh_library_resync():
+    """Sync every scene's list from disk; tag the panels if anything
+    changed. Safe to call from a timer, a handler, or an operator."""
     try:
         changed = False
         for scene in bpy.data.scenes:
@@ -1372,7 +1506,26 @@ def _bvh_library_timer():
             _tag_redraw('VIEW_3D', 'PROPERTIES')
     except Exception:
         pass
-    return 1.0
+    return None   # one-shot when used as a timer
+
+
+def bvh_library_check(scene):
+    """Called from the BVH Library panel draw. Read-only: schedules a
+    resync only when the folder's listing differs from this scene's
+    list."""
+    try:
+        if _bvh_library_listing() == [e.filename
+                                      for e in scene.blendcap_bvh_entries]:
+            return
+        if not bpy.app.timers.is_registered(_bvh_library_resync):
+            bpy.app.timers.register(_bvh_library_resync, first_interval=0.0)
+    except Exception:
+        pass
+
+
+@bpy.app.handlers.persistent
+def _bvh_library_on_load(_filepath=None, _depsgraph=None):
+    _bvh_library_resync()
 
 class BLENDCAP_UL_bvh(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
@@ -1382,7 +1535,76 @@ class BLENDCAP_UL_bvh(bpy.types.UIList):
             layout.alignment = 'CENTER'
             layout.label(text="")
 
+# Multi-Camera & Multi-Person: named by the user (2026-11-19). It was
+# hidden from the Capture dropdown until there was footage to build it
+# around, and went back in when it was built (the same day, on his
+# four-camera two-person take). False hides it again; nothing else has
+# to change.
+SHOW_PEOPLE_MULTI = True
+_PEOPLE_MULTI_ITEM = [
+    ('PEOPLE_MULTI', "Multi-Camera & Multi-Person",
+     "Capture multiple people's performance from up to 4 different "
+     "angles to get a more accurate result"),
+] if SHOW_PEOPLE_MULTI else []
+
+
 class BlendCapProperties(bpy.types.PropertyGroup):
+    capture_mode: bpy.props.EnumProperty(
+        name="Cameras",
+        items=[('SINGLE', "Single-Camera Capture",
+                "Capture one person's performance from a single video"),
+               ('MULTI', "Multi-Camera Capture",
+                "Capture one person's performance from up to 4 different "
+                "angles to get a more accurate result"),
+               ('PEOPLE', "Multi-Person Capture",
+                "Capture multiple people's performance from a single "
+                "video"),
+               ] + _PEOPLE_MULTI_ITEM,
+        default='SINGLE',
+        update=update_capture_mode,
+    )
+    # Per-camera focal lengths (35mm equivalent). Each capture is
+    # reconstructed at its own true scale, so the clips may use
+    # DIFFERENT lenses; what matters is that each value is right.
+    # 0 = not set, and the run is blocked until every camera in use has
+    # one: the merge's thresholds are in centimetres for a real-sized
+    # human, and a wrong focal inflates the whole scene (measured: at
+    # 1.6x scale, plant detection stopped finding any planted feet).
+    multicam_focal_a_mm: bpy.props.FloatProperty(
+        name="Focal (mm)",
+        description=_FOCAL_TIP.format("A", ""),
+        default=0.0, min=0.0, max=500.0)
+    multicam_focal_b_mm: bpy.props.FloatProperty(
+        name="Focal (mm)", description=_FOCAL_TIP.format("B", ""),
+        default=0.0, min=0.0, max=500.0)
+    multicam_focal_c_mm: bpy.props.FloatProperty(
+        name="Focal (mm)", description=_FOCAL_TIP.format("C", ""),
+        default=0.0, min=0.0, max=500.0)
+    multicam_focal_d_mm: bpy.props.FloatProperty(
+        name="Focal (mm)", description=_FOCAL_TIP.format("D", ""),
+        default=0.0, min=0.0, max=500.0)
+    # Multi-Camera Capture from File Path: ONE focal length for the
+    # group (that route expects identical cameras), and the selected
+    # clips with what each file holds, as JSON (multicam.file_infos).
+    multicam_focal_mm: bpy.props.FloatProperty(
+        name="Focal (mm)",
+        description="Focal length the cameras were shot at, in millimetres "
+                    "(35mm / full-frame equivalent)",
+        default=0.0, min=0.0, max=500.0)
+    multicam_files: bpy.props.StringProperty(default="[]", options={'HIDDEN'})
+    multicam_slide_b: bpy.props.IntProperty(
+        name="Sync Slide", description=_SLIDE_TIP.format("B"), default=0,
+        update=_multicam_slide_update(1, "multicam_slide_b"))
+    multicam_slide_c: bpy.props.IntProperty(
+        name="Sync Slide", description=_SLIDE_TIP.format("C"), default=0,
+        update=_multicam_slide_update(2, "multicam_slide_c"))
+    multicam_slide_d: bpy.props.IntProperty(
+        name="Sync Slide", description=_SLIDE_TIP.format("D"), default=0,
+        update=_multicam_slide_update(3, "multicam_slide_d"))
+    multicam_camera_view: bpy.props.EnumProperty(
+        name="Camera View",
+        description="Which camera angle to use when adding a camera",
+        items=_multicam_view_items)
     video_source: bpy.props.EnumProperty(
         name="Source",
         items=[('FILE', "File Path", "Run capture on a specific video file picked from disk"),
@@ -1395,6 +1617,14 @@ class BlendCapProperties(bpy.types.PropertyGroup):
         description="Track the body in the source video (pose, hands and root motion)")
     track_face: bpy.props.BoolProperty(name="Face Tracking", default=False,
         description="Track the face in the source video (blendshapes, landmarks, gaze)")
+    # Drawn IN PLACE of track_face, greyed out, in a multi-person mode
+    # with Body off: a checkbox's tooltip is fixed, so the one state that
+    # needs a different one gets a stand-in. It shows track_face's tick
+    # and changes nothing.
+    track_face_people_off: bpy.props.BoolProperty(
+        name="Face Tracking", description=FACE_ONLY_FACE_TIP,
+        get=lambda self: bool(self.track_face), set=lambda self, value: None,
+        options={'SKIP_SAVE'})
     preview_step: bpy.props.IntProperty(name="Preview Skip",
         description="How many frames to skip between checked preview frames (0 = check every frame; higher is faster but less thorough)",
         default=10, min=0, max=100)
@@ -1448,6 +1678,12 @@ class BlendCapProperties(bpy.types.PropertyGroup):
     smooth_face: bpy.props.FloatProperty(
         name="Face Smoothing",
         description="Smoothing window for face data, measured in seconds. 0 = off",
+        default=0.23, min=0.0, max=2.0, step=5, precision=2)
+    smooth_head: bpy.props.FloatProperty(
+        name="Head Smoothing",
+        description="Smoothing window for head and neck rotations, "
+                    "measured in seconds. These joints are excluded "
+                    "from Body smoothing and tuned here instead. 0 = off",
         default=0.23, min=0.0, max=2.0, step=5, precision=2)
 
     # ARKit shape-key application: independent clip selector and face
@@ -1508,6 +1744,39 @@ class BlendCapProperties(bpy.types.PropertyGroup):
     bvh_face_denoise_tongue: bpy.props.FloatProperty(
         name="Tongue",
         default=0.0, min=0.0, max=1.0, step=1, precision=3)
+
+    # --- BVH head noise filtering (per-axis rotation dead-zone) ---
+    # Sibling of face noise filtering, but on the Head+Neck rotation
+    # axes. Thresholds are in degrees; rotation wobble below the
+    # threshold collapses to a smoothed baseline, motion above passes
+    # through untouched. Bakes into the exported BVH.
+    bvh_head_denoise_enabled: bpy.props.BoolProperty(
+        name="Use Head Noise Filtering",
+        description="Remove small head rotation jitter (nodding, "
+                    "shaking, tilting wobble) that survives smoothing. "
+                    "Head motion larger than the thresholds passes "
+                    "through untouched. Bakes into the exported BVH.",
+        default=True)
+    bvh_head_denoise_expanded: bpy.props.BoolProperty(
+        name="Show Head Noise Filtering",
+        description="Expand the head noise filtering controls.",
+        default=False)
+    bvh_head_denoise_nod: bpy.props.FloatProperty(
+        name="Nod (°)",
+        description="Removes up-and-down nodding wobble (pitch) smaller "
+                    "than this angle. Deliberate nods larger than the "
+                    "threshold pass through untouched. 0 = off",
+        default=3.0, min=0.0, max=15.0, step=10, precision=1)
+    bvh_head_denoise_turn: bpy.props.FloatProperty(
+        name="Turn (°)",
+        description="Removes left-right head-shake wobble (yaw) smaller "
+                    "than this angle. 0 = off",
+        default=2.0, min=0.0, max=15.0, step=10, precision=1)
+    bvh_head_denoise_tilt: bpy.props.FloatProperty(
+        name="Tilt (°)",
+        description="Removes ear-to-shoulder wobble (roll) smaller "
+                    "than this angle. 0 = off",
+        default=2.0, min=0.0, max=15.0, step=10, precision=1)
 
     # --- BVH body depth noise filtering ---
     # Sibling of face noise filtering, but on the camera-depth axis of
@@ -1572,6 +1841,11 @@ class BlendCapProperties(bpy.types.PropertyGroup):
         default=0.0, min=0.0, max=1.0, step=1, precision=3)
 
     # ----- BVH-side collapsible section states -----
+    bvh_jitter_expanded: bpy.props.BoolProperty(
+        name="Show Jitter Control",
+        description="Expand the jitter control sections (smoothing and "
+                    "noise filtering).",
+        default=False)
     bvh_smoothing_expanded: bpy.props.BoolProperty(
         name="Show BVH Smoothing",
         description="Expand the BVH smoothing controls.",
@@ -1665,6 +1939,21 @@ class BlendCapProperties(bpy.types.PropertyGroup):
         description="Rebuild finger poses from the tracked fingertips for "
                     "real per-finger articulation. Replaces Finger Curl "
                     "Strength; slow on long clips",
+        default=False)
+    bvh_hold_cropped_limbs: bpy.props.BoolProperty(
+        name="Hold Cropped Limbs",
+        description="Hold body parts still when they are outside the "
+                    "picture, instead of using a \"best guess\" animation",
+        default=False)
+    # Multi-person captures only (drawn only for them). Off: the BVH
+    # goes to the 3D cursor like any other. On: the cursor stands for
+    # the camera's spot on the floor and each person lands where they
+    # stood, so a group rebuilds in place one BVH at a time.
+    bvh_people_in_place: bpy.props.BoolProperty(
+        name="Keep Captured Position",
+        description="Place this person where they stood in the footage, "
+                    "measured from the 3D cursor, so everyone in the capture "
+                    "lines up",
         default=False)
     face_expression_multiplier: bpy.props.FloatProperty(
         name="Face Expression Multiplier",

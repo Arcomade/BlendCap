@@ -1,10 +1,9 @@
 {
-  "name": "BlendCap → Mixamo",
-  "version": 1,
+  "name": "BlendCap \u2192 Mixamo",
+  "version": 2,
   "target_kind": "generic",
   "namespace_strip": "mixamorig:",
   "auto_bake_ik": false,
-  "_note": "BlendCap BVH → Mixamo. Source = BlendCap's exported BVH bone names (SAM 3D Body: Hips/Spine/.../LeftToe/Root). Target = this rig's actual bone names. Twist bones are not driven — target rig's twist setup (driver, constraint, or auto-twist) handles them from the FK rotation. namespace_strip is set to 'mixamorig:' so the map works on freshly-imported Mixamo FBXs (where bones come in as 'mixamorig:Hips' etc.) without manual renaming. Locomotion: Root→hips LOC XY + Hips→hips LOC Z, both composed per-axis onto the same hips bone (this rig's typical export carries all translation on the hips).",
   "pairs": [
     {
       "source": "Head",
@@ -265,16 +264,16 @@
       "influence": 1.0
     },
     {
-      "source": "Spine",
+      "source": "Hips",
       "target": "Hips",
-      "channels": "ROT",
-      "influence": 1.0
+      "channels": "LOC",
+      "influence": 1.0,
+      "axes": "Z"
     },
     {
       "source": "Hips",
       "target": "Hips",
-      "channels": "LOC",
-      "axes": "Z",
+      "channels": "ROT",
       "influence": 1.0
     },
     {
@@ -329,8 +328,23 @@
       "source": "Root",
       "target": "Hips",
       "channels": "LOC",
-      "axes": "XY",
-      "influence": 1.0
+      "influence": 1.0,
+      "axes": "XY"
     }
-  ]
+  ],
+  "face_head_source": "Head",
+  "face_capture_compensation": false,
+  "face_amplification": {
+    "jaw": 1.0,
+    "gaze": 1.0,
+    "lids": 1.0,
+    "brows": 1.0,
+    "lips": 1.0,
+    "cheeks": 1.0,
+    "nose": 1.0,
+    "tongue": 1.0,
+    "global": 1.0
+  },
+  "use_world_location": false,
+  "_note": "BlendCap BVH \u2192 Mixamo. Source = BlendCap's exported BVH bone names (SAM 3D Body: Hips/Spine/.../LeftToe/Root). Target = this rig's actual bone names. Twist bones are not driven \u2014 target rig's twist setup (driver, constraint, or auto-twist) handles them from the FK rotation. namespace_strip is set to 'mixamorig:' so the map works on freshly-imported Mixamo FBXs (where bones come in as 'mixamorig:Hips' etc.) without manual renaming. Locomotion: Root\u2192hips LOC XY + Hips\u2192hips LOC Z, both composed per-axis onto the same hips bone (this rig's typical export carries all translation on the hips)."
 }

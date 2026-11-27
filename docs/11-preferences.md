@@ -4,7 +4,27 @@ BlendCap's preferences can be found in **Edit ▸ Preferences ▸ Add-ons ▸ Bl
 
 ![The BlendCap add-on preferences](images/22-preferences.png)
 
-The preferences are grouped into four sections.
+The preferences are grouped into five sections. Each one folds open and closed from the arrow in its header.
+
+---
+
+## Updates
+
+BlendCap can check for new versions and install them for you (see [Installation](03-installation.md)).
+
+| Control                                        | What it does                                                                                                                                                                              |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Automatically check for updates**            | Once a day, shortly after Blender starts, looks for a newer BlendCap release and offers to install it. Needs Blender's online access (**Preferences ▸ System ▸ Network**). On by default. |
+| **Show update notice in the sidebar**          | Shows a small notice at the top of BlendCap's sidebar panel while an update is waiting. On by default.                                                                                    |
+| **Check now**                                  | Checks for an update right away. The time of the last check is shown next to it.                                                                                                          |
+| **Update Now**                                 | Shows when an update is available. Installs it over your current version and keeps your dependencies, presets and settings. Restart Blender afterwards.                                   |
+| **What's new**                                 | Opens the new version's list of changes.                                                                                                                                                  |
+| **Remind Me Tomorrow** / **Skip This Version** | Put the update off for a day, or ignore this version until the next one is released.                                                                                                      |
+| **Documentation**                              | Opens this documentation online.                                                                                                                                                          |
+
+If **Update Now** is greyed out, a note below it says why and what to do. Usually the new version needs a newer installer (download the full package from your store page and use **Install from Disk**), or some of your files are still stored inside the add-on's folder and need to be moved first. If you installed BlendCap through a store's own repository in **Get Extensions**, updates come through there instead, and these controls are switched off.
+
+![The Updates section with an update waiting](images/42-preferences-updates.png)
 
 ---
 
@@ -12,11 +32,15 @@ The preferences are grouped into four sections.
 
 Manage the models and libraries BlendCap needs. When everything is installed, this section confirms it and lists what was detected (your GPU and the installed library versions), for reference and support questions.
 
-| Control                  | What it does                                                                                                                                                                                                                            |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Install Dependencies** | Runs the one-time setup (see [Installation](03-installation.md)). Shows as **Reinstall Dependencies** once they're installed, re-run it after a GPU change or an interrupted install.                                                   |
-| **Open Install Folder**  | Opens the folder where BlendCap and its dependencies live on disk (the path is shown above the button).                                                                                                                                 |
-| **Uninstall**            | Removes the bundled Python environment and downloaded AI models to free disk space (several GB). A confirmation appears first; Blender may freeze briefly while files are removed, and you'll need to reinstall before capturing again. |
+| Control                                                            | What it does                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Install Dependencies**                                           | Runs the one-time setup (see [Installation](03-installation.md)). Shows as **Reinstall Dependencies** once they're installed, re-run it after a GPU change or an interrupted install. When an install didn't finish, a red note says so here, and **Reinstall Dependencies** continues where it stopped.                                                                                    |
+| **Open Dependency Folder**                                         | Opens the folder where the installed dependencies live on disk (the path is shown above the button). The addon's own folder has an **Open Addon Folder** button under **File & Cache Locations**.                                                                                                                                                                                           |
+| **Uninstall**                                                      | Removes the bundled Python environment and downloaded AI models to free disk space (several GB). A confirmation appears first; Blender may freeze briefly while files are removed, and you'll need to reinstall before capturing again.                                                                                                                                                     |
+| **Store dependencies in a custom folder**                          | Keeps the dependency files (about 11 GB) in a folder you choose, for example on a bigger drive. New installs go there, and **Move Dependency Files** relocates an existing install, with a progress bar and a **Cancel Move** button. Unticking the box offers to move them back. BlendCap warns you about slow or removable drives, since every capture loads the models from that folder. |
+| **Don't show the startup warning about files in the addon folder** | Only matters if you updated from 1.0.5 or older and chose not to move your files. It stops the reminder window at startup. The files stay where they are, and an add-on update can still delete them.                                                                                                                                                                                       |
+
+This section is also where BlendCap tells you when something needs attention: dependencies that were built for an earlier version and need a rebuild, a custom dependency folder that can't be found (reconnect the drive, don't reinstall), or Windows Smart App Control blocking the capture engine. See [Troubleshooting & FAQ](12-troubleshooting-and-faq.md).
 
 ---
 
@@ -24,12 +48,16 @@ Manage the models and libraries BlendCap needs. When everything is installed, th
 
 Choose where BlendCap stores its data (covered in [BVH Library & Cache](10-bvh-library-and-cache.md)).
 
-| Control | What it does |
-|---|---|
-| **Set default cache folder** | Save tracking data to a folder you choose instead of the temporary folder, so captures made in unsaved projects survive closing Blender. Saved projects still keep their cache next to the `.blend` file unless you also tick **Always use this folder**. |
-| **Use a custom BVH library folder** | Read and save the BVH library from a folder you choose. Point several projects at one shared folder to reuse takes across them. |
+| Control                                     | What it does                                                                                                                                                                                                                                              |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Set default cache folder**                | Save tracking data to a folder you choose instead of the temporary folder, so captures made in unsaved projects survive closing Blender. Saved projects still keep their cache next to the `.blend` file unless you also tick **Always use this folder**. |
+| **Use a custom BVH library folder**         | Read and save the BVH library from a folder you choose. Point several projects at one shared folder to reuse takes across them.                                                                                                                           |
+| **Store custom presets in a custom folder** | Keeps your saved bone maps and rest poses in a "BlendCap Presets" folder inside a location you choose. They move there the moment you pick it, and move back when you untick it.                                                                          |
+| **Open Preset Folder**                      | Opens the folder your custom presets are in (the path is shown above the button). It holds a `retarget_maps` folder and a `rest_pose_presets` folder, so preset files can also be copied in by hand.                                                      |
+| **Export Presets** / **Import Presets**     | Saves all of your custom bone maps and rest poses into one zip file, or adds the presets from such a file. Importing keeps the presets you already have, unless you choose to replace them.                                                               |
+| **Open Addon Folder**                       | Opens the folder the add-on itself is installed in.                                                                                                                                                                                                       |
 
-Changing a location doesn't move existing data, new captures use the new location.
+Changing a location doesn't move existing data, new captures use the new location. (Custom presets and dependencies are the exception, see their rows.)
 
 ---
 
@@ -50,14 +78,25 @@ Which hardware runs the body capture. **Automatic** suits almost everyone, it us
 
 ### Other capture settings
 
-| Control                        | What it does                                                                                                                                                                                                                                                                                                                                                              |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Refine Hand Tracking**       | An extra capture pass that sharpens finger poses. **Automatic** (default) refines on NVIDIA and skips it on non-NVIDIA/CPU, where it's slow; **Always on** for best hands everywhere; **Always off** for speed. Hands are still captured either way, this pass only adds polish, and whether hands appear in the armature at all is the **Hands** toggle in BVH Settings. |
-| **Default Source**             | Which video source new projects start on: **File Path** or **Video Editor Strip**. Set it to Video Editor Strip if you usually capture from the timeline. Choosing Video Editor Strip asks whether new files should have Blender's Sequencer render option turned off automatically (see **Sequencer Render Warning** below).                                                                                                                                                                                                                 |
-| **Sequencer Render Warning**   | What to do about Blender's "Sequencer" render option when you switch the source to a Video Editor strip (leaving it on can make renders export your source clip instead of the scene): **Ask each time** (default), **Turn off automatically**, or **Leave it alone**. **Turn off automatically** also covers new files that start on a Video Editor strip through **Default Source**; saved projects keep their own setting. **Ask each time** isn't available while Default Source is Video Editor Strip, new files start on a strip with no switch to ask on. See [Capturing](05-capturing.md).                                                                  |
-| **Disable playhead auto-snap** | Keep the timeline playhead where it is when a capture starts, rather than jumping to the start of the selected clip.                                                                                                                                                                                                                                                      |
+| Control                              | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Refine Hand Tracking Default**     | Where the **Refine Hand Tracking** checkbox in the Capture section starts each time you open Blender (the checkbox itself can be changed freely during a session). **Automatic** (default) starts enabled on NVIDIA and disabled on non-NVIDIA/CPU, where the extra pass is slow; Choose **On by default** for best hands everywhere; **Off by default** for speed. Hands are still captured either way, this pass only adds polish, and whether hands appear in the armature at all is the **Hands** toggle in BVH Settings. |
+| **Show Footage in BlendCap Cameras** | Shows the source video as the background of cameras added with **Add Camera** (see [BVH Generation and Post-Processing](08-bvh-generation-and-post-processing.md)). On by default.                                                                                                                                                                                                                                                                                                                                            |
+| **Default Source**                   | Which video source new projects start on: **File Path** or **Video Editor Strip**. Set it to Video Editor Strip if you usually capture from the timeline.                                                                                                                                                                                                                                                                                                                                                                     |
+| **Disable playhead auto-snap**       | Keep the timeline playhead where it is when a capture starts, rather than jumping to the start of the selected clip.                                                                                                                                                                                                                                                                                                                                                                                                          |
 
-> **Refine Hand Tracking is not Rebuild Finger Motion.** This preference sharpens the hand *capture* itself, an extra pass at tracking time. **Rebuild Finger Motion** (in BVH Settings) is a separate control that reshapes the fingers afterward, to retain as much detail as possible when the BVH is generated. See [Hand & Finger Tracking](07-hand-tracking.md).
+> **Refine Hand Tracking is not Rebuild Finger Motion.** Refine Hand Tracking sharpens the hand *capture* itself, it's an extra pass at tracking time. **Rebuild Finger Motion** (in BVH Settings) is a separate control that reshapes the fingers afterward, to retain as much detail as possible when the BVH is generated. See [Hand & Finger Tracking](07-hand-tracking.md).
+
+### When video is added to the sequencer
+
+Blender changes a few project settings when you drop a video into the Video Sequencer. These four options stop it from doing that, and all four are on by default:
+
+| Control                                             | What it does                                                                                                                                                                                                              |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Keep the project's view transform**               | Blender normally switches the view transform to Standard when a clip is added. This keeps your project's own setting (AgX, Filmic), and sets the new clip up so it still displays the way it should.                      |
+| **Keep the project's frame rate**                   | Blender normally sets the project's frame rate to the clip's. This keeps the project's frame rate. The clip still plays at normal speed, and capturing a clip with a different frame rate offers the usual conversion.    |
+| **Turn off Sequencer rendering**                    | Blender's **Output ▸ Post Processing ▸ Sequencer** option makes renders show your video strips instead of your scene. This turns it off when a clip is added, or when the Video Source is switched to Video Editor Strip. |
+| **Only while the BlendCap workspace tab is active** | Limits the three options above to BlendCap's **Performance Capture** workspace, rather than all video editing workspaces. Untick it to have them apply in any workspace with a Sequencer.                                 |
 
 ---
 

@@ -1,11 +1,28 @@
 # BlendCap source-build dependencies (Python 3.12).
 #
+# Dependency revision: 1
+# (Maintainers: when this file, the installer lock or the model list
+# changes, bump DEPS_REVISION in blendcap/helpers.py and this line
+# together. Installed copies compare it with the number stamped in
+# their venv and show a "rebuild your dependencies" notice when behind.)
+#
 # These are the exact versions the supported (paid) installer validates
 # against. Building from source is possible but UNSUPPORTED — see
 # NOTICE.txt / licenses/ for the license terms that apply either way.
 #
-# The addon expects the environment at <addon root>/venv
+# The addon expects the environment at <dependency folder>/venv
 # (venv\Scripts\python.exe on Windows, venv/bin/python elsewhere).
+# The dependency folder is:
+#   Windows: %APPDATA%\Blender Foundation\Blender\<version>\extensions\
+#            .user\user_default\blendcap\deps
+#   Linux:   ~/.config/blender/<version>/extensions/.user/user_default/
+#            blendcap/deps
+# (Preferences > Add-ons > BlendCap > AI Tracking Dependencies shows the exact
+# path for your install.)
+#
+# 1.0.5 and older expected it inside the addon folder instead. Blender deletes
+# that folder when a new version is installed over it, so move venv/ and
+# checkpoints/ out of there before you update.
 #
 # torch/torchvision/torchaudio MUST be the CUDA 12.8 (+cu128) builds for
 # NVIDIA: cu128 covers RTX 20-series (Turing) through RTX 50-series
@@ -51,7 +68,7 @@ requests==2.34.2
 moge @ git+https://github.com/microsoft/MoGe.git@07444410f1e33f402353b99d6ccd26bd31e469e8
 
 # Model assets are NOT included in this repository and are not pip-installable.
-# Place them under checkpoints/ at the paths below — the capture scripts read
+# Place them under <dependency folder>/checkpoints/ at the paths below — the capture scripts read
 # these exact locations (see save_mhr_data.py / save_face_data.py):
 #
 #   sam-3d-body-dinov3/          SAM 3D Body — GATED by Meta. Accept the license at

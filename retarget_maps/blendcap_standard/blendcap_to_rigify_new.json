@@ -1,44 +1,9 @@
 {
-  "name": "BlendCap → Rigify (New)",
-  "version": 9,
+  "name": "BlendCap \u2192 Rigify (New)",
+  "version": 10,
   "target_kind": "rigify_control",
   "namespace_strip": "",
   "auto_bake_ik": false,
-  "face_head_source": "Head",
-  "face_head_target": "head",
-  "face_capture_compensation": false,
-  "face_amplification": {
-    "jaw": 1.0,
-    "gaze": 1.0,
-    "lids": 1.0,
-    "brows": 1.0,
-    "lips": 1.0,
-    "cheeks": 1.0,
-    "nose": 1.0
-  },
-  "_note": "Rigify NEW face rig. Companion to the overhauled flat face BVH (66 face bones, all flat-parented to Head, zero-constraint). Masters-only design: face-anchored target masters driven via BASIS, plus HEAD_LOCAL on bones whose target parent chain rides jaw. The HEAD_LOCAL path uses Blender's pb.matrix setter to back-solve the basis through whatever the target parent did (jaw cascade, constraint blends, anything) — so lip.B can be driven to land at source's exact head-local position without double-counting the parent's contribution. v6 enables HEAD_LOCAL on the LowerLip → lip.B pair (the depth-level view_layer.update() in retarget.py's bake loop makes parent matrices current at the moment of back-solve, so this works correctly). PAIR SELECTION: BASIS for face-anchored masters (jaw_master, jaw.L/R, lip.T, lip_end.L/R.001, eye.L/R, lid.*002, brow endpoints, brow.T.*, cheek.B.*001, cheek.T.*001, nose, nose.002, nose.L/R, forehead.*, temple.*) — these have no parent-cascade contamination. HEAD_LOCAL for LowerLip → lip.B because its target parent chain (MCH-lip_arm.B.L → MCH-jaw_master_bottom_out) rides 100% with jaw. DROPPED still: inner lip tweaks (MCH-lip_offset cascade fills them), jaw chain children (chin / chin.001 / chin.L/R / jaw.L/R.001 — parent ORG-jaw_master 100%, could be re-added as HEAD_LOCAL pairs later if user wants chin articulation), tongue chain (same — could re-add as HEAD_LOCAL), brow ridge middles, brow muscle middle, Nose1/3/4 / nostril ends, ear pairs (source has no ear bones).",
-  "ik_chains": [
-    {
-      "owner": "MCH-shin_ik.L",
-      "ik_control": "foot_ik.L",
-      "pole_control": "thigh_ik_target.L"
-    },
-    {
-      "owner": "MCH-shin_ik.R",
-      "ik_control": "foot_ik.R",
-      "pole_control": "thigh_ik_target.R"
-    },
-    {
-      "owner": "MCH-forearm_ik.L",
-      "ik_control": "hand_ik.L",
-      "pole_control": "upper_arm_ik_target.L"
-    },
-    {
-      "owner": "MCH-forearm_ik.R",
-      "ik_control": "hand_ik.R",
-      "pole_control": "upper_arm_ik_target.R"
-    }
-  ],
   "pairs": [
     {
       "source": "LeftForehead",
@@ -691,9 +656,9 @@
     {
       "source": "Hips",
       "target": "torso",
-      "channels": "LOC",
-      "axes": "Z",
-      "influence": 1.0
+      "channels": "LOC_ROT",
+      "influence": 1.0,
+      "axes": "XYZ"
     },
     {
       "source": "LeftUpLeg",
@@ -747,10 +712,56 @@
       "source": "Root",
       "target": "root",
       "channels": "LOC",
-      "axes": "XY",
-      "influence": 1.0
+      "influence": 1.0,
+      "axes": "XY"
     }
   ],
+  "face_head_source": "Head",
+  "face_head_target": "head",
+  "face_capture_compensation": false,
+  "face_amplification": {
+    "jaw": 1.0,
+    "gaze": 1.0,
+    "lids": 1.0,
+    "brows": 1.0,
+    "lips": 1.0,
+    "cheeks": 1.0,
+    "nose": 1.0,
+    "tongue": 1.0,
+    "global": 1.0
+  },
+  "use_world_location": false,
+  "ik_chains": [
+    {
+      "limb_kind": "ARM",
+      "side": "L",
+      "owner": "MCH-forearm_ik.L",
+      "ik_control": "hand_ik.L",
+      "pole_control": "upper_arm_ik_target.L"
+    },
+    {
+      "limb_kind": "ARM",
+      "side": "R",
+      "owner": "MCH-forearm_ik.R",
+      "ik_control": "hand_ik.R",
+      "pole_control": "upper_arm_ik_target.R"
+    },
+    {
+      "limb_kind": "LEG",
+      "side": "L",
+      "owner": "MCH-shin_ik.L",
+      "ik_control": "foot_ik.L",
+      "pole_control": "thigh_ik_target.L"
+    },
+    {
+      "limb_kind": "LEG",
+      "side": "R",
+      "owner": "MCH-shin_ik.R",
+      "ik_control": "foot_ik.R",
+      "pole_control": "thigh_ik_target.R"
+    }
+  ],
+  "_note": "Rigify NEW face rig. Companion to the overhauled flat face BVH (66 face bones, all flat-parented to Head, zero-constraint). Masters-only design: face-anchored target masters driven via BASIS, plus HEAD_LOCAL on bones whose target parent chain rides jaw. The HEAD_LOCAL path uses Blender's pb.matrix setter to back-solve the basis through whatever the target parent did (jaw cascade, constraint blends, anything) \u2014 so lip.B can be driven to land at source's exact head-local position without double-counting the parent's contribution. v6 enables HEAD_LOCAL on the LowerLip \u2192 lip.B pair (the depth-level view_layer.update() in retarget.py's bake loop makes parent matrices current at the moment of back-solve, so this works correctly). PAIR SELECTION: BASIS for face-anchored masters (jaw_master, jaw.L/R, lip.T, lip_end.L/R.001, eye.L/R, lid.*002, brow endpoints, brow.T.*, cheek.B.*001, cheek.T.*001, nose, nose.002, nose.L/R, forehead.*, temple.*) \u2014 these have no parent-cascade contamination. HEAD_LOCAL for LowerLip \u2192 lip.B because its target parent chain (MCH-lip_arm.B.L \u2192 MCH-jaw_master_bottom_out) rides 100% with jaw. DROPPED still: inner lip tweaks (MCH-lip_offset cascade fills them), jaw chain children (chin / chin.001 / chin.L/R / jaw.L/R.001 \u2014 parent ORG-jaw_master 100%, could be re-added as HEAD_LOCAL pairs later if user wants chin articulation), tongue chain (same \u2014 could re-add as HEAD_LOCAL), brow ridge middles, brow muscle middle, Nose1/3/4 / nostril ends, ear pairs (source has no ear bones).",
   "_note_transfer_update": "2026-07-08 transfer-mode update: every face pair is now loc_space=head_local (measured end-to-end on the reference character: smile error 1.75mm RMS/15.8mm max -> 0.34mm/2.3mm). Rigify mouth masters/corners carry LOC_ROT again - the engine now allows rotation alongside head-local LOC, restoring the authored funnel/roll (up to ~29 deg) and corner-tilt (~10 deg) rotations that were previously discarded. Face motion is auto-normalized to the target's face size at bake (eye-distance ratio).",
   "_note_lips_reverted": "2026-07-09: all lip/mouth pairs reverted to channels=LOC (location only). The LOC_ROT lip rotation required an engine gate-lift that broke CloudRig's face, so the rotation work was pulled. loc_space (head_local) is unchanged."
 }

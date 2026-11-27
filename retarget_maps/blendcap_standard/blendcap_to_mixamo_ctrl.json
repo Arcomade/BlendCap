@@ -1,6 +1,6 @@
 {
-  "name": "BlendCap → Mixamo Control Rig",
-  "version": 1,
+  "name": "BlendCap \u2192 Mixamo Control Rig",
+  "version": 2,
   "target_kind": "generic",
   "namespace_strip": "",
   "auto_bake_ik": false,
@@ -246,8 +246,14 @@
       "influence": 1.0
     },
     {
-      "source": "Spine2",
+      "source": "Spine3",
       "target": "Ctrl_Spine2",
+      "channels": "ROT",
+      "influence": 1.0
+    },
+    {
+      "source": "Spine2",
+      "target": "Ctrl_Spine1",
       "channels": "ROT",
       "influence": 1.0
     },
@@ -266,9 +272,9 @@
     {
       "source": "Hips",
       "target": "Ctrl_Hips",
-      "channels": "LOC",
+      "channels": "LOC_ROT",
       "influence": 1.0,
-      "axes": "Z"
+      "axes": "XYZ"
     },
     {
       "source": "LeftUpLeg",
@@ -335,8 +341,11 @@
     "brows": 1.0,
     "lips": 1.0,
     "cheeks": 1.0,
-    "nose": 1.0
+    "nose": 1.0,
+    "tongue": 1.0,
+    "global": 1.0
   },
+  "use_world_location": false,
   "ik_chains": [
     {
       "limb_kind": "ARM",

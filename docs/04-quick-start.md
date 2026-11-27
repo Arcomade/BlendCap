@@ -18,7 +18,7 @@ In the **Video Source** section, leave it on **File Path** and point BlendCap at
 
 ![Selecting a video source](images/07-quickstart-video-source.png)
 
->**Tips for a good first clip:** The video should only show one person, fully in frame, with reasonably good lighting, and a steady camera. See [Filming Tips](13-filming-tips.md) for more.
+>**Tips for a good first clip:** The video should only show one person, fully in frame, with reasonably good lighting, and a steady camera. See [Filming Tips](13-filming-tips.md) for more. (BlendCap can also capture multiple people at once, or one take from several camera angles, but we'll stick with a simple case for now.)
 >
 >BlendCap can also pull footage from Blender's Video Sequencer for editing and multi-clip work. See [Capturing](05-capturing.md) for details.
 
@@ -30,10 +30,14 @@ Before committing to a full capture, you can optionally click **Run Preview**. I
 
 ## 4. Capture
 
+The dropdown at the top of the **Capture** section sets the capture mode. Leave it on **Single-Camera Capture** for now, the other modes are covered in [Capturing](05-capturing.md).
+
 In the **Capture** section, choose what to track:
 
 - **Body**: full body and hands.
 - **Face**: facial performance (can be combined with Body, or done on its own).
+
+**Refine Hand Tracking**, just below, sharpens the finger tracking. You can generally leave it alone, but if it's on and the capture feels slow, you can disable it for a speed boost, see [Hand & Finger Tracking](07-hand-tracking.md).
 
 Click **Run Capture**. BlendCap processes the clip and loads a plane in the viewport showing the tracked 2D skeleton over your footage, so you can check the result before going further.
 
@@ -67,13 +71,12 @@ Now transfer the captured motion onto your character. In the **Retargeting** sec
 
 ![Choosing source and target rigs](images/10-quickstart-retarget-rigs.png)
 ![Choosing source and target rigs](images/10-1-quickstart-retarget-rigs.png)
-
 ## 7. Load a bone map
 
 BlendCap needs to know which captured bone drives which bone on your rig. The easiest path:
 
 - **Choose a preset** that matches your rig type from the preset list, **or**
-- Click **Auto-Match** to let BlendCap attempt to pair the bones automatically based on naming, or **Add All** to fill the map, and pair the bones manually.
+- Click **Auto-Match** to let BlendCap attempt to pair the bones automatically based on their names, positions and place in the hierarchy, or **Add All** to fill the map, and pair the bones manually.
 
 ![Choosing source and target rigs](images/10-2-bone-map.png)
 
@@ -83,7 +86,7 @@ You can fine-tune any pairing by hand, see [Retargeting](09-retargeting.md).
 
 Retargeting is cleanest when the source armature and your character start from the same rest pose, so line them up before baking.
 
-- **If your character is in a simple T-pose** (like the example), open the **Custom Rest Pose** section, enable it, and pick the **T-POSE** preset. No manual posing needed.
+- **If your character is in a simple T-pose** (like the example), open the **Custom Rest Pose** section, enable it, and pick the **BlendCap → T-POSE** preset. No manual posing needed.
 - **For any other pose, match it by hand.** In **Pose Mode** on the source armature, clear its transforms, pose it to match your character's rest pose, then enable **Use Current Source Pose as Rest**. You can also save any manual pose as your own Custom Rest Pose preset for future use.
 
 This only sets what BlendCap treats as the source's rest pose; it doesn't change your captured animation. See [Retargeting](09-retargeting.md) for more.
@@ -119,3 +122,5 @@ From here:
 - Master retargeting and custom rigs → [Retargeting](09-retargeting.md)
 - Add facial performance → [Face Capture](06-face-capture.md)
 - Add high-detail hand motion → [Hand Tracking](07-hand-tracking.md)
+- Capture from multiple camera angles → [Multi-Camera Capture](05a-multi-camera-capture.md)
+- Capture multiple people at once → [Multi-Person Capture](05b-multi-person-capture.md)

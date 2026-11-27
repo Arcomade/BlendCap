@@ -8,6 +8,8 @@ import numpy as np
 import cv2
 from pathlib import Path
 
+from pipeline.video_colour import frame_fix, apply_fix
+
 # MHR70 keypoint name -> index
 KP = {
     "nose": 0, "left_eye": 1, "right_eye": 2, "left_ear": 3, "right_ear": 4,
@@ -256,9 +258,16 @@ def main():
     parser.add_argument("--face", default="", help="Face NPZ from save_face_data.py (optional if --input)")
     parser.add_argument("--output", default="overlay.mp4", help="Output video path")
     parser.add_argument("--thickness", type=int, default=2, help="Dot size (default: 2)")
+    parser.add_argument("--people", default="",
+                        help="Multi-Person Capture: the capture's folder. Every "
+                             "person's skeleton (and face, where captured) is "
+                             "drawn on every frame of the capture; --input and "
+                             "--face are then not drawn. No numbers and no "
+                             "per-person colours: who is who is the addon's to "
+                             "draw, live, so a correction never needs a new video")
     args = parser.parse_args()
 
-    if not args.input and not args.face:
+    if not args.input and not args.face and not args.people:
         print("ERROR: Provide at least one of --input (body) or --face (face).")
         sys.exit(1)
 
@@ -293,6 +302,14 @@ def main():
     face_data = None
     hud_indices = []
 
+    if args.face and args.people and not os.path.isfile(args.face):
+        # A multi-person capture: --face is the most prominent person's
+        # face data, and it is only there when THEIR face was found.
+        # Faces found for other people are drawn from their own tracks
+        # below, so this is nothing to stop for.
+        print("No face data for the most prominent person; drawing the faces "
+              "that were found")
+        args.face = ""
     if args.face:
         if not os.path.isfile(args.face):
             print(f"ERROR: Face NPZ not found: {args.face}")
@@ -323,6 +340,41 @@ def main():
             frame_indices = face_frame_indices
             fps = float(fnpz["fps"])
 
+    # Everybody of a multi-person capture
+    people = []
+    if args.people:
+        import json
+        with open(os.path.join(args.people, "people.json"), encoding="utf-8") as fh:
+            table = json.load(fh)
+        p_start = int(table.get("start_frame", 0))
+        p_frames = int(table["frames"])
+        for t in table.get("tracks", []):
+            tp = os.path.join(args.people, "people", f"track_{int(t['id']):02d}.npz")
+            if not os.path.isfile(tp):
+                continue
+            tz = np.load(tp)
+            entry = {"first": int(tz["frame_indices"][0]),
+                     "kp": tz["keypoints_2d"], "face": None}
+            fps = float(tz["fps"])
+            fp = tp[:-4] + "_face.npz"
+            if os.path.isfile(fp):
+                fz = np.load(fp, allow_pickle=False)
+                entry["face"] = {
+                    "landmarks": fz["face_landmarks"] if "face_landmarks" in fz else None,
+                    "bbox": fz["face_bbox"], "detected": fz["face_detected"],
+                    "lookup": {int(v): i for i, v in enumerate(fz["frame_indices"].astype(int))}}
+            people.append(entry)
+        print(f"Loading {len(people)} people from {args.people}")
+        if people:
+            # the whole capture, whoever is on screen when
+            keypoints_2d = None
+            face_data = None
+            hud_indices = []
+            frame_indices = np.arange(p_start, p_start + p_frames)
+        elif frame_indices is None:
+            print("ERROR: no people in this capture.")
+            sys.exit(1)
+
     # Open video
     print(f"Reading video: {video}")
     cap = cv2.VideoCapture(str(video))
@@ -338,6 +390,11 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"  {vid_total} frames, {width}x{height}, {vid_fps:.1f} FPS")
 
+    # OpenCV decodes every file as BT.601. Frames from a source tagged
+    # otherwise (most HD clips: BT.709) are corrected so the overlay
+    # shows the same colours as the original strip in Blender.
+    colour_fix = frame_fix(video, log=print)
+
     # Scale down (cap long edge at 1920, otherwise native)
     if max(width, height) > 1920:
         scale = 1920 / max(width, height)
@@ -351,13 +408,14 @@ def main():
         print(f"ERROR: Cannot create output video {args.output}")
         sys.exit(1)
 
-    has_body = keypoints_2d is not None
+    has_body = keypoints_2d is not None or bool(people)
     has_face = face_data is not None
     mode = ("body + face" if has_body and has_face else "body only" if has_body else "face only")
     print(f"  Output: {args.output} ({out_w}x{out_h}) [{mode}]")
 
     # Build body frame lookup
-    body_lookup = {int(v): i for i, v in enumerate(frame_indices)} if has_body and args.input else {}
+    body_lookup = ({int(v): i for i, v in enumerate(frame_indices)}
+                   if keypoints_2d is not None and args.input else {})
 
     # Frame range (union of body and face)
     first_vid_frame = int(frame_indices[0])
@@ -386,6 +444,7 @@ def main():
         ret, frame = cap.read()
         if not ret:
             break
+        frame = apply_fix(frame, colour_fix)
 
         # Body skeleton
         body_idx = body_lookup.get(vid_f)
@@ -405,7 +464,23 @@ def main():
                 draw_blendshape_hud(frame, face_data["blendshapes"][face_idx], hud_indices, HUD_LABELS)
                 face_drawn += 1
 
-        has_track = body_idx is not None or face_idx is not None
+        drawn_people = 0
+        for person in people:
+            pi = vid_f - person["first"]
+            if 0 <= pi < len(person["kp"]):
+                draw_skeleton(frame, person["kp"][pi], args.thickness)
+                drawn_people += 1
+            pf = person["face"]
+            fi = pf["lookup"].get(vid_f) if pf is not None else None
+            if fi is not None:
+                seen = bool(pf["detected"][fi])
+                draw_face_box(frame, pf["bbox"][fi], seen)
+                if seen and pf["landmarks"] is not None:
+                    draw_face_landmarks(frame, pf["landmarks"][fi])
+        if drawn_people:
+            tracked += 1
+
+        has_track = body_idx is not None or face_idx is not None or drawn_people > 0
         cv2.putText(frame, f"{vid_f}/{last_vid_frame}{'' if has_track else ' [no track]'}",
                     (10, height - 15), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (200,200,200), 1, cv2.LINE_AA)

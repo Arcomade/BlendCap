@@ -129,7 +129,7 @@ def clean_tracking_failures(global_rots, joint_coords, parents, R0):
 
     good_idx = np.where(~bad)[0]
     if len(good_idx) == 0:
-        print("       WARNING: all frames flagged — skipping repair")
+        print("       WARNING: all frames flagged - skipping repair")
         return global_rots.copy(), joint_coords.copy(), []
 
     runs = _bad_runs(bad)

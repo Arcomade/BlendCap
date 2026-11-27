@@ -18,6 +18,7 @@ import bpy
 from mathutils import Matrix, Quaternion, Vector
 
 from .fcurves import _bulk_write_keys, _accumulate_basis_key
+from .constraint_sim import child_of_delta
 
 
 # Opt-in dispatcher for the fast FK->IK engine. Flip True after
@@ -50,6 +51,7 @@ def _detect_child_of_constraints(t_pb, tgt_rig):
         out.append({
             'target_pb': pbs[con.subtarget],
             'inverse_matrix': con.inverse_matrix.copy(),
+            'owner_space': getattr(con, 'owner_space', 'POSE'),
             'name': con.name,
         })
     return out
@@ -58,15 +60,15 @@ def _detect_child_of_constraints(t_pb, tgt_rig):
 def _child_of_compensation(child_of_list, tgt_mw, tgt_mw_inv, baked_arm=None):
     """Compose the inverse of Child Of effects so that, when the
     constraints run after our basis write, the bone lands at desired
-    pose. Per Blender's evaluateConstraint(CHILDOF) with target_space=
-    WORLD, owner_space=POSE:
-
-        bone_post_arm = tgt_mw_inv @ target_world @ inverse_matrix
-                        @ tgt_mw @ bone_pre_arm
+    pose. The constraint's effect is  bone_post_arm = D @ bone_pre_arm
+    with D from constraint_sim.child_of_delta, which depends on the
+    constraint's OWNER SPACE: Pose space (the default for a bone)
+    ignores the armature object's placement, World space does not.
+    (This docstring used to give the world-space formula for
+    owner_space=POSE; that only holds with the rig at the origin.)
 
     To make bone_post_arm = desired_arm:
-        bone_pre_arm = X @ desired_arm
-        X = tgt_mw_inv @ inverse_matrix^-1 @ target_world^-1 @ tgt_mw
+        bone_pre_arm = D^-1 @ desired_arm
 
     For multiple constraints, compose by composing their X matrices
     in reverse evaluation order (last constraint to run is the first
@@ -84,14 +86,12 @@ def _child_of_compensation(child_of_list, tgt_mw, tgt_mw_inv, baked_arm=None):
     for cof in child_of_list:
         sub_name = cof['target_pb'].name
         if baked_arm is not None and sub_name in baked_arm:
-            target_world = tgt_mw @ baked_arm[sub_name]
+            sub_arm = baked_arm[sub_name]
         else:
-            target_world = tgt_mw @ cof['target_pb'].matrix
-        inverse = cof['inverse_matrix']
-        Xi = (tgt_mw_inv
-              @ inverse.inverted()
-              @ target_world.inverted()
-              @ tgt_mw)
+            sub_arm = cof['target_pb'].matrix
+        Xi = child_of_delta(
+            sub_arm, cof['inverse_matrix'], tgt_mw, tgt_mw_inv,
+            cof.get('owner_space', 'POSE')).inverted()
         X = Xi @ X
     return X
 
@@ -139,7 +139,7 @@ def _bake_world_pairs_iter(pairs, src_rig, tgt_rig, frame_start, frame_end):
                 pairs, src_rig, tgt_rig, frame_start, frame_end)
             return
         print("[BlendCap] FK->IK fast engine: SAMPLE-mode pole detected "
-              "— falling back to classic engine for the whole bake")
+              "- falling back to classic engine for the whole bake")
 
     scene = bpy.context.scene
     tgt_mw = tgt_rig.matrix_world

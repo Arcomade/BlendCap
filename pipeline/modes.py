@@ -49,6 +49,7 @@ from .foot_grounding import (compute_feet_defined_vertical,
                              compute_per_stance_correction)
 from .footskate_cleanup import apply_footskate_cleanup
 from .body_depth_denoise import apply_body_depth_denoise
+from .head_rotation_denoise import apply_head_rotation_denoise
 from .face_export import (
     AVERAGE_IPD_METERS,
     compute_face_bone_data,
@@ -180,6 +181,90 @@ def _clean_tracking_stage(args, export_mode, parents, prerot_quats,
     return global_rots, joint_coords, flagged_runs
 
 
+def merged_take_cameras(folder, n_frames, cam_dirs=None):
+    """For a take merged from several cameras (pipeline/
+    two_camera_merge): each camera's own capture, cut to the merged
+    take's frames, in the form hand_solver.solve_hands_merged takes.
+
+    folder: the merged take's folder (calibration.npz, and the cameras'
+    captures in cam_a, cam_b, ... unless cam_dirs = {'a': dir, 'b':
+    dir, ...} says otherwise). Returns (cameras, None) or (None, why
+    not)."""
+    calib_path = os.path.join(folder, "calibration.npz")
+    if not os.path.isfile(calib_path):
+        return None, "no calibration next to the merged capture"
+    cal = np.load(calib_path)
+    GA = np.asarray(cal["GA"], dtype=np.float64)
+    flip = np.diag([1.0, -1.0, -1.0])
+    level = flip @ GA @ flip          # camera A's frame -> the merged take's
+    if "turns" in cal.files:
+        turns = np.asarray(cal["turns"], dtype=np.float64)
+        starts = [int(s) for s in cal["starts"]]
+        shifts = np.asarray(cal["sync_shifts"], dtype=np.float64)
+        arms = {"right": np.asarray(cal["arm_right"], dtype=np.float64),
+                "left": np.asarray(cal["arm_left"], dtype=np.float64)}
+    else:
+        # merged before more than two cameras could be: camera B's
+        # values under their own names
+        o = int(cal["sync_offset"])   # frames camera A leads camera B by
+        turns = np.stack([np.eye(3), np.asarray(cal["R"], dtype=np.float64)])
+        starts = [max(o, 0), max(-o, 0)]
+        shifts = np.zeros((2, n_frames))
+        if "sync_shift" in cal.files and len(cal["sync_shift"]) == n_frames:
+            shifts[1] = np.asarray(cal["sync_shift"], dtype=np.float64)
+        arms = None
+        if "arm_w_right" in cal.files:
+            arms = {s: np.stack([np.zeros(len(cal[k])), np.asarray(
+                cal[k], dtype=np.float64)])
+                for s, k in (("right", "arm_w_right"),
+                             ("left", "arm_w_left"))}
+    # how far the merge trusted each camera for each arm, frame by
+    # frame (takes merged before this was recorded: every camera
+    # counts alike)
+    if arms is not None and arms["right"].shape[1] != n_frames:
+        arms = None
+    views = "abcd"[:len(turns)]
+    cameras = []
+    for k, view in enumerate(views):
+        sub = os.path.join((cam_dirs or {}).get(view)
+                           or os.path.join(folder, f"cam_{view}"),
+                           "mhr_frames.npz")
+        if not os.path.isfile(sub):
+            return None, f"camera {view.upper()}'s capture was not found"
+        z = np.load(sub)
+        if "keypoints_2d" not in z.files:
+            return None, f"camera {view.upper()}'s capture has no 2D keypoints"
+        cut = slice(starts[k], None)
+        arrs = [z[key][cut][:n_frames].astype(np.float64)
+                for key in ("global_rots", "joint_coords", "cam_t")]
+        kp2d = z["keypoints_2d"][cut][:n_frames]
+        if any(len(a) != n_frames for a in arrs) or len(kp2d) != n_frames:
+            return None, (f"camera {view.upper()}'s capture does not cover "
+                          f"the merged take's frames")
+        (g, jc, ct), _n_bad = _repair_nonfinite_frames(
+            arrs, f"camera {view.upper()} tracking data")
+        if k > 0 and shifts.shape[1] == n_frames and np.any(shifts[k]):
+            # the merge read this camera between its own frames (fine
+            # sync); its keypoints have to be read at the same moments
+            from .two_camera_merge import resample_frames
+            t_k = np.arange(n_frames) - shifts[k]
+            g = resample_frames(g, t_k, "rotation")
+            jc, ct = resample_frames(jc, t_k), resample_frames(ct, t_k)
+            kp2d = resample_frames(kp2d.astype(np.float64), t_k)
+        share = None
+        if arms is not None:
+            # camera A has what the others leave
+            share = {s: (w[k] if k > 0 else 1.0 - w[1:].sum(axis=0))
+                     for s, w in arms.items()}
+        cameras.append({"label": view.upper(), "global_rots": g,
+                        "keypoints_2d": kp2d, "joint_coords": jc,
+                        "cam_t": ct,
+                        "to_merged": (level if k == 0
+                                      else level @ flip @ turns[k] @ flip),
+                        "share": share})
+    return cameras, None
+
+
 def _solve_hands_stage(args, export_mode, npz, parents, offsets_cm,
                        prerot_quats, global_rots):
     """Optional 2D-keypoint hand refinement (--hand-solver on).
@@ -188,7 +273,12 @@ def _solve_hands_stage(args, export_mode, npz, parents, offsets_cm,
     correction — because the 2D keypoints live there. Mutates
     global_rots finger joints in place. Returns True when any frame
     was solved (the finger boost is skipped then: solved chains are
-    absolute fits, amplifying them would break the poses)."""
+    absolute fits, amplifying them would break the poses).
+
+    A take merged from several cameras is fitted in EACH camera's picture
+    and the fits are merged (hand_solver.solve_hands_merged): the
+    merged take's own keypoints are camera A's alone, and its frame is
+    no longer the one any picture was taken in."""
     if getattr(args, "hand_solver", "off") != "on":
         return False
     if export_mode == "template" or npz is None:
@@ -216,6 +306,21 @@ def _solve_hands_stage(args, export_mode, npz, parents, offsets_cm,
     def _hand_progress(done, total, detail):
         pct = 12 + int(round(max(0.0, min(1.0, done / max(total, 1))) * 18))
         _progress(pct, f"Rebuilding finger motion - {detail}")
+
+    if "gravity_aligned" in getattr(npz, "files", ()):
+        cameras, why = merged_take_cameras(
+            os.path.dirname(os.path.abspath(args.input)),
+            global_rots.shape[0])
+        if cameras is not None:
+            print("       Hand solver: multi-camera take, fitting each "
+                  "camera's picture and merging")
+            from .hand_solver import solve_hands_merged
+            summary = solve_hands_merged(global_rots, cameras, parents,
+                                         offsets_cm, R0t,
+                                         progress_cb=_hand_progress)
+            return bool(summary.get("any_solved"))
+        print(f"       Hand solver: multi-camera take, but {why}; using "
+              f"the keypoints kept with the merged take (camera A's)")
 
     summary = solve_hands(global_rots, kp2d, parents, offsets_cm, R0t,
                           progress_cb=_hand_progress)
@@ -250,7 +355,11 @@ def _detrend_camera_pitch(cam_t, npz=None):
 
     Returns a status line for the caller to print.
     """
-    if npz is not None and "gravity_aligned" in getattr(npz, "files", ()):
+    # A merged take the merge could level. (One it could not, a take
+    # with no floor to measure, carries 0 and is in camera A's frame:
+    # the same case as a single camera.)
+    if npz is not None and "gravity_aligned" in getattr(npz, "files", ()) \
+            and int(npz["gravity_aligned"]):
         return ("Camera pitch detrend: skipped (input is already "
                 "gravity-aligned)")
     if cam_t.shape[0] < 2 or float(cam_t[:, 2].var()) <= 1e-6:
@@ -267,6 +376,41 @@ def _detrend_camera_pitch(cam_t, npz=None):
     cam_t[:, 1] = cam_t[:, 1] - slope * cam_t[:, 2]
     return (f"Camera pitch detrend: removed {slope:+.4f} * cam_t.z from "
             f"cam_t.y ({pitch:.1f} deg of depth-induced Y bleed)")
+
+
+def _hold_cropped_limbs_stage(args, export_mode, npz, parents,
+                              prerot_quats, global_rots, fps):
+    """Optional --hold-cropped-limbs (see pipeline/cropped_limbs.py).
+
+    Runs AFTER the hand solver (whose finger fits are overwritten on
+    frames where that hand is held) and BEFORE the camera offset (the
+    hold works in parent-relative space, which the offset leaves
+    alone). Returns (global_rots, report or None); the report carries
+    valid_feet, feet_never_seen and hips_held for the later stages."""
+    if not getattr(args, 'hold_cropped_limbs', False):
+        return global_rots, None
+    if export_mode == "template" or npz is None:
+        return global_rots, None
+    if "keypoints_2d" not in npz.files or "frame_size" not in npz.files:
+        print("[WARNING] Hold Cropped Limbs skipped - this capture predates "
+              "the feature (no picture size in the tracking data). Run the "
+              "capture again to use it.")
+        return global_rots, None
+    kp2d = npz["keypoints_2d"]
+    if kp2d.shape[0] != global_rots.shape[0]:
+        print("[WARNING] Hold Cropped Limbs skipped - keypoint frame mismatch")
+        return global_rots, None
+    _progress(13, "Holding cropped limbs")
+    from .cropped_limbs import hold_cropped_limbs
+    global_rots, rep = hold_cropped_limbs(global_rots, kp2d, npz["frame_size"],
+                                          parents, prerot_quats, fps)
+    for line in rep["lines"]:
+        print(line)
+    if rep["feet_never_seen"]:
+        print("       Hold Cropped Limbs: the feet are never in the picture; "
+              "foot locking and grounding have nothing to work with and "
+              "stand down; the body keeps a fixed standing height")
+    return global_rots, rep
 
 
 def _load_cam_t(npz, args, export_mode):
@@ -508,11 +652,11 @@ def _anchor_face_to_body(face_data, face_calibration, args, parents,
             target_n = max(n_frames, face_n)
             if face_n < n_frames:
                 print(f"WARNING: Body has {n_frames} frames, face has "
-                      f"{face_n} frames — holding last face frame for "
+                      f"{face_n} frames - holding last face frame for "
                       f"the trailing {n_frames - face_n}.")
             else:
                 print(f"WARNING: Body has {n_frames} frames, face has "
-                      f"{face_n} frames — the body's processed last "
+                      f"{face_n} frames - the body's processed last "
                       f"frame will be held for the trailing "
                       f"{face_n - n_frames}.")
             # Pad face to target by repeating its last frame. Empty-
@@ -536,10 +680,18 @@ def _anchor_face_to_body(face_data, face_calibration, args, parents,
     return face_bone_data, target_n
 
 
-def _build_translation(args, cam_t, n_frames, fps):
+def _build_translation(args, cam_t, n_frames, fps, depth_measured=False):
     """Per-frame translation vector (Y-up, centered, smoothed). Split
     into Root / Hips later: Root takes X/Z locomotion; Hips takes
     vertical body motion (squat / jump / gait bob).
+
+    depth_measured: the take has no depth axis to distrust (a multi-
+    camera merge: what was camera A's depth is measured sideways-on by
+    another camera, and the merged root sits within a centimetre or
+    two of the triangulated one on every axis). Root Smoothing then
+    applies as the number on the slider to both floor axes, without
+    the doubling a single camera's depth gets. With the doubling, the
+    default moved a merged root up to 26 cm on that axis.
 
     Returns (translation, translation_raw): the smoothed series the
     pipeline renders from, and the pre-smoothing series kept as
@@ -570,7 +722,8 @@ def _build_translation(args, cam_t, n_frames, fps):
         sigma = seconds_to_sigma_frames(args.smooth_root, fps)
         print(f"       Root smoothing: Gaussian sigma={sigma:.1f} frames "
               f"({args.smooth_root:.2f} s at {fps:.1f} fps, X/Z only, "
-              f"depth Z 2x)")
+              + ("depth not doubled: multi-camera take)"
+                 if depth_measured else "depth Z 2x)"))
         # Y (axis 1) is deliberately NOT smoothed here: a jump lives
         # almost entirely in cam_t.Y for only ~12-18 airborne frames, so
         # this Gaussian flattens the arc — and the flattened remainder
@@ -578,7 +731,9 @@ def _build_translation(args, cam_t, n_frames, fps):
         # it to the floor (net: jumps frozen at standing height). This
         # slider's job is locomotion/depth noise; vertical noise gets its
         # own much smaller sigma below (--smooth-vertical).
-        translation = smooth_positions(translation, sigma, skip_axes=(1,))
+        translation = smooth_positions(
+            translation, sigma, skip_axes=(1,),
+            depth_axis=None if depth_measured else 2)
 
     if args.smooth_vertical > 0:
         vsigma = seconds_to_sigma_frames(args.smooth_vertical, fps)
@@ -589,7 +744,7 @@ def _build_translation(args, cam_t, n_frames, fps):
 
 
 def _solve_vertical_motion(args, export_mode, joint_coords, translation,
-                           rest_pos, floor_override_y=None):
+                           rest_pos, floor_override_y=None, valid_feet=None):
     """Vertical body motion + animation grounding solve.
 
     floor_override_y: optional floor reference in the same coordinate
@@ -626,6 +781,13 @@ def _solve_vertical_motion(args, export_mode, joint_coords, translation,
     render use the same series, so grounding is exact (no
     walk-cycle hover from the old metric/render mismatch).
 
+    valid_feet: optional (n_frames, 2) bool (L, R) from Hold Cropped
+    Limbs. A foot that was not in the picture is the model's GUESS, and
+    the held legs that ship are a different (standing) shape, so a
+    guessed foot must not set the floor: only frames where the foot was
+    filmed vote. With no filmed foot at all the shift is 0 and run_body
+    puts the hips at the rest pose's standing height instead.
+
     Returns (body_y, hips_offset_y, animation_shift_y)."""
     jc_hips_y_yup = -joint_coords[:, 1, 1]
     if not args.no_center:
@@ -639,6 +801,15 @@ def _solve_vertical_motion(args, export_mode, joint_coords, translation,
     if export_mode != "template":
         jc_feet_y_yup = -joint_coords[:, FOOT_SAM_INDICES, 1]
         render_world_feet = translation[:, 1, None] + jc_feet_y_yup
+        if valid_feet is not None:
+            # FOOT_SAM_INDICES = LeftFoot, LeftToe, RightFoot, RightToe
+            vf = np.asarray(valid_feet, dtype=bool)
+            seen = vf[:, [0, 0, 1, 1]]
+            if not seen.any():
+                print("       Animation grounding: no foot was ever in the "
+                      "picture; hips sit at the rest pose's standing height")
+                return body_y, hips_offset_y, 0.0
+            render_world_feet = np.where(seen, render_world_feet, np.inf)
         min_feet = float(render_world_feet.min())
         if floor_override_y is not None:
             # Feet Define the Floor: ground the rebuilt series' plant
@@ -693,6 +864,8 @@ def run_body(args, export_mode, face_data, face_calibration):
 
     Returns a dict with summary fields the entry point needs:
       cam_t_present  bool — whether vertical/locomotion data was found
+      depth_measured bool — a multi-camera take: Root Smoothing was not
+                     doubled on the depth axis (see _build_translation)
       face_bone_data dict|None — set in 'both' mode; used for the face-bone count
     """
     if not os.path.isfile(args.mhr_model):
@@ -723,11 +896,63 @@ def run_body(args, export_mode, face_data, face_calibration):
                                          offsets_cm, prerot_quats,
                                          global_rots)
 
+    # A person of a Multi-Camera & Multi-Person take is drawn at their
+    # own size: the take's cameras, placed once for everybody, give how
+    # far each really is from the body against how far it took the body
+    # to be, which is the person's size against the body model's
+    # (pipeline/people_place.py; the merge has already built the joint
+    # positions at that size). After Rebuild Finger Motion on purpose:
+    # that goes back to the cameras' own captures, which hold the body
+    # at the model's size. The only other capture that carries the
+    # number is a person of a one-camera multi-person capture whose
+    # height the user typed (people_tracks.typed_size): their joint
+    # positions are at that size already too.
+    if npz is not None and "body_scale" in getattr(npz, "files", ()):
+        body_size = float(npz["body_scale"])
+        if abs(body_size - 1.0) > 1e-6:
+            offsets_cm = offsets_cm * body_size
+            print(f"Body size: {body_size:.3f} of the body model's")
+
+    global_rots, crop = _hold_cropped_limbs_stage(
+        args, export_mode, npz, parents, prerot_quats, global_rots, fps)
+    valid_feet = crop["valid_feet"] if crop else None
+    feet_never_seen = bool(crop and crop["feet_never_seen"])
+    hips_held = crop["hips_held"] if crop else None
+    if hips_held is not None and not hips_held.any():
+        hips_held = None
+
     cam_t = _load_cam_t(npz, args, export_mode)
 
     R0_pre_correction, global_rots, joint_coords, cam_t = \
         _apply_camera_offset(args, export_mode, global_rots,
                              joint_coords, cam_t)
+
+    # Hold Cropped Limbs, the pelvis: while the hips were out of the
+    # picture, keep them upright and let them follow the chest's facing
+    # (see cropped_limbs.steady_hips). After the camera offset on
+    # purpose: "upright" has to be measured in the levelled frame.
+    if crop is not None and export_mode != "template":
+        from .cropped_limbs import (steady_hips, upright_held_legs,
+                                    J_SPINE_CHAIN)
+        _g0_before = global_rots[0].copy()
+        if hips_held is not None:
+            global_rots = steady_hips(global_rots, hips_held, parents,
+                                      prerot_quats, offsets_cm, fps)
+        # Held legs stay vertical under a tracked pelvis that tilts
+        # (hips in the picture, legs cropped); a no-op where the pelvis
+        # is upright, which covers everything steady_hips handled.
+        global_rots = upright_held_legs(global_rots, crop["held"], parents,
+                                        prerot_quats, offsets_cm)
+        if R0_pre_correction is not None:
+            # frame0 rest pose (command line only; the addon always
+            # exports with the T-pose rest): keep the rest equal to the
+            # PROCESSED frame 0, still in the raw pre-offset orientation
+            # the rest-pose invariant asks for. The camera offset is one
+            # rotation on every joint, recovered from the chest, which
+            # steady_hips leaves alone.
+            _chest = J_SPINE_CHAIN[-1]
+            _r_cam = _g0_before[_chest] @ R0_pre_correction[_chest].T
+            R0_pre_correction = _r_cam.T[None] @ global_rots[0]
 
     # Head-angle offset is built here (cheap) but applied AFTER
     # prune_skeleton — see "Head-bone angle offset" comment near the
@@ -779,8 +1004,35 @@ def run_body(args, export_mode, face_data, face_calibration):
         f0_err = np.max(np.abs(local_rots[0] - np.eye(3)))
         print(f"       Frame 0 identity error: {f0_err:.6f} (should be ~0)")
 
-    translation, translation_raw = _build_translation(args, cam_t,
-                                                      n_frames, fps)
+    translation, translation_raw = _build_translation(
+        args, cam_t, n_frames, fps,
+        depth_measured="gravity_aligned" in getattr(npz, "files", ()))
+    if feet_never_seen and export_mode != "template":
+        # No foot was ever filmed: the vertical body channel would come
+        # from the model's guessed legs. Hold the hips at one height
+        # (X/Z locomotion from the torso is kept).
+        translation[:, 1] = translation[0, 1]
+        translation_raw[:, 1] = translation_raw[0, 1]
+    if hips_held is not None and export_mode != "template":
+        # The pelvis was not filmed: its travel, height and depth are
+        # all the model's guess. Hold the body where it was.
+        from .cropped_limbs import hold_series
+        translation = hold_series(translation, hips_held)
+        translation_raw = hold_series(translation_raw, hips_held)
+    # How far Root Smoothing moved the body on frame 0 (X/Z; zero with
+    # the slider at 0, or with root motion off, when the root does not
+    # travel at all). The camera record below is pinned on frame 0, and
+    # it has to be pinned on where the capture SAW the body there: a
+    # smoothed frame 0 is the average of the frames after it, which is
+    # somewhere the body never was if it is already moving. Pinned on
+    # that, the whole take sat that far from the camera (Add Camera),
+    # and two people of one capture, each moved their own way, came out
+    # further apart or closer than they were (Keep Captured Position:
+    # 12 and 10 cm on the take of 2026-11-24, "when I disable smoothing,
+    # the characters are spaced correctly").
+    pin_shift = np.zeros(3)
+    if args.root_motion and export_mode != "template":
+        pin_shift[[0, 2]] = (translation[0] - translation_raw[0])[[0, 2]]
 
     # Robust floor (--robust-floor / "Recover Floor Level"): estimate
     # the floor from stance frames instead of the take's single lowest
@@ -797,18 +1049,23 @@ def run_body(args, export_mode, face_data, face_calibration):
     # vertical translation (which can't tell a jump from camera motion).
     # Supersedes Pass 1's per-stance corrections — plants sit exactly
     # at level 0 by construction, so there is nothing left for Pass 1
-    # to pull.
+    # to pull. A multi-camera take's height is measured, so its flights
+    # and held blinks keep it (measured_vertical).
     use_fdf = foot_lock_on and bool(getattr(args, 'feet_define_floor',
                                             False))
     fdf_vertical = None
     fdf_planted = None
+    fdf_details = {}
     if use_fdf:
         fdf_result = compute_feet_defined_vertical(
             joint_coords, translation, fps,
             sensitivity=getattr(args, 'foot_sensitivity', 0.5),
-            translation_raw=translation_raw)
+            translation_raw=translation_raw, valid_feet=valid_feet,
+            measured_vertical=("gravity_aligned" in npz.files
+                               and cam_t is not None),
+            details=fdf_details)
         if fdf_result is None:
-            print("       Feet-defined floor: no plants detected — "
+            print("       Feet-defined floor: no plants detected - "
                   "falling back to classic vertical")
             use_fdf = False
         else:
@@ -826,7 +1083,7 @@ def run_body(args, export_mode, face_data, face_calibration):
     else:
         vert_translation = translation
         if "floor_y" in npz.files and cam_t is not None:
-            # A measured floor level (two-camera merge writes one) beats
+            # A measured floor level (the multi-camera merge writes one) beats
             # the classic lowest-frame rule, which lets a single
             # downward foot glitch define the floor and float the whole
             # take. Convert from NPZ world Y-down to the grounding
@@ -836,11 +1093,11 @@ def run_body(args, export_mode, face_data, face_calibration):
             if not args.no_center:
                 floor_override_y += float(cam_t[0, 1])
             print(f"       Floor: using measured level from NPZ "
-                  f"(two-camera), not lowest frame")
+                  f"(multi-camera), not lowest frame")
 
     body_y, hips_offset_y, animation_shift_y = _solve_vertical_motion(
         args, export_mode, joint_coords, vert_translation, rest_pos,
-        floor_override_y=floor_override_y)
+        floor_override_y=floor_override_y, valid_feet=valid_feet)
 
     # Split: Root takes X/Z (gated by --root-motion), Hips takes Y
     # always. With --root-motion off, Root sits at (0, 0, 0) every
@@ -869,12 +1126,46 @@ def run_body(args, export_mode, face_data, face_calibration):
         _progress(35, "Foot grounding (Pass 1)")
         per_stance_correction = compute_per_stance_correction(
             joint_coords, translation, fps,
-            sensitivity=getattr(args, 'foot_sensitivity', 0.5))
+            sensitivity=getattr(args, 'foot_sensitivity', 0.5),
+            valid_feet=valid_feet)
         body_y = body_y + per_stance_correction
+
+    if hips_held is not None and export_mode != "template":
+        # The other half of the hips' height (the pelvis' own position
+        # inside the model's body frame) is held too.
+        from .cropped_limbs import hold_series
+        body_y = hold_series(body_y, hips_held)
 
     root_pos = np.zeros((n_frames, 3), dtype=np.float64)
     hips_pos = np.zeros((n_frames, 3), dtype=np.float64)
     hips_pos[:, 1] = hips_offset_y + body_y + animation_shift_y
+    if valid_feet is not None and export_mode != "template":
+        # Hold Cropped Limbs: while BOTH legs are held they are the rest
+        # pose's standing legs, so the hips belong at the rest pose's
+        # standing height - there the held feet sit exactly on the floor.
+        # The height the pipeline worked out above was measured on the
+        # model's guessed legs (usually bent or shorter than a straight
+        # leg), which is what sank the whole body and pushed the held
+        # feet under the ground plane. A visible crouch is not shown
+        # while the legs are out of the picture: what was not filmed
+        # stays still.
+        _both_held = ~np.asarray(valid_feet, dtype=bool).any(axis=1)
+        if _both_held.any():
+            from .cropped_limbs import mask_weights, feet_height_below_hips
+            _w = mask_weights(_both_held)
+            # Per frame, from the skeleton as it will render: the hips
+            # go where the LOWEST held foot touches the floor. Under an
+            # upright pelvis this is exactly the rest pose's standing
+            # height; under a tracked pelvis that rolls, one hip socket
+            # drops and the body rises by that much instead of pushing
+            # a foot through the floor.
+            _stand_y = FLOOR_CLEARANCE_M - feet_height_below_hips(
+                global_rots, R0, bvh_offsets, parents, FOOT_SAM_INDICES)
+            _stand_y = np.where(np.isfinite(_stand_y), _stand_y,
+                                hips_offset_y)
+            hips_pos[:, 1] = (1.0 - _w) * hips_pos[:, 1] + _w * _stand_y
+            print(f"       Hold Cropped Limbs: hips at standing height on "
+                  f"{int(_both_held.sum())}/{n_frames} frames (both legs held)")
     if args.root_motion:
         root_pos[:, 0] = translation[:, 0]   # X locomotion
         root_pos[:, 2] = translation[:, 2]   # Z locomotion
@@ -935,12 +1226,30 @@ def run_body(args, export_mode, face_data, face_calibration):
               f"roll={head_roll_deg_for_bake:+.2f}deg")
         local_rots = apply_head_local(local_rots, R_head_for_bake, names)
 
+    # Rotation smoothing. Head+Neck are CARVED OUT of the body pass and
+    # owned by --smooth-head, so head smoothing tunes independently.
+    # The savgol runs per joint with no cross-joint coupling, so at
+    # equal window values the split is numerically identical to the
+    # old single pass over all joints.
+    smooth_head_s = float(getattr(args, 'smooth_head', 0.0) or 0.0)
+    _head_neck_idx = [i for i, n in enumerate(names)
+                     if n in ("Neck", "Head")]
     if args.smooth > 0:
         _progress(42, "Smoothing rotations")
         window = seconds_to_savgol_window(args.smooth, fps)
         print(f"       Rotation smoothing: Savitzky-Golay window={window} frames "
-              f"({args.smooth:.2f} s at {fps:.1f} fps)")
-        local_rots = smooth_rotations(local_rots, window)
+              f"({args.smooth:.2f} s at {fps:.1f} fps; Head+Neck excluded)")
+        _body_idx = [i for i in range(len(names))
+                     if i not in _head_neck_idx]
+        local_rots[:, _body_idx] = smooth_rotations(
+            local_rots[:, _body_idx], window)
+    if smooth_head_s > 0 and _head_neck_idx:
+        hwindow = seconds_to_savgol_window(smooth_head_s, fps)
+        print(f"       Head rotation smoothing: Savitzky-Golay "
+              f"window={hwindow} frames ({smooth_head_s:.2f} s at "
+              f"{fps:.1f} fps; Head+Neck)")
+        local_rots[:, _head_neck_idx] = smooth_rotations(
+            local_rots[:, _head_neck_idx], hwindow)
 
     # Depth-velocity dead-zone on tip world positions (feet, hands,
     # head) and on root translation Z. Mirrors the face Noise Filtering
@@ -1020,6 +1329,19 @@ def run_body(args, export_mode, face_data, face_calibration):
             # and clamp for safety (a genuine correction is cm-scale).
             from scipy.ndimage import (gaussian_filter1d as _gauss1d,
                                        median_filter as _med_filt)
+            # A gap that kept the take's MEASURED height (multi-
+            # camera: a flight, or a squat the detector lost the feet
+            # in) gets the take's typical correction, not one
+            # interpolated from the plants beside it: those are the
+            # takeoff crouch and the landing, the fastest leg changes
+            # in the take and so where smoothing moves the rendered
+            # feet most, and their corrections shifted the whole
+            # flight (6 cm on a 44 cm jump).
+            typical = float(np.median(delta[~np.isnan(delta)]))
+            blend = int(fdf_details.get("measured_blend_frames", 2))
+            for g0, g1 in fdf_details.get("measured_gaps", ()):
+                if g1 - g0 + 1 > 2 * blend:
+                    delta[g0 + blend:g1 + 1 - blend] = typical
             pl_idx = np.flatnonzero(~np.isnan(delta))
             delta = np.interp(np.arange(n_frames), pl_idx, delta[pl_idx])
             med_w = max(3, int(round(0.2 * fps)) | 1)
@@ -1063,7 +1385,7 @@ def run_body(args, export_mode, face_data, face_calibration):
                 if args.root_motion else None),
             robust_floor=use_fdf,
             local_height_base=use_fdf,
-            progress_range=(55, 90))
+            progress_range=(55, 90), valid_feet=valid_feet)
 
     # Body grounding (--body-grounding): the LAST grounding pass, run
     # on the FINAL FK-rendered skeleton — after rotation smoothing,
@@ -1124,6 +1446,31 @@ def run_body(args, export_mode, face_data, face_calibration):
             back_radius=skin_r, resting_w=resting_w,
             floor_y=0.0 if floor_override_y is not None else None)
 
+    # Hold Cropped Limbs, final seating. The hips were put at standing
+    # height when the vertical channel was assembled, but the stages
+    # since then (plant re-levelling between real stances, smoothing,
+    # body grounding) are interpolated across the held frames and move
+    # them again by a few cm. So, last of all the automatic passes and
+    # on the skeleton exactly as it ships: on frames where BOTH legs
+    # are held, the hips go where the lowest held foot touches the
+    # floor. Frames with a filmed foot are not touched.
+    if valid_feet is not None and export_mode != "template":
+        _both_held = ~np.asarray(valid_feet, dtype=bool).any(axis=1)
+        _foot_idx = [names.index(nm) for nm in
+                     ("LeftFoot", "LeftToe", "RightFoot", "RightToe")
+                     if nm in names]
+        if _both_held.any() and _foot_idx and len(_both_held) == n_frames:
+            from .cropped_limbs import mask_weights
+            from .footskate_cleanup import (_fk_world_positions_bvh,
+                                            _local_to_global_bvh)
+            _w = mask_weights(_both_held)
+            for f in np.where(_w > 0)[0]:
+                g = _local_to_global_bvh(parents, local_rots[f])
+                wpos = _fk_world_positions_bvh(parents, bvh_offsets, g,
+                                               hips_pos[f])
+                low = float(wpos[_foot_idx, 1].min())
+                hips_pos[f, 1] += _w[f] * (FLOOR_CLEARANCE_M - low)
+
     # Manual floor-level correction (--height-offset): a constant Y on
     # the Hips channel, applied AFTER Pass 1/Pass 2 grounding so the
     # pinned plants shift with the body instead of being re-pinned to
@@ -1135,6 +1482,27 @@ def run_body(args, export_mode, face_data, face_calibration):
     if export_mode != "template" and abs(height_offset) > 1e-9:
         print(f"       Height offset: {height_offset:+.3f} m")
         hips_pos[:, 1] += height_offset
+
+    # Head noise filtering: WORLD-SPACE head stabilization (nod/turn/
+    # tilt dead-zones in degrees). The wobble is smeared across the
+    # whole chain, so the gate works on the head's world orientation
+    # and counter-rotates the Head bone — the only joint it writes.
+    # MUST RUN LAST among chain-modifying stages: depth denoise, FDF,
+    # footskate, and body grounding all rotate/translate joints under
+    # the head, and each re-creates world-space head wobble — running
+    # the gate right after smoothing measurably did almost nothing on
+    # the reference clip once the rest of the pipeline had run
+    # (RMS 0.90 vs 0.43 when gated last). Only the synthetic Root
+    # insert and tail padding follow this point; neither rotates the
+    # chain. See pipeline/head_rotation_denoise.
+    _hd_nod = float(getattr(args, 'head_denoise_nod', 0.0) or 0.0)
+    _hd_turn = float(getattr(args, 'head_denoise_turn', 0.0) or 0.0)
+    _hd_tilt = float(getattr(args, 'head_denoise_tilt', 0.0) or 0.0)
+    if export_mode != "template" and (_hd_nod > 0.0 or _hd_turn > 0.0
+                                       or _hd_tilt > 0.0):
+        _progress(91, "Head noise filtering")
+        apply_head_rotation_denoise(local_rots, names, parents, fps,
+                                    _hd_nod, _hd_turn, _hd_tilt)
 
     # Insert synthetic Root (floor projection, X/Z locomotion) and
     # RootEnd (horizontal-forward stub for clean Blender bone-tail
@@ -1165,6 +1533,23 @@ def run_body(args, export_mode, face_data, face_calibration):
             np.broadcast_to(root_pos[-1], (pad_n, 3)),
         ], axis=0)
 
+    # Add Camera: the real camera's place in this BVH's world, anchored
+    # on the hips as they ship on frame 0 (after every pass above), less
+    # what Root Smoothing moved them there (pin_shift, above). See
+    # pipeline/capture_camera.py.
+    if (getattr(args, 'camera_sidecar', '') and export_mode != "template"
+            and npz is not None):
+        from .capture_camera import write_camera_sidecar
+        write_camera_sidecar(
+            args.camera_sidecar, npz, args.input,
+            hips_world0=root_pos[0] + hips_pos[0] - pin_shift,
+            root_world0=root_pos[0],
+            R_level=resolve_camera_level(
+                pitch_deg=getattr(args, 'camera_pitch', 0.0),
+                roll_deg=-getattr(args, 'camera_roll', 0.0)),
+            view=getattr(args, 'camera_view', 'a'),
+            n_frames=int(local_rots.shape[0]))
+
     _progress(92, "Writing BVH file")
     hips_idx = names.index("Hips")
     write_bvh(args.output, parents, bvh_offsets, names,
@@ -1178,6 +1563,7 @@ def run_body(args, export_mode, face_data, face_calibration):
 
     return {
         "cam_t_present": cam_t is not None,
+        "depth_measured": "gravity_aligned" in getattr(npz, "files", ()),
         "face_bone_data": face_bone_data,
     }
 
@@ -1363,8 +1749,11 @@ def run_root(args):
               f"({args.smooth_root:.2f} s at {fps:.1f} fps, X/Z only)")
         # Same Y exclusion as the body path (_build_translation): in this
         # root-only export ALL vertical motion lives in this one vector,
-        # so smoothing Y would flatten jump arcs here too.
-        root_pos = smooth_positions(root_pos, sigma, skip_axes=(1,))
+        # so smoothing Y would flatten jump arcs here too. And the same
+        # depth rule: no doubling on a multi-camera take.
+        root_pos = smooth_positions(
+            root_pos, sigma, skip_axes=(1,),
+            depth_axis=None if "gravity_aligned" in npz.files else 2)
 
     if args.smooth_vertical > 0:
         vsigma = seconds_to_sigma_frames(args.smooth_vertical, fps)

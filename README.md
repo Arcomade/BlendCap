@@ -45,6 +45,8 @@ BlendCap reconstructs a full **performance**, body, hands, and face, from an ord
 ## Features
 
 - **Single-camera, markerless capture**: full body **and** hands from one ordinary clip.
+- **Multi-camera capture**: combine up to 4 different angles of the same take into one capture, for better depth and fewer hidden limbs.
+- **Multi-person capture**: capture multiple performers from one clip, each on their own armature, on its own or combined with multi-camera capture.
 - **Finger tracking**: both general hand shape tracking and full finger pose tracking, with dedicated controls to tune finger curl or rebuild the finger motion from the tracked keypoints.
 - **Facial performance capture**: drives ARKit-style shape keys and face bones, captured from the same clip or its own.
 - **Retarget onto your rig**: Rigify, Auto-Rig Pro, CloudRig, Mixamo and custom rigs, in both **FK and IK**, with included presets and a visual bone-map editor.
@@ -69,16 +71,28 @@ BlendCap reconstructs a full **performance**, body, hands, and face, from an ord
 | <img src="assets/sh-12-hands.webp" width="380"> | <img src="assets/18_00090262.webp" width="380"> |
 |            Full finger pose tracking            |     Separate body and face clips, combined      |
 
+<table>
+  <tr><th colspan="2" align="center">Multi-camera &amp; multi-person capture</th></tr>
+  <tr>
+    <td align="center"><img src="assets/sh-19-fight-footage.webp" width="380"></td>
+    <td align="center"><img src="assets/sh-20-fight-render.webp" width="380"></td>
+  </tr>
+  <tr>
+    <td align="center">Four cameras, two performers tracked</td>
+    <td align="center">The same take, on two characters</td>
+  </tr>
+</table>
+
 > **Watch the feature demo:** [YouTube](https://www.youtube.com/watch?v=hOW8U1goY8g)
 
 ## Requirements
 
-| | |
-|---|---|
-| **Blender** | 4.2 or newer |
-| **OS** | Windows 10/11 (fully supported) · Linux, including Flatpak Blender (supported) · macOS (not supported) |
-| **GPU** | NVIDIA RTX 20 / GTX 16 series or newer, 6 GB+ VRAM recommended. AMD/Intel paths install automatically but aren't hardware-validated yet; CPU-only fallback available (slow). |
-| **Disk / network** | ~32 GB free for models + dependencies; internet needed once for the ~11 GB setup download. Capture itself runs offline. |
+|                    |                                                                                                                                                                                                                                                                                             |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Blender**        | 4.2 or newer                                                                                                                                                                                                                                                                                |
+| **OS**             | Windows 10/11 (fully supported) · Linux, including Flatpak Blender (supported) · macOS (not yet supported)                                                                                                                                                                                  |
+| **GPU**            | NVIDIA RTX 20 / GTX 16 series or newer, 6 GB+ VRAM recommended. AMD/Intel paths install automatically but aren't hardware-validated yet, recommended minimum an AMD RX 6000 series card or newer, or a discrete Intel Arc card, no integrated graphics; CPU-only fallback available (slow). |
+| **Disk / network** | ~32 GB free for models + dependencies; internet needed once for the ~11 GB setup download. Capture itself runs offline.                                                                                                                                                                     |
 
 See the full [system requirements](#documentation) in the documentation for the GPU tiers and the CPU-only fallback.
 
@@ -123,9 +137,9 @@ Where it lives in the source: capture runs in [`save_mhr_data.py`](save_mhr_data
 Directions actively being worked toward, not dated promises, priorities shift with feedback:
 
 **Planned**
+- **Moving-camera support**: capture footage from a moving camera, using a camera solve you've made with Blender's own tracker.
 - **More rig presets** — ready-made bone maps for other popular rigs.
-- **Smarter auto-match** — better automatic bone matching in the map editor, so custom rigs won't need as much manual input.
-- **Multi-person capture** — track more than one performer in a shot and split them onto separate armatures.
+- **macOS support**: bringing capture to Apple Silicon Macs, which BlendCap doesn't currently run on.
 - **Resumable captures** — pause and continue a long capture, and recover a crashed run instead of starting it over from scratch.
 
 **Exploring**

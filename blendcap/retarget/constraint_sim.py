@@ -73,6 +73,28 @@ _UNSUPPORTED_TYPES = frozenset({
 })
 
 
+def child_of_delta(sub_arm, inverse_matrix, tgt_mw, tgt_mw_inv, owner_space):
+    """Armature-space matrix D with  post_arm = D @ pre_arm  for a bone's
+    Child Of whose target is a bone of the SAME armature (sub_arm = that
+    bone's armature-space pose).
+
+    Blender evaluates the constraint in its owner space:
+      'POSE' (the default for a bone, and what Auto-Rig Pro and the
+        Mixamo control rig use on every IK control and pole): the
+        target is brought into the armature's own space, so the armature
+        OBJECT's placement cancels out.  D = sub_arm @ inverse
+      anything else: world-space evaluation.
+        D = M^-1 @ (M @ sub_arm) @ inverse @ M
+    Measured against Blender 5.3 with the rig at the origin, moved,
+    turned and scaled (2026-11-13). The two are identical when M is the
+    identity, which is why an off-origin FK->IK bake was the only place
+    the old always-world formula showed (support log: IK bake placement).
+    """
+    if owner_space == 'POSE':
+        return sub_arm @ inverse_matrix
+    return tgt_mw_inv @ (tgt_mw @ sub_arm) @ inverse_matrix @ tgt_mw
+
+
 def _scan_supported_constraints(pb, walk_set, eval_pb=None):
     """Scan a target pose-bone for constraints we can simulate in pure
     math. Returns list of metadata dicts in evaluation order.
@@ -96,7 +118,16 @@ def _scan_supported_constraints(pb, walk_set, eval_pb=None):
     robustness (not implemented in this version).
     """
     out = []
+    # Every entry is stamped with the name of the constraint it came from
+    # ('con_name'), so limit_probe can line this list up with the bone's
+    # real constraint stack. Stamped at the top of the next iteration
+    # because the branches below leave through `continue`.
+    _stamp_from, _stamp_name = 0, None
     for con in pb.constraints:
+        if _stamp_name is not None:
+            for _d in out[_stamp_from:]:
+                _d.setdefault('con_name', _stamp_name)
+        _stamp_from, _stamp_name = len(out), con.name
         # Driver-driven influence/mute (Rigify/ARP FK-IK blend switches,
         # Rigify neck_follow / head_follow) are written by the depsgraph
         # to the EVALUATED datablock, NOT the original `con` we iterate
@@ -340,6 +371,7 @@ def _scan_supported_constraints(pb, walk_set, eval_pb=None):
             out.append({
                 'type': 'CHILD_OF',
                 'subtarget': sub,
+                'owner_space': getattr(con, 'owner_space', 'POSE'),
                 'inverse_matrix': con.inverse_matrix.copy(),
                 'influence': infl,
                 'use_location_x': getattr(con, 'use_location_x', True),
@@ -535,6 +567,9 @@ def _scan_supported_constraints(pb, walk_set, eval_pb=None):
                 # D_j = sub_arm @ rest_offset @ owner_rest_inv.
                 'owner_rest_inv': owner_rest.inverted(),
             })
+    if _stamp_name is not None:
+        for _d in out[_stamp_from:]:
+            _d.setdefault('con_name', _stamp_name)
     return out
 
 
@@ -883,9 +918,9 @@ def _apply_constraint_chain(arm_local, cons, tgt_mw, tgt_mw_inv,
                 continue
             # v3 ignores per-component flags (use_location_*/etc.);
             # default settings (all on) are by far the common case.
-            sub_world = tgt_mw @ sub_arm
-            new_arm = (tgt_mw_inv @ sub_world @ con['inverse_matrix']
-                       @ tgt_mw @ out)
+            new_arm = child_of_delta(
+                sub_arm, con['inverse_matrix'], tgt_mw, tgt_mw_inv,
+                con.get('owner_space', 'POSE')) @ out
             if infl >= 1.0:
                 out = new_arm
             else:
@@ -1181,8 +1216,9 @@ def _compensate_basis_for_constraints(desired_arm, cons, parent_arm, rel_rest,
             # rare in practice).
             continue
         else:  # CHILD_OF
-            sub_world = tgt_mw @ sub_arm
-            X = (tgt_mw_inv @ sub_world @ con['inverse_matrix'] @ tgt_mw)
+            X = child_of_delta(
+                sub_arm, con['inverse_matrix'], tgt_mw, tgt_mw_inv,
+                con.get('owner_space', 'POSE'))
             if infl >= 1.0:
                 arm_pre = X.inverted() @ arm_pre
             else:

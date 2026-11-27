@@ -6,12 +6,13 @@ panels last (they reference operator IDs by string, so technically the
 ordering between panels and operators doesn't matter for Blender, but
 keeping operators-first matches Blender addon convention).
 """
+import os
 import bpy
 
 from .properties import (
     BlendCapBVHEntry, BlendCapBonePair, BlendCapIKChain,
     BLENDCAP_UL_bvh, BlendCapProperties, BlendCapCameraOffset,
-    _bvh_library_timer,
+    _bvh_library_resync, _bvh_library_on_load,
 )
 from .operators_retarget import (
     BLENDCAP_UL_retarget_pairs,
@@ -38,6 +39,20 @@ from .operators_rest_pose import (
     BLENDCAP_OT_delete_rest_pose_preset,
     BLENDCAP_OT_preview_rest_pose_preset,
 )
+from .operators_storage import (
+    BLENDCAP_OT_export_presets,
+    BLENDCAP_OT_import_presets,
+    BLENDCAP_OT_move_deps,
+    BLENDCAP_OT_cancel_move_deps,
+    BLENDCAP_OT_move_presets,
+    BLENDCAP_OT_storage_move_all,
+    BLENDCAP_OT_storage_consent,
+    BLENDCAP_OT_storage_consent_watcher,
+    _storage_consent_timer,
+)
+from . import updater as _updater
+from . import rig_conflicts as _rig_conflicts
+from .rig_conflicts import BLENDCAP_OT_retarget_conflicts
 from .properties import update_use_current_pose_as_rest
 from .operators_pipeline import (
     BLENDCAP_LicenseLine,
@@ -46,9 +61,14 @@ from .operators_pipeline import (
     BLENDCAP_OT_install_cancel,
     BLENDCAP_OT_install_run,
     BLENDCAP_OT_install_open_prefs,
+    BLENDCAP_OT_open_docs,
+    BLENDCAP_OT_deps_mark_rebuilt,
+    BLENDCAP_OT_sac_recheck,
     BLENDCAP_OT_copy_grant_cmd,
     BLENDCAP_OT_uninstall_dependencies,
     BLENDCAP_OT_deps_missing,
+    BLENDCAP_OT_bvh_importer_missing,
+    BLENDCAP_OT_enable_bvh_importer,
     BLENDCAP_OT_open_license,
     BLENDCAP_OT_append_workspace,
     BLENDCAP_OT_generate_mocap,
@@ -57,11 +77,17 @@ from .operators_pipeline import (
     BLENDCAP_OT_generate_bvh,
     BLENDCAP_OT_bake_camera_offset,
 )
+from .multicam import (
+    BLENDCAP_OT_multicam_capture,
+    BLENDCAP_OT_multicam_sync,
+    BLENDCAP_OT_multicam_sync_sound,
+    BLENDCAP_OT_multicam_sync_exit,
+    BLENDCAP_OT_multicam_select_clips,
+    BLENDCAP_OT_multicam_clear_clips,
+)
 from .operators_library import (
     BLENDCAP_OT_revert_strip,
     BLENDCAP_OT_show_warnings,
-    BLENDCAP_OT_sequencer_warning,
-    BLENDCAP_OT_vse_default_prompt,
     BLENDCAP_OT_import_lib_bvh,
     BLENDCAP_OT_export_lib_bvh,
     BLENDCAP_OT_export_lib_fbx,
@@ -78,6 +104,8 @@ from .panels import (
     OUTPUT_PT_blendcap_ui,
 )
 from . import retarget
+from . import people_ui as _people_ui
+from .scene_camera import BLENDCAP_OT_add_camera
 
 
 # ============================================================
@@ -168,25 +196,43 @@ classes = (
     BLENDCAP_UL_bvh,
     BLENDCAP_UL_retarget_pairs,
     BLENDCAP_UL_license_text,
+    _people_ui.BlendCapPerson,
+    _people_ui.BLENDCAP_UL_people,
+    _people_ui.BLENDCAP_OT_people_join,
+    _people_ui.BLENDCAP_OT_people_swap,
+    _people_ui.BLENDCAP_OT_people_split,
+    _people_ui.BLENDCAP_OT_people_remove,
+    _people_ui.BLENDCAP_OT_people_reset,
+    _people_ui.BLENDCAP_OT_generate_bvh_all,
+    BLENDCAP_OT_add_camera,
     BlendCapProperties,
     BLENDCAP_OT_install_dependencies,
     BLENDCAP_OT_install_cancel,
     BLENDCAP_OT_install_run,
     BLENDCAP_OT_install_open_prefs,
+    BLENDCAP_OT_open_docs,
+    BLENDCAP_OT_deps_mark_rebuilt,
+    BLENDCAP_OT_sac_recheck,
     BLENDCAP_OT_copy_grant_cmd,
     BLENDCAP_OT_uninstall_dependencies,
     BLENDCAP_OT_deps_missing,
+    BLENDCAP_OT_bvh_importer_missing,
+    BLENDCAP_OT_enable_bvh_importer,
     BLENDCAP_OT_open_license,
     BLENDCAP_OT_append_workspace,
     BLENDCAP_OT_generate_mocap,
+    BLENDCAP_OT_multicam_capture,
+    BLENDCAP_OT_multicam_sync,
+    BLENDCAP_OT_multicam_sync_sound,
+    BLENDCAP_OT_multicam_sync_exit,
+    BLENDCAP_OT_multicam_select_clips,
+    BLENDCAP_OT_multicam_clear_clips,
     BLENDCAP_OT_cancel,
     BLENDCAP_OT_cancel_cleanup,
     BLENDCAP_OT_generate_bvh,
     BLENDCAP_OT_bake_camera_offset,
     BLENDCAP_OT_revert_strip,
     BLENDCAP_OT_show_warnings,
-    BLENDCAP_OT_sequencer_warning,
-    BLENDCAP_OT_vse_default_prompt,
     BLENDCAP_OT_import_lib_bvh,
     BLENDCAP_OT_export_lib_bvh,
     BLENDCAP_OT_export_lib_fbx,
@@ -205,19 +251,66 @@ classes = (
     BLENDCAP_OT_retarget_remove_pair,
     BLENDCAP_OT_apply_retarget,
     BLENDCAP_OT_cancel_retarget,
+    BLENDCAP_OT_retarget_conflicts,
     BLENDCAP_OT_convert_fk_to_ik,
     BLENDCAP_OT_cancel_fk_to_ik,
     BLENDCAP_OT_save_rest_pose,
     BLENDCAP_OT_save_rest_pose_confirm,
     BLENDCAP_OT_delete_rest_pose_preset,
     BLENDCAP_OT_preview_rest_pose_preset,
+    BLENDCAP_OT_export_presets,
+    BLENDCAP_OT_import_presets,
+    BLENDCAP_OT_move_deps,
+    BLENDCAP_OT_cancel_move_deps,
+    BLENDCAP_OT_move_presets,
+    BLENDCAP_OT_storage_move_all,
+    BLENDCAP_OT_storage_consent,
+    BLENDCAP_OT_storage_consent_watcher,
     BLENDCAP_OT_apply_arkit,
     BLENDCAP_OT_cancel_arkit_apply,
     BLENDCAP_OT_save_arkit_csv,
     BLENDCAP_OT_donate,
+    *_updater.classes,
     VIEW3D_PT_blendcap_ui,
     OUTPUT_PT_blendcap_ui,
 )
+
+
+def _relocate_installer_and_refresh():
+    """Move a shipped installer/ out of the addon folder (helpers.
+    relocate_installer) and recompute the donate flag. Run at register
+    and again from a short timer: preferences (a custom dependency
+    folder) may not be readable while register() runs, and the move
+    must land next to the RIGHT dependency folder."""
+    try:
+        from .helpers import (relocate_installer, stamp_deps_if_unstamped,
+                              smart_app_control_state, presets_root)
+        from . import panels
+        # Make sure the preset location has its retarget_maps/ and
+        # rest_pose_presets/ folders (a custom location only resolves
+        # once preferences are readable, which is why this runs here
+        # and not only at register).
+        presets_root()
+        relocate_installer()
+        panels.refresh_donate_flag()
+        # Windows Smart App Control: one registry read for the session
+        # (see helpers). A console line when it is enforcing.
+        if smart_app_control_state(refresh=True) == 'ON':
+            print("[BlendCap] Windows Smart App Control is on: it will "
+                  "block the capture engine (see Preferences).")
+        # A working environment with no revision stamp gets the current
+        # one (hand-built venvs; every environment the first time this
+        # code runs). Same timing as the relocation: the dependency
+        # folder may not resolve until preferences are readable.
+        stamp_deps_if_unstamped()
+    except Exception as e:
+        print(f"[BlendCap] installer relocation check failed: {e}")
+
+
+def _deferred_installer_relocation():
+    _relocate_installer_and_refresh()
+    return None
+
 
 @bpy.app.handlers.persistent
 def _undo_redo_pre(scene, depsgraph=None):
@@ -271,11 +364,61 @@ def _clear_dangling_retarget_rigs(scene, depsgraph=None):
             s.blendcap_retarget_target = None
 
 
+@bpy.app.handlers.persistent
+def _blendcap_sanitize_rest_pose_preset(_arg=None, _depsgraph=None):
+    """Snap a stale rest-pose preset selection back to '__NONE__'.
+
+    The dropdown's item list is rebuilt dynamically and changed shape
+    in 1.0.6 (bundled presets moved into bundled/, Standard/Custom
+    sections added), so a .blend saved under an older layout can store
+    a selection that no longer resolves — Blender then logs a
+    "matches no enum" warning on EVERY redraw, flooding the console.
+    Fires on load_post; only writes when the stored value is invalid."""
+    from .properties import get_rest_pose_preset_items
+    for s in bpy.data.scenes:
+        props = getattr(s, 'blendcap_props', None)
+        if props is None:
+            continue
+        try:
+            valid = {it[0] for it in
+                     get_rest_pose_preset_items(props, bpy.context)
+                     if it is not None}
+            if props.custom_rest_pose_preset not in valid:
+                props.custom_rest_pose_preset = '__NONE__'
+        except Exception:
+            pass
+
+
 # Reentrancy guard for the re-save the cache-migration handler triggers.
 # The re-save fires save_post again; this flag makes that second pass skip
 # straight through (the migration would no-op anyway — the temp cache is
 # already emptied — but the flag avoids a wasted scan and any save loop).
 _blendcap_migration_resaving = False
+
+# Where an UNSAVED project's cache was just before a save, noted by the
+# save_pre handler below (None when the project already had a file). With
+# a custom cache folder that is the custom folder, and the project's
+# captures have to follow it to its own folder (the user, 2026-11-26).
+_blendcap_presave_cache = None
+# (old cache folder, the project's file) still to be collected: the move
+# waits for a save with no capture or BVH job running, since those write
+# into the old folder.
+_blendcap_cache_to_collect = None
+
+
+@bpy.app.handlers.persistent
+def _blendcap_note_cache_before_save(*args):
+    """save_pre: remember where an unsaved project's cache is, before the
+    save gives the project a folder and _cache_dir() starts pointing
+    there. Read by _blendcap_migrate_cache_on_save."""
+    global _blendcap_presave_cache
+    _blendcap_presave_cache = None
+    try:
+        if not bpy.data.filepath:
+            from .helpers import _cache_dir
+            _blendcap_presave_cache = _cache_dir()
+    except Exception as e:
+        print(f"[BlendCap] Could not note the cache folder before saving: {e}")
 
 
 @bpy.app.handlers.persistent
@@ -289,6 +432,8 @@ def _blendcap_migrate_cache_on_save(*args):
     @persistent so it survives file loads. save_post runs on the main
     thread, so resolving prefs / touching bpy.data here is safe."""
     global _blendcap_migration_resaving
+    global _blendcap_presave_cache, _blendcap_cache_to_collect
+    presave, _blendcap_presave_cache = _blendcap_presave_cache, None
     if _blendcap_migration_resaving:
         _blendcap_migration_resaving = False
         return
@@ -303,6 +448,9 @@ def _blendcap_migrate_cache_on_save(*args):
     # the project on first save is now default behavior (no longer a pref).
     if not bpy.data.filepath:
         return
+    if presave:
+        # the project was unsaved until this save
+        _blendcap_cache_to_collect = (presave, bpy.data.filepath)
     prefs = addon_prefs()
     if not prefs:
         return
@@ -312,6 +460,7 @@ def _blendcap_migrate_cache_on_save(*args):
     # for clarity.)
     if getattr(prefs, "cache_use_custom", False) and \
        getattr(prefs, "cache_always_use_custom", False):
+        _blendcap_cache_to_collect = None
         return
 
     try:
@@ -320,6 +469,29 @@ def _blendcap_migrate_cache_on_save(*args):
     except Exception as e:
         print(f"[BlendCap] Cache migration error: {e}")
         return
+
+    # An unsaved project that kept its cache in the custom cache folder:
+    # its captures follow it into its own folder (only its own, that
+    # folder is shared by every unsaved project).
+    if _blendcap_cache_to_collect:
+        old_cache, for_file = _blendcap_cache_to_collect
+        if for_file != bpy.data.filepath:
+            _blendcap_cache_to_collect = None       # another project by now
+        else:
+            try:
+                from .helpers import (blendcap_state, bvh_state,
+                                      migrate_project_cache_into)
+                if blendcap_state.get('running') or bvh_state.get('running'):
+                    print("[BlendCap] A capture or BVH job is running: this "
+                          "project's captures move into its folder at the "
+                          "next save.")
+                else:
+                    _blendcap_cache_to_collect = None
+                    moved = migrate_project_cache_into(
+                        old_cache, new_cache) or moved
+            except Exception as e:
+                _blendcap_cache_to_collect = None
+                print(f"[BlendCap] Cache migration error: {e}")
     if not moved:
         return
 
@@ -387,19 +559,9 @@ def _blendcap_apply_default_video_source(*args):
     finally:
         properties._SETTING_DEFAULT_SOURCE = prev
 
-    # Enforce AUTO_DISABLE directly instead of riding on the property
-    # update above: the update only fires when the value actually CHANGES,
-    # and a startup file saved with the source already on VSE (likely for
-    # exactly the users this pref exists for) changes nothing - the
-    # callback never runs and the Sequencer checkbox stays on.
-    if (default_src == 'VSE'
-            and getattr(prefs, "sequencer_export_behavior", 'NOTIFY')
-                == 'AUTO_DISABLE'):
-        for s in bpy.data.scenes:
-            props = getattr(s, "blendcap_props", None)
-            if (props is not None and props.video_source == 'VSE'
-                    and getattr(s.render, 'use_sequencer', False)):
-                s.render.use_sequencer = False
+    # No Sequencer-rendering change here: that now happens when a clip
+    # is added to the sequencer (sequencer_guard), gated to the BlendCap
+    # workspace, which also covers files that start on the strip source.
 
 
 def _blendcap_default_source_startup_timer():
@@ -410,6 +572,120 @@ def _blendcap_default_source_startup_timer():
     except Exception as e:
         print(f"[BlendCap] default video source apply failed: {e}")
     return None  # returning None unregisters this one-shot timer
+
+
+# ---------------------------------------------------------------------------
+# Plain-language notice when Blender's own install of a BlendCap zip
+# fails (drag-and-drop or Install from Disk).
+# ---------------------------------------------------------------------------
+# Blender disables an enabled addon right before replacing its folder
+# and re-enables it afterwards. On success the copy that comes back is
+# the new one; on failure (typically "[WinError 5] Access is denied"
+# renaming the folder, because an Explorer window, a terminal or an
+# editor has something in it open) the OLD copy is re-enabled: same
+# folder, same version. unregister() notes when it is being disabled
+# by Blender's installer (the installer is visibly on the call stack;
+# a user unticking the addon is not), register() checks whether the
+# folder and version are unchanged shortly after, and if so shows a
+# window that says what Blender's message doesn't. Blender's own
+# error still appears; this one comes on top, half a second later.
+# The note lives in bpy.app.driver_namespace, which survives the
+# module reload between the two calls.
+_INSTALL_NOTE_KEY = "blendcap_install_attempt"
+_INSTALL_NOTE_MAX_AGE = 180.0
+
+
+def _disabled_by_extension_installer():
+    """True when the current unregister() was triggered by Blender's
+    extension installer (bl_extension_ops._preferences_ensure_disabled
+    is on the stack), not by the user toggling the addon."""
+    import traceback
+    try:
+        for fr in traceback.extract_stack():
+            if (fr.name == "_preferences_ensure_disabled"
+                    and "bl_extension_ops" in os.path.basename(fr.filename)):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _addon_folder_identity():
+    """(version, folder creation/inode key) - both change when Blender
+    replaces the folder, neither when the replacement failed."""
+    from .helpers import _addon_dir
+    from .updater import current_version
+    try:
+        st = os.stat(_addon_dir())
+        key = (st.st_ino, st.st_ctime_ns)
+    except OSError:
+        key = None
+    return (current_version(), key)
+
+
+def _note_install_disable():
+    if not _disabled_by_extension_installer():
+        return
+    try:
+        import time
+        version, key = _addon_folder_identity()
+        bpy.app.driver_namespace[_INSTALL_NOTE_KEY] = {
+            't': time.time(), 'version': version, 'key': key}
+    except Exception:
+        pass
+
+
+def _failed_install_detected():
+    """Consume the note; True when this register() is the OLD copy
+    coming back after Blender's install failed."""
+    import time
+    try:
+        note = bpy.app.driver_namespace.pop(_INSTALL_NOTE_KEY, None)
+    except Exception:
+        note = None
+    if not note:
+        return False
+    if time.time() - float(note.get('t', 0)) > _INSTALL_NOTE_MAX_AGE:
+        return False
+    version, key = _addon_folder_identity()
+    return (version == note.get('version') and key is not None
+            and key == note.get('key'))
+
+
+_FAILED_INSTALL_LINES = [
+    "BlendCap could not be updated. Nothing was changed.",
+    "This usually means the BlendCap addon folder is open in another "
+    "program:",
+    "an Explorer window, a terminal, or a file from that folder open in "
+    "an editor.",
+    "Close it, then install the update again.",
+]
+
+
+def _failed_install_popup():
+    def draw(self, _context):
+        for line in _FAILED_INSTALL_LINES:
+            self.layout.label(text=line)
+    try:
+        wm = bpy.context.window_manager
+        if wm and wm.windows:
+            with bpy.context.temp_override(window=wm.windows[0]):
+                wm.popup_menu(draw, title="BlendCap update failed",
+                              icon='ERROR')
+    except Exception:
+        pass
+    return None
+
+
+def _check_failed_install():
+    try:
+        if _failed_install_detected() and not bpy.app.background:
+            print("[BlendCap] the update was not installed (the addon "
+                  "folder is probably open in another program).")
+            bpy.app.timers.register(_failed_install_popup,
+                                    first_interval=0.5, persistent=True)
+    except Exception as e:
+        print(f"[BlendCap] failed-install check skipped: {e}")
 
 
 def register():
@@ -454,8 +730,38 @@ def register():
         default=False)
     # Inline uninstall confirm: True while the red Confirm/Cancel block is
     # showing in the prefs panel. WindowManager-scoped, session-only.
+    # Refine Hand Tracking: SESSION checkbox over the prefs master.
+    # WindowManager state dies with the session, so every launch
+    # re-derives from the master (Automatic = hardware) - exactly the
+    # wanted lifetime. -1 = follow master, 0/1 = this session's click.
+    from .operators_pipeline import (_refine_checkbox_get,
+                                     _refine_checkbox_set)
+    bpy.types.WindowManager.blendcap_refine_hands_state = \
+        bpy.props.IntProperty(default=-1, options={'SKIP_SAVE'})
+    bpy.types.WindowManager.blendcap_refine_hands = bpy.props.BoolProperty(
+        name="Refine Hand Tracking",
+        description="Extra capture pass that sharpens hand tracking - "
+                    "required for Rebuild Finger Motion. Runs slowly "
+                    "on non-NVIDIA cards. The default setting can be "
+                    "changed in the preferences",
+        get=_refine_checkbox_get, set=_refine_checkbox_set)
     bpy.types.WindowManager.blendcap_uninstall_armed = bpy.props.BoolProperty(
         default=False)
+
+    # --- Multi-person capture: the People list and the mirror of the
+    # selected capture's corrections (people_ui.py says why a mirror) ---
+    bpy.types.Scene.blendcap_people = bpy.props.CollectionProperty(
+        type=_people_ui.BlendCapPerson)
+    bpy.types.Scene.blendcap_people_camera = bpy.props.EnumProperty(
+        name="Correct In",
+        description="Which cameras the buttons below correct",
+        items=_people_ui.scope_items, options={'SKIP_SAVE'})
+    bpy.types.Scene.blendcap_people_index = bpy.props.IntProperty(
+        default=0, update=_people_ui._index_update)
+    bpy.types.Scene.blendcap_people_states = bpy.props.StringProperty(
+        default="{}", options={'HIDDEN'})
+    bpy.types.Scene.blendcap_people_shown = bpy.props.StringProperty(
+        default="", options={'HIDDEN'})
 
     # --- Retargeting v2 scene state ---
     bpy.types.Scene.blendcap_retarget_pairs = bpy.props.CollectionProperty(type=BlendCapBonePair)
@@ -750,18 +1056,29 @@ def register():
     # body rig is active. Values are inert — nothing reads from this.
     bpy.types.Scene.blendcap_camera_offset_placeholder = bpy.props.PointerProperty(
         type=BlendCapCameraOffset)
+    # Per-rig "Mute Limits and Drivers" (support item 14): the record of
+    # what BlendCap muted lives on the rig object, and the two checkboxes
+    # read and write the rig itself. See rig_conflicts.py.
+    _rig_conflicts.register_properties()
 
-    if not bpy.app.timers.is_registered(_bvh_library_timer):
-        bpy.app.timers.register(_bvh_library_timer, first_interval=0.2, persistent=True)
+    # BVH library list: synced on load, after BVH generation, and when
+    # the panel notices the folder changed. No polling.
+    if _bvh_library_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_bvh_library_on_load)
+    bpy.app.timers.register(_bvh_library_resync, first_interval=0.2)
 
     if _clear_dangling_retarget_rigs not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_clear_dangling_retarget_rigs)
     if _clear_dangling_retarget_rigs not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_clear_dangling_retarget_rigs)
+    if _blendcap_note_cache_before_save not in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.append(_blendcap_note_cache_before_save)
     if _blendcap_migrate_cache_on_save not in bpy.app.handlers.save_post:
         bpy.app.handlers.save_post.append(_blendcap_migrate_cache_on_save)
     if _blendcap_apply_default_video_source not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_blendcap_apply_default_video_source)
+    if _blendcap_sanitize_rest_pose_preset not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_blendcap_sanitize_rest_pose_preset)
     # Catch the startup scene, which loaded before this register() ran (so
     # load_post never fired for it). One-shot - returns None and unregisters.
     bpy.app.timers.register(_blendcap_default_source_startup_timer,
@@ -775,16 +1092,131 @@ def register():
     if _undo_redo_post not in bpy.app.handlers.redo_post:
         bpy.app.handlers.redo_post.append(_undo_redo_post)
 
+    # Storage scan: NOTHING moves automatically. When custom presets
+    # or the dependency files still sit inside the addon folder (a
+    # pre-1.0.6 layout, which updates can delete), a timer arms the
+    # consent dialog once a window exists - it explains, offers the
+    # move, and returns every launch until the user acts. The scan's
+    # only write is deleting drag-merge leftovers of SHIPPED presets
+    # (byte-identical copies of files that moved into bundled/).
+    # Must never be able to break registration.
+    try:
+        from .helpers import (scan_user_data, addon_prefs,
+                              _track_presets_root)
+        _track_presets_root()
+        pending = scan_user_data()
+        prefs = addon_prefs()
+        hidden = bool(prefs and getattr(prefs, "hide_storage_warning",
+                                        False))
+        if ((pending["presets"] or pending["deps"])
+                and not bpy.app.background and not hidden):
+            # 0.1 s: the watcher must be listening before any human
+            # can physically click (a click before arming was the
+            # missed-dialog bug).
+            from .operators_storage import _WATCH, _consent_on_load
+            _WATCH["shutdown"] = False
+            bpy.app.timers.register(_storage_consent_timer,
+                                    first_interval=0.1, persistent=True)
+            # A .blend opened at startup (or later) replaces the window
+            # manager and kills the watcher: re-arm after file loads.
+            if _consent_on_load not in bpy.app.handlers.load_post:
+                bpy.app.handlers.load_post.append(_consent_on_load)
+    except Exception as e:
+        print(f"[BlendCap] storage scan skipped: {e}")
+
+    # Sequencer guard (keep view transform / frame rate when video is
+    # added). Attached only while either preference is on.
+    try:
+        from . import sequencer_guard
+        sequencer_guard.arm()
+    except Exception as e:
+        print(f"[BlendCap] sequencer guard not started: {e}")
+
+    # Multi-Camera Capture's syncing mode: the letters and the "syncing
+    # mode" band drawn over the Sequencer, and its header's exit button.
+    try:
+        from . import multicam_view
+        multicam_view.arm()
+    except Exception as e:
+        print(f"[BlendCap] syncing mode drawing not started: {e}")
+
+    # Multi-person capture: the boxes drawn over the video, and the
+    # corrections following undo, redo and a project being opened.
+    try:
+        _people_ui.arm()
+    except Exception as e:
+        print(f"[BlendCap] people list not started: {e}")
+
+    # Installer out of the addon folder (paid builds), now and again
+    # shortly after (prefs may not be readable yet - see the helper).
+    _relocate_installer_and_refresh()
+    try:
+        # persistent: a .blend opened by double-click loads right after
+        # register and would drop an ordinary timer.
+        bpy.app.timers.register(_deferred_installer_relocation,
+                                first_interval=0.6, persistent=True)
+    except Exception:
+        pass
+
+    # Update check (off on dev builds, off without online access, off
+    # when the preference is unticked).
+    try:
+        _updater.arm()
+    except Exception as e:
+        print(f"[BlendCap] updater not started: {e}")
+
+    # Old copy re-enabled after Blender's install of a zip failed?
+    _check_failed_install()
+
 
 def unregister():
+    # Being switched off by Blender's installer? Note it, so register()
+    # can tell a failed install from a successful one.
+    _note_install_disable()
+    # Stop a live consent watcher/timer cleanly before its operator
+    # class disappears.
+    try:
+        from .operators_storage import _WATCH, _consent_on_load
+        _WATCH["shutdown"] = True
+        if _consent_on_load in bpy.app.handlers.load_post:
+            bpy.app.handlers.load_post.remove(_consent_on_load)
+    except Exception:
+        pass
+    try:
+        from . import sequencer_guard
+        sequencer_guard.disarm()
+    except Exception:
+        pass
+    try:
+        from . import multicam_view
+        multicam_view.disarm()
+    except Exception:
+        pass
+    try:
+        _people_ui.disarm()
+    except Exception as e:
+        print(f"[BlendCap] people list not stopped: {e}")
+    try:
+        _updater.disarm()
+    except Exception:
+        pass
+    try:
+        if bpy.app.timers.is_registered(_deferred_installer_relocation):
+            bpy.app.timers.unregister(_deferred_installer_relocation)
+    except Exception:
+        pass
     if _clear_dangling_retarget_rigs in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_clear_dangling_retarget_rigs)
     if _clear_dangling_retarget_rigs in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_clear_dangling_retarget_rigs)
+    if _blendcap_note_cache_before_save in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.remove(_blendcap_note_cache_before_save)
     if _blendcap_migrate_cache_on_save in bpy.app.handlers.save_post:
         bpy.app.handlers.save_post.remove(_blendcap_migrate_cache_on_save)
     if _blendcap_apply_default_video_source in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_blendcap_apply_default_video_source)
+    if _blendcap_sanitize_rest_pose_preset in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_blendcap_sanitize_rest_pose_preset)
     if bpy.app.timers.is_registered(_blendcap_default_source_startup_timer):
         bpy.app.timers.unregister(_blendcap_default_source_startup_timer)
     if _undo_redo_pre in bpy.app.handlers.undo_pre:
@@ -795,8 +1227,10 @@ def unregister():
         bpy.app.handlers.redo_pre.remove(_undo_redo_pre)
     if _undo_redo_post in bpy.app.handlers.redo_post:
         bpy.app.handlers.redo_post.remove(_undo_redo_post)
-    if bpy.app.timers.is_registered(_bvh_library_timer):
-        bpy.app.timers.unregister(_bvh_library_timer)
+    if _bvh_library_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_bvh_library_on_load)
+    if bpy.app.timers.is_registered(_bvh_library_resync):
+        bpy.app.timers.unregister(_bvh_library_resync)
     for cls in reversed(classes): bpy.utils.unregister_class(cls)
     del bpy.types.Scene.blendcap_props
     del bpy.types.Scene.blendcap_bvh_entries
@@ -808,6 +1242,13 @@ def unregister():
     del bpy.types.WindowManager.blendcap_install_agreed
     del bpy.types.WindowManager.blendcap_install_force
     del bpy.types.WindowManager.blendcap_uninstall_armed
+    del bpy.types.WindowManager.blendcap_refine_hands_state
+    del bpy.types.WindowManager.blendcap_refine_hands
+    del bpy.types.Scene.blendcap_people
+    del bpy.types.Scene.blendcap_people_index
+    del bpy.types.Scene.blendcap_people_camera
+    del bpy.types.Scene.blendcap_people_states
+    del bpy.types.Scene.blendcap_people_shown
     del bpy.types.Scene.blendcap_retarget_pairs
     del bpy.types.Scene.blendcap_retarget_pair_index
     del bpy.types.Scene.blendcap_retarget_source
@@ -850,3 +1291,4 @@ def unregister():
     del bpy.types.Scene.blendcap_use_custom_ik_sources
     del bpy.types.Object.blendcap_camera_offset
     del bpy.types.Scene.blendcap_camera_offset_placeholder
+    _rig_conflicts.unregister_properties()

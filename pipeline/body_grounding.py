@@ -597,7 +597,7 @@ def compute_body_grounding_correction(world_pos, names, fps,
     weight = np.clip(weight, 0.0, 1.0)
 
     if weight.max() < 1e-3:
-        print("       Body grounding: no non-upright stretches found — "
+        print("       Body grounding: no non-upright stretches found - "
               "no correction applied")
         return np.zeros(n_frames, dtype=np.float64)
 
@@ -628,5 +628,5 @@ def compute_body_grounding_correction(world_pos, names, fps,
               f"{catch_distance*100:.0f} cm)")
     else:
         print("       Body grounding: no non-upright near-floor "
-              "stretches found — no correction applied")
+              "stretches found - no correction applied")
     return correction

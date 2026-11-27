@@ -79,6 +79,7 @@ from .constraint_sim import (
     _compensate_basis_for_constraints,
     _topo_sort_target_bones,
 )
+from . import limit_probe
 
 
 def _settle_target_drivers_and_eval(scene, tgt_rig):
@@ -406,8 +407,10 @@ def _setup_leg_anchor_compensation(pairs, src_rig, tgt_rig, src_mw, tgt_mw,
     # drift and add it to a root-ish LOC pair's basis translation.
     # ------------------------------------------------------------------
     _LEG_ROOT_KW = ('thigh', 'upleg', 'upper_leg')
+    from .preset_io import _face_region_from_source
     comp_loc_pair = None
     _comp_candidates = []
+    _face_skipped = 0
     for p in pairs:
         if p.channels not in ('LOC', 'LOC_ROT'):
             continue
@@ -419,6 +422,18 @@ def _setup_leg_anchor_compensation(pairs, src_rig, tgt_rig, src_mw, tgt_mw,
         if p.target not in tgt_rig.pose.bones:
             continue
         if p.target not in by_target:
+            continue
+        # Face pairs are never a compensation target. Pushing a face
+        # bone can't reduce the measured LEG drift, so the same
+        # correction would stack on it every frame without bound
+        # (0.26 m/frame on a customer's hand-built preset with a
+        # ROT-only Hips pair, Reddit 2026-07-26, support item 7).
+        # Head-local LOC pairs and anything whose source is a face
+        # bone are out; if nothing else remains, compensation is
+        # simply off for this bake (it is self-zeroing, safe to skip).
+        space = (getattr(p, 'loc_space', 'BASIS') or 'BASIS').upper()
+        if space == 'HEAD_LOCAL' or _face_region_from_source(p.source):
+            _face_skipped += 1
             continue
         _comp_candidates.append(p)
     # Prefer the pair actually FED BY THE HIPS. Face pairs are LOC with
@@ -436,6 +451,11 @@ def _setup_leg_anchor_compensation(pairs, src_rig, tgt_rig, src_mw, tgt_mw,
             break
     if comp_loc_pair is None and _comp_candidates:
         comp_loc_pair = _comp_candidates[0]
+    if comp_loc_pair is None and _face_skipped:
+        print("[BlendCap] Leg-anchor compensation off for this bake: the only "
+              "location pairs are face pairs (no hips/pelvis or other body "
+              "LOC pair to correct). Add a body LOC pair, e.g. Hips with "
+              "Loc & Rot, to enable it.")
     comp_legs = []  # list of (source_bone_name, target_bone_name)
     _seen = set()
     for p in pairs:
@@ -616,7 +636,7 @@ def _setup_head_local(scene, src_rig, tgt_rig, rest_data, src_walk_set,
         if _face_pair_count:
             print(f"[BlendCap] WARNING: {_face_pair_count} face pair(s) "
                   f"mapped but head bones could not be resolved "
-                  f"(source={hl_src_name!r}, target={hl_tgt_name!r}) — "
+                  f"(source={hl_src_name!r}, target={hl_tgt_name!r}) - "
                   f"head-local transfer is OFF for this bake. Set the "
                   f"Head (Source) / Head (Target) fields in Advanced.")
     for rd in rest_data:
@@ -1110,6 +1130,9 @@ def _matrix_bake_pairs_iter_fast(pairs, src_rig, tgt_rig, frame_start, frame_end
     edit-bone translation but uses the snapshot's rotation.
     """
     scene = bpy.context.scene
+    # A cancelled or failed bake must not leave an earlier bake's
+    # limit report behind for the operator to pick up.
+    limit_probe.reset()
     compensation_on = bool(getattr(scene, 'blendcap_face_capture_compensation', False))
     denoise_on = bool(getattr(scene, 'blendcap_face_denoise', False))
     # World-space LOC toggle. Mirrors the classic engine. With the
@@ -1121,8 +1144,15 @@ def _matrix_bake_pairs_iter_fast(pairs, src_rig, tgt_rig, frame_start, frame_end
 
     _eval_pbs, _eff_influence = _settle_target_drivers_and_eval(scene, tgt_rig)
 
-    src_mw = src_rig.matrix_world
-    tgt_mw = tgt_rig.matrix_world
+    # .copy() is load-bearing: matrix_world from RNA is a LIVE VIEW of
+    # the object, not a snapshot. The apply operator puts both rigs'
+    # object transforms back right after this setup (so the viewport
+    # doesn't show the neutralised target for the whole bake), and the
+    # modal returns to Blender's main loop between ticks, where the
+    # depsgraph refreshes matrix_world - every frame after the first
+    # would then see the restored placement folded into src_mw/tgt_mw.
+    src_mw = src_rig.matrix_world.copy()
+    tgt_mw = tgt_rig.matrix_world.copy()
     scale_ratio = _compute_scale_ratio(src_mw, tgt_mw)
 
     rest_data, src_bone_names = _build_rest_data(
@@ -1162,6 +1192,11 @@ def _matrix_bake_pairs_iter_fast(pairs, src_rig, tgt_rig, frame_start, frame_end
     last_q = {}
     key_accum = {}
     primed_channels = set()
+    # Measures (never changes) how far a Limit Rotation on a mapped bone
+    # pulls it off the rotation keyed below. Empty on rigs without one.
+    probe = limit_probe.LimitProbe(tgt_rig, target_meta, constraint_meta,
+                                   _eff_influence)
+    probe_bones = probe.bones
 
     for frame in range(frame_start, frame_end + 1):
         src_arm_local, src_basis_loc_cache, src_basis_rot_cache = (
@@ -1184,12 +1219,21 @@ def _matrix_bake_pairs_iter_fast(pairs, src_rig, tgt_rig, frame_start, frame_end
             # Parent arm-local — always from computed_tgt_arm_local
             # because depth-sorted iteration over tgt_walk_set covers
             # every ancestor of every mapped target before we reach it.
+            # ARMATURE space, not world: _compute_rotation_basis
+            # divides this out of desired_arm_rot_q, which is already
+            # brought into armature space via tgt_mw_rot_inv, and
+            # rel_rest_rot_q_inv is armature-relative too. Folding
+            # tgt_mw in here (as this used to) only cancelled while the
+            # armature OBJECT had no rotation; a rotated target (raw
+            # Mixamo import: Y-up rest stood up by a 90 deg X object
+            # rotation) got every child bone rotated by that object
+            # rotation - hips fine, spine/limbs wrong (support item 13).
             if parent_name is None:
                 parent_arm = None
                 parent_arm_rot_q = Quaternion()
             else:
                 parent_arm = computed_tgt_arm_local[parent_name]
-                parent_arm_rot_q = (tgt_mw @ parent_arm).to_quaternion()
+                parent_arm_rot_q = parent_arm.to_quaternion()
 
             # Armature-carry-as-parent (see the setup comment at
             # carry_con detection): the basis math below — world-delta
@@ -1204,7 +1248,8 @@ def _matrix_bake_pairs_iter_fast(pairs, src_rig, tgt_rig, frame_start, frame_end
                     carry_con, computed_tgt_arm_local)
                 if D_carry is not None:
                     basis_parent_arm = D_carry
-                    parent_arm_rot_q = (tgt_mw @ D_carry).to_quaternion()
+                    # Armature space, same reason as above.
+                    parent_arm_rot_q = D_carry.to_quaternion()
 
             basis_rot_q = None
             basis_loc = Vector((0.0, 0.0, 0.0))
@@ -1238,6 +1283,11 @@ def _matrix_bake_pairs_iter_fast(pairs, src_rig, tgt_rig, frame_start, frame_end
                 wrote_loc, parent_arm, rel_rest, last_q, tgt_mw, tgt_mw_inv,
                 computed_tgt_arm_local)
 
+            if tgt_name in probe_bones:
+                probe.measure(frame, tgt_name, basis_loc, basis_rot_q,
+                              parent_arm, rel_rest, tgt_mw, tgt_mw_inv,
+                              computed_tgt_arm_local)
+
             # Accumulate keyframes for the channels we wrote. Continuity
             # tracking (last_q sign flip) happened upstream in the rotation
             # / HEAD_LOCAL branches above — pass last_q=None to skip it.
@@ -1264,6 +1314,10 @@ def _matrix_bake_pairs_iter_fast(pairs, src_rig, tgt_rig, frame_start, frame_end
                 key_accum, primed_channels)
 
         yield frame
+
+    # Per-frame phase done: publish what the limits did, and which
+    # channels are about to be keyed (the driver check reads that).
+    probe.finish(frame_start, frame_end, key_accum.keys())
 
     # Same bulk-write tail as the classic engine. ESC during this phase
     # can leave partial fcurves; the per-frame phase above is cancellable

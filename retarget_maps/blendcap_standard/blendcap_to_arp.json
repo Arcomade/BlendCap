@@ -1,44 +1,9 @@
 {
-  "name": "BlendCap → Auto-Rig Pro",
-  "version": 7,
+  "name": "BlendCap \u2192 Auto-Rig Pro",
+  "version": 8,
   "target_kind": "generic",
   "namespace_strip": "",
   "auto_bake_ik": false,
-  "face_head_source": "Head",
-  "face_head_target": "head.x",
-  "face_capture_compensation": false,
-  "face_amplification": {
-    "jaw": 1.0,
-    "gaze": 1.0,
-    "lids": 1.0,
-    "brows": 1.0,
-    "lips": 1.0,
-    "cheeks": 1.0,
-    "nose": 1.0
-  },
-  "_note": "Body + hands + face mapping for ARP rigs with the MODERN Facial 2 module. v1 (clean rebuild) verified against a freshly-generated stock ARP Facial 2 rig (NEW ARP rig_analysis.json) — no character-specific bones, only what ARP generates by default. EYES: LeftEye/RightEye -> c_eye_target.l/.r (LOC -> Damped Track converts to eye rotation). LIDS: LeftUpperLid/RightUpperLid -> c_eyelid_top.l/.r and similar for lower; segments c_eyelid_top_01/02/03.l cascade from these masters via ACTION constraints in the rig. BROWS: 4 source brow muscle bones per side drive the 4 brow segment widgets directly (outer to inner: LeftBrowMuscle -> c_eyebrow_03.l, LeftBrowMuscle1 -> c_eyebrow_02.l, LeftBrowMuscle2 -> c_eyebrow_01.l, LeftBrowMuscle3 -> c_eyebrow_01_end.l). The segments are CHILDREN of c_eyebrow_full.l, so c_eyebrow_full is left undriven (otherwise its motion would cascade to the segments via parent inheritance, double-counting). NOSE: c_nose_03.x and c_nose_02.x. c_nose_01.x is the parent of c_nose_02.x; leaving c_nose_01 undriven means c_nose_02 basis applies cleanly without parent cascade. CHEEKS: LeftCheekUpper -> c_cheek_smile.l (zygomatic lift), LeftCheekLower -> c_cheek_inflate.l (cheek puff, spatially the closest stock target to the source's lower-cheek position). LIPS: drive the user-facing widgets directly (stock ARP has no _master parent bones — those were Tifa-character-specific). Upper lip + lip corners use BASIS. Lower lip widgets (c_lips_bot.x, c_lips_bot_01.l/.r) parent through c_lips_bot_offset.x -> jawbone.x = 100% jaw cascade; HEAD_LOCAL on those pairs so the pb.matrix setter back-solves the basis through the jaw rotation. JAW: JawTip -> c_jawbone.x with channels=LOC (ARP converts the translation to jaw rotation internally; JawTip is the source jaw-chain child that swings when source jaw_master rotates). CHIN + TONGUE: c_chin_01/02.x and c_tong_01/02/03.x parent through jawbone.x, so HEAD_LOCAL for both. face_capture_compensation OFF + all amplifications at 1.0 by default — character-specific tuning is user-facing via the Amplification Values panel.",
-  "ik_chains": [
-    {
-      "owner": "leg_ik_nostr.l",
-      "ik_control": "c_foot_ik.l",
-      "pole_control": "c_leg_pole.l"
-    },
-    {
-      "owner": "leg_ik_nostr.r",
-      "ik_control": "c_foot_ik.r",
-      "pole_control": "c_leg_pole.r"
-    },
-    {
-      "owner": "forearm_ik_nostr.l",
-      "ik_control": "c_hand_ik.l",
-      "pole_control": "c_arms_pole.l"
-    },
-    {
-      "owner": "forearm_ik_nostr.r",
-      "ik_control": "c_hand_ik.r",
-      "pole_control": "c_arms_pole.r"
-    }
-  ],
   "pairs": [
     {
       "source": "LeftBrowMuscle",
@@ -586,13 +551,13 @@
     },
     {
       "source": "Spine3",
-      "target": "c_spine_03.x",
+      "target": "c_spine_04.x",
       "channels": "ROT",
       "influence": 1.0
     },
     {
       "source": "Spine2",
-      "target": "c_spine_02.x",
+      "target": "c_spine_03.x",
       "channels": "ROT",
       "influence": 1.0
     },
@@ -611,9 +576,9 @@
     {
       "source": "Hips",
       "target": "c_root_master.x",
-      "channels": "LOC",
-      "axes": "Z",
-      "influence": 1.0
+      "channels": "LOC_ROT",
+      "influence": 1.0,
+      "axes": "XYZ"
     },
     {
       "source": "LeftUpLeg",
@@ -667,10 +632,56 @@
       "source": "Root",
       "target": "c_pos",
       "channels": "LOC",
-      "axes": "XY",
-      "influence": 1.0
+      "influence": 1.0,
+      "axes": "XY"
     }
   ],
+  "face_head_source": "Head",
+  "face_head_target": "head.x",
+  "face_capture_compensation": false,
+  "face_amplification": {
+    "jaw": 1.0,
+    "gaze": 1.0,
+    "lids": 1.0,
+    "brows": 1.0,
+    "lips": 1.0,
+    "cheeks": 1.0,
+    "nose": 1.0,
+    "tongue": 1.0,
+    "global": 1.0
+  },
+  "use_world_location": false,
+  "ik_chains": [
+    {
+      "limb_kind": "ARM",
+      "side": "L",
+      "owner": "forearm_ik_nostr.l",
+      "ik_control": "c_hand_ik.l",
+      "pole_control": "c_arms_pole.l"
+    },
+    {
+      "limb_kind": "ARM",
+      "side": "R",
+      "owner": "forearm_ik_nostr.r",
+      "ik_control": "c_hand_ik.r",
+      "pole_control": "c_arms_pole.r"
+    },
+    {
+      "limb_kind": "LEG",
+      "side": "L",
+      "owner": "leg_ik_nostr.l",
+      "ik_control": "c_foot_ik.l",
+      "pole_control": "c_leg_pole.l"
+    },
+    {
+      "limb_kind": "LEG",
+      "side": "R",
+      "owner": "leg_ik_nostr.r",
+      "ik_control": "c_foot_ik.r",
+      "pole_control": "c_leg_pole.r"
+    }
+  ],
+  "_note": "Body + hands + face mapping for ARP rigs with the MODERN Facial 2 module. v1 (clean rebuild) verified against a freshly-generated stock ARP Facial 2 rig (NEW ARP rig_analysis.json) \u2014 no character-specific bones, only what ARP generates by default. EYES: LeftEye/RightEye -> c_eye_target.l/.r (LOC -> Damped Track converts to eye rotation). LIDS: LeftUpperLid/RightUpperLid -> c_eyelid_top.l/.r and similar for lower; segments c_eyelid_top_01/02/03.l cascade from these masters via ACTION constraints in the rig. BROWS: 4 source brow muscle bones per side drive the 4 brow segment widgets directly (outer to inner: LeftBrowMuscle -> c_eyebrow_03.l, LeftBrowMuscle1 -> c_eyebrow_02.l, LeftBrowMuscle2 -> c_eyebrow_01.l, LeftBrowMuscle3 -> c_eyebrow_01_end.l). The segments are CHILDREN of c_eyebrow_full.l, so c_eyebrow_full is left undriven (otherwise its motion would cascade to the segments via parent inheritance, double-counting). NOSE: c_nose_03.x and c_nose_02.x. c_nose_01.x is the parent of c_nose_02.x; leaving c_nose_01 undriven means c_nose_02 basis applies cleanly without parent cascade. CHEEKS: LeftCheekUpper -> c_cheek_smile.l (zygomatic lift), LeftCheekLower -> c_cheek_inflate.l (cheek puff, spatially the closest stock target to the source's lower-cheek position). LIPS: drive the user-facing widgets directly (stock ARP has no _master parent bones \u2014 those were Tifa-character-specific). Upper lip + lip corners use BASIS. Lower lip widgets (c_lips_bot.x, c_lips_bot_01.l/.r) parent through c_lips_bot_offset.x -> jawbone.x = 100% jaw cascade; HEAD_LOCAL on those pairs so the pb.matrix setter back-solves the basis through the jaw rotation. JAW: JawTip -> c_jawbone.x with channels=LOC (ARP converts the translation to jaw rotation internally; JawTip is the source jaw-chain child that swings when source jaw_master rotates). CHIN + TONGUE: c_chin_01/02.x and c_tong_01/02/03.x parent through jawbone.x, so HEAD_LOCAL for both. face_capture_compensation OFF + all amplifications at 1.0 by default \u2014 character-specific tuning is user-facing via the Amplification Values panel.",
   "_note_transfer_update": "2026-07-08 transfer-mode update: every face pair is now loc_space=head_local (measured end-to-end on the reference character: smile error 1.75mm RMS/15.8mm max -> 0.34mm/2.3mm). Rigify mouth masters/corners carry LOC_ROT again - the engine now allows rotation alongside head-local LOC, restoring the authored funnel/roll (up to ~29 deg) and corner-tilt (~10 deg) rotations that were previously discarded. Face motion is auto-normalized to the target's face size at bake (eye-distance ratio).",
   "_note_lips_reverted": "2026-07-09: all lip/mouth pairs reverted to channels=LOC (location only). The LOC_ROT lip rotation required an engine gate-lift that broke CloudRig's face, so the rotation work was pulled. loc_space (head_local) is unchanged."
 }

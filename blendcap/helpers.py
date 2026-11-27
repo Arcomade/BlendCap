@@ -82,6 +82,45 @@ def _cache_dir():
     return os.path.join(base, "Blendcap_Cache")
 
 
+def dir_tree_signature(dirs, suffix):
+    """Cheap change detector for dropdowns that list files on disk.
+
+    Blender calls a dynamic enum's items callback on every redraw of
+    the panel that shows it, so anything that walks folders or opens
+    files there runs dozens of times per second while the mouse is
+    over the panel. Callers compute this signature first and rebuild
+    their item list only when it changed. It walks each directory with
+    os.scandir and records (path, mtime_ns, size) for files with
+    `suffix` plus the subfolder names; on Windows DirEntry.stat() comes
+    from the listing itself, so this is about the cost of one listing
+    per folder and no file is opened. Missing dirs contribute nothing.
+    """
+    sig = []
+    for root in dirs:
+        if not root:
+            continue
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        try:
+                            if e.is_dir(follow_symlinks=False):
+                                stack.append(e.path)
+                                sig.append((e.path, -1, -1))
+                            elif e.name.endswith(suffix):
+                                st = e.stat(follow_symlinks=False)
+                                sig.append((e.path, st.st_mtime_ns,
+                                            st.st_size))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    sig.sort()
+    return tuple(sig)
+
+
 def _bvh_library_dir():
     """Folder holding the BVH library (the exports managed in the BVH Library
     panel). Custom location via the add-on pref (used as-is - the user names
@@ -96,6 +135,129 @@ def _bvh_library_dir():
         if p:
             return bpy.path.abspath(p)
     return os.path.join(_cache_dir(), "bvh_exports")
+
+
+# ---------------------------------------------------------------------------
+# Windows path length (support item 10)
+# ---------------------------------------------------------------------------
+# Blender's own Python cannot open, see or create anything past the classic
+# Windows limits: 259 characters for a file path, 247 for a folder. That holds
+# even on a PC with Windows' long-path setting switched on (measured on
+# Blender 5.3 with LongPathsEnabled = 1: the capture helper's Python wrote a
+# 300-character path happily, Blender's could not even see the file). So a
+# project on a deep server path used to capture fine and then have Generate
+# BVH do nothing at all, with no message: the BVH was written, or not, and
+# Blender simply could not find it. These checks run before a job starts and
+# say which path is too long. They are a wall, not a fix: nothing in the
+# chain can be made to work past the limit (Blender's BVH importer and its
+# video reader have the same limit).
+WIN_MAX_FILE_PATH = 259
+WIN_MAX_DIR_PATH = 247
+# The longest file name BlendCap writes straight into a capture folder.
+CAPTURE_LONGEST_FILE = "blendcap_capture_debug.log"
+
+
+def path_over_limit(path, is_dir=False):
+    """The path's length when Blender can't use it on Windows, else 0."""
+    if sys.platform != 'win32' or not path:
+        return 0
+    try:
+        full = os.path.abspath(path)
+    except Exception:
+        full = str(path)
+    n = len(full)
+    return n if n > (WIN_MAX_DIR_PATH if is_dir else WIN_MAX_FILE_PATH) else 0
+
+
+def _wrap_path(path, width=60):
+    """Split a path over several dialog lines, breaking after a separator
+    where possible (dialog labels don't wrap and clip at the edge)."""
+    parts = re.split(r'(?<=[\\/])', path)
+    lines, cur = [], ""
+    for part in parts:
+        while len(part) > width:
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(part[:width])
+            part = part[width:]
+        if cur and len(cur) + len(part) > width:
+            lines.append(cur)
+            cur = part
+        else:
+            cur += part
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+_LONG_PATH_ADVICE = {
+    'video': ["Move or rename the video so its path is shorter, then try again."],
+    'cache': ["Save the project in a folder with a shorter path, or shorten",
+              "the clip's name. A custom cache folder with a short path also",
+              "works (Preferences > File & Cache Locations, with Always use",
+              "this folder ticked)."],
+    'library': ["Use a BVH library folder with a shorter path, or shorten the",
+                "clip's name."],
+}
+
+
+def path_too_long_lines(path, length, is_dir=False, kind='cache'):
+    """The warning dialog's lines for one path that is over the limit."""
+    limit = WIN_MAX_DIR_PATH if is_dir else WIN_MAX_FILE_PATH
+    try:
+        full = os.path.abspath(path)
+    except Exception:
+        full = str(path)
+    lines = [f"Path too long for Blender on Windows: {length} characters "
+             f"(limit {limit})."]
+    lines += ["    " + ln for ln in _wrap_path(full)]
+    lines += _LONG_PATH_ADVICE.get(kind, _LONG_PATH_ADVICE['cache'])
+    return lines
+
+
+def first_path_too_long(checks):
+    """checks: (path, is_dir, kind) tuples. The first one over the limit as
+    (path, length, is_dir, kind), or None."""
+    for path, is_dir, kind in checks:
+        n = path_over_limit(path, is_dir)
+        if n:
+            return path, n, is_dir, kind
+    return None
+
+
+def block_if_path_too_long(checks):
+    """Show the warning dialog for the first path over the limit and
+    return True (the caller cancels its job); False when all are fine."""
+    hit = first_path_too_long(checks)
+    if hit is None:
+        return False
+    path, n, is_dir, kind = hit
+    print(f"[BlendCap] path too long for Blender on Windows "
+          f"({n} characters): {path}")
+    _show_warning_popup(path_too_long_lines(path, n, is_dir, kind))
+    return True
+
+
+def capture_folder_checks(output_dir):
+    """The checks for a capture folder: the folder itself, and the longest
+    file BlendCap writes into it."""
+    return [(output_dir, True, 'cache'),
+            (os.path.join(output_dir, CAPTURE_LONGEST_FILE), False, 'cache')]
+
+
+def bvh_job_checks(jobs, library_dir):
+    """The checks for a list of BVH jobs (cmd, intermediate path, stem):
+    each intermediate file and each final file in the library folder."""
+    custom = (os.path.normcase(os.path.abspath(library_dir))
+              != os.path.normcase(os.path.abspath(
+                  os.path.join(_cache_dir(), "bvh_exports"))))
+    kind = 'library' if custom else 'cache'
+    checks = [(library_dir, True, kind)]
+    for _cmd, intermediate, stem in jobs:
+        checks.append((intermediate, False, 'cache'))
+        checks.append((os.path.join(library_dir, f"{stem}.bvh"), False, kind))
+    return checks
 
 
 def _temp_cache_dir():
@@ -115,6 +277,34 @@ def _norm_path(p):
     """Absolute, normalized, case-folded path for reliable comparison
     (Windows paths are case-insensitive)."""
     return os.path.normcase(os.path.normpath(bpy.path.abspath(p)))
+
+
+# Legacy DOS device names Windows refuses as file names regardless of
+# extension ("CON.json" fails the same way "CON" does).
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _filename_error(name):
+    """Plain-English reason a user-typed file name can't be used, or
+    None when it's fine. Catches what open() would otherwise reject
+    with an unreadable OSError: the characters Windows forbids in file
+    names, and the legacy device names it reserves. Checked on every
+    platform so presets stay shareable across OSes."""
+    bad = {c for c in (name or "") if c in '<>:"/\\|?*' or ord(c) < 32}
+    if bad:
+        shown = " ".join(sorted(c for c in bad if ord(c) >= 32))
+        if shown:
+            return f"Names can't contain these characters: {shown}"
+        return "Names can't contain control characters"
+    stem = (name or "").split(".")[0].strip().upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        return (f'"{stem}" is a name reserved by Windows, '
+                f"pick another name")
+    return None
 
 
 def _path_is_under(path, root):
@@ -273,6 +463,200 @@ def migrate_temp_cache_into(new_cache_dir):
     return True
 
 
+def _project_cache_entries(old_cache, with_library):
+    """What the open project uses in old_cache: (capture folder names,
+    BVH library file names). old_cache is a folder SHARED by every
+    unsaved project (the custom cache folder), so only this project's
+    part of it may follow the project when it is saved:
+
+      - the folder of every path the project holds into the cache (a
+        capture's overlay strip, the viewport preview image, a rig's
+        stored BVH path);
+      - the capture folder of every clip in the project: stamped
+        overlays and Empties (blendcap_source_strip), the video strips
+        in the sequencer by name, and the clip the panel is on now (a
+        capture made in an earlier session is found by its clip's name
+        alone, with nothing loaded from it);
+      - the per-person folders of those captures (Capture_<clip>_P<n>,
+        marked .person_of);
+      - with_library: the BVHs in bvh_exports named after one of those
+        clips, or that a rig in the project was imported from, with any
+        file sharing their name.
+
+    MAIN-THREAD ONLY (touches bpy.data)."""
+    try:
+        present = {n for n in os.listdir(old_cache)
+                   if os.path.isdir(os.path.join(old_cache, n))}
+    except OSError:
+        return set(), set()
+    by_fold = {os.path.normcase(n): n for n in present}
+    wanted, bvh_refs = set(), set()
+
+    def under(path):
+        """Note the top-level cache entry a stored path sits in."""
+        try:
+            if not path or not _path_is_under(path, old_cache):
+                return
+            rel = os.path.relpath(
+                os.path.normpath(bpy.path.abspath(path)),
+                os.path.normpath(bpy.path.abspath(old_cache)))
+        except Exception:
+            return
+        parts = rel.split(os.sep)
+        if not parts or parts[0] in ("", ".", ".."):
+            return
+        if os.path.normcase(parts[0]) == "bvh_exports":
+            if len(parts) > 1:
+                bvh_refs.add(os.path.normcase(os.path.splitext(parts[1])[0]))
+        else:
+            wanted.add(os.path.normcase(parts[0]))
+
+    def clip(raw):
+        name = _sanitize_clip_name(str(raw or ""))
+        if name:
+            wanted.add(os.path.normcase(f"Capture_{name}"))
+
+    for scene in bpy.data.scenes:
+        se = getattr(scene, "sequence_editor", None)
+        if not se:
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            strips = list(getattr(se, "strips_all",
+                                  getattr(se, "sequences_all", [])))
+        for s in strips:
+            try:
+                if s.type not in ('MOVIE', 'IMAGE'):
+                    continue
+                clip(s.get("blendcap_source_strip", ""))
+                where = s.filepath if s.type == 'MOVIE' else s.directory
+                if _path_is_under(where, old_cache):
+                    under(where)
+                else:
+                    clip(_strip_media_extension(s.name))
+            except Exception:
+                pass
+    for img in bpy.data.images:
+        under(img.filepath)
+    for obj in bpy.data.objects:
+        try:
+            clip(obj.get("blendcap_source_strip", ""))
+            if obj.type == 'ARMATURE':
+                under(str(obj.get("blendcap_bvh_path", "") or ""))
+        except Exception:
+            pass
+    try:
+        clip(_resolve_clip_name(bpy.context))
+    except Exception:
+        pass
+
+    folders = {by_fold[n] for n in wanted if n in by_fold}
+    for name in present:
+        for f in list(folders):
+            tail = name[len(f):]
+            if (os.path.normcase(name).startswith(os.path.normcase(f))
+                    and tail.startswith("_P") and tail[2:].isdigit()
+                    and os.path.isfile(os.path.join(old_cache, name, ".person_of"))):
+                folders.add(name)
+
+    files = set()
+    if with_library:
+        lib = os.path.join(old_cache, "bvh_exports")
+        try:
+            names = [n for n in os.listdir(lib)
+                     if os.path.isfile(os.path.join(lib, n))]
+        except OSError:
+            names = []
+        folded = {os.path.normcase(f) for f in folders}
+        stems = set()
+        for n in names:
+            stem, ext = os.path.splitext(n)
+            if ext.lower() != ".bvh":
+                continue
+            if os.path.normcase(stem) in bvh_refs:
+                stems.add(os.path.normcase(stem))
+                continue
+            try:
+                c = stem_clip(stem, old_cache)
+            except Exception:
+                c = None
+            if c and os.path.normcase(f"Capture_{c}") in folded:
+                stems.add(os.path.normcase(stem))
+        files = {n for n in names
+                 if os.path.normcase(os.path.splitext(n)[0]) in stems}
+    return folders, files
+
+
+def migrate_project_cache_into(old_cache, new_cache_dir):
+    """Move the open project's captures out of old_cache (the custom
+    cache folder it used while it was unsaved) into new_cache_dir (the
+    cache next to the .blend it was just saved as), and re-point the
+    project at them.
+
+    Why: with 'Set default cache folder' on and 'Always use this
+    folder' off, an unsaved project's cache is the custom folder and a
+    saved project's is next to its .blend. Without this the captures
+    made before the first save stayed behind in the custom folder and
+    the saved project no longer found them (the user, 2026-11-26).
+
+    Unlike the temp cache (migrate_temp_cache_into, the whole folder),
+    the custom folder is shared by every unsaved project, so only what
+    this project uses is moved (_project_cache_entries). Returns True
+    only when something was moved. MAIN-THREAD ONLY."""
+    if not old_cache or not new_cache_dir:
+        return False
+    if _norm_path(old_cache) == _norm_path(new_cache_dir):
+        return False
+    if _norm_path(old_cache) == _norm_path(_temp_cache_dir()):
+        return False                # the whole-folder move covers it
+    if not os.path.isdir(old_cache):
+        return False
+    # the library follows the cache unless it has a folder of its own
+    with_library = (_norm_path(_bvh_library_dir())
+                    == _norm_path(os.path.join(new_cache_dir, "bvh_exports")))
+    folders, files = _project_cache_entries(old_cache, with_library)
+    if not folders and not files:
+        return False
+
+    print(f"[BlendCap] Moving this project's captures into its folder:\n"
+          f"           from {old_cache}\n           to   {new_cache_dir}")
+    moved = False
+    for name in sorted(folders):
+        src = os.path.join(old_cache, name)
+        dst = os.path.join(new_cache_dir, name)
+        if _path_is_under(new_cache_dir, src):
+            continue                # saved inside its own capture folder
+        try:
+            if not os.path.exists(dst):
+                os.makedirs(new_cache_dir, exist_ok=True)
+                shutil.move(src, dst)
+            else:
+                _merge_move_dir(src, dst)
+            moved = True
+        except Exception as e:
+            print(f"[BlendCap] Could not move {name} (left in place): {e}")
+    if files:
+        lib_new = os.path.join(new_cache_dir, "bvh_exports")
+        try:
+            os.makedirs(lib_new, exist_ok=True)
+        except OSError as e:
+            print(f"[BlendCap] Could not create {lib_new}: {e}")
+            files = set()
+        for name in sorted(files):
+            src = os.path.join(old_cache, "bvh_exports", name)
+            dst = os.path.join(lib_new, name)
+            try:
+                if os.path.exists(dst):
+                    os.remove(dst)
+                shutil.move(src, dst)
+                moved = True
+            except Exception as e:
+                print(f"[BlendCap] Could not move {name} (left in place): {e}")
+    if moved:
+        _repath_cache_references(old_cache, new_cache_dir)
+    return moved
+
+
 def _addon_dir():
     # helpers.py lives at <addon_root>/blendcap/helpers.py, so the addon
     # root — where the helper scripts (save_mhr_data.py, npz_to_bvh.py),
@@ -290,8 +674,398 @@ def _addon_dir():
     # pasted into a .blend — which can't happen for an installed addon.)
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def _root_package():
+    """The extension's root package name ('bl_ext.<repo>.blendcap') -
+    the key Blender's addons collection and extension_path_user are
+    keyed by. This module is <root>.blendcap.helpers, so drop the last
+    segment (same computation addon_prefs uses)."""
+    return (__package__ or "").rpartition('.')[0]
+
+
+def _extension_user_root():
+    """Per-extension USER data folder - Blender's official home for
+    data an extension must keep across updates (extension_path_user
+    survives update, reinstall, and repository changes). Everything
+    BlendCap must not lose on update lives under here: saved presets
+    (presets_root) and, by default, the installed dependencies
+    (_deps_default_dir). Falls back to a folder in Blender's user
+    config when the extension API is unavailable (running from source
+    as a plain legacy addon) - same survives-updates property."""
+    try:
+        d = bpy.utils.extension_path_user(_root_package(), create=True)
+        if d:
+            return d
+    except Exception:
+        pass
+    try:
+        base = bpy.utils.user_resource('CONFIG')
+    except Exception:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    d = os.path.join(base, "blendcap", "user_data")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _inside_addon_dir(path):
+    """True when `path` is the addon folder or lives inside it - the
+    one place user data must never be configured to live, because
+    updates replace that folder. The safeguard every location field
+    and move target runs through."""
+    try:
+        p = os.path.abspath(bpy.path.abspath(path or ""))
+        a = os.path.abspath(_addon_dir())
+        return os.path.commonpath([os.path.normcase(p),
+                                   os.path.normcase(a)]) \
+            == os.path.normcase(a)
+    except Exception:
+        return False
+
+
+def _presets_default_dir():
+    """Default home for saved presets when no custom location is set."""
+    return os.path.join(_extension_user_root(), "presets")
+
+
+def _presets_custom_dir():
+    """The custom preset location from preferences, or ''. A value
+    inside the addon folder is IGNORED (treated as unset) - the prefs
+    panel shows why in red next to the field. Presets live in a
+    'BlendCap Presets' subfolder of whatever the user picked, so the
+    folder is self-identifying instead of scattering retarget_maps/
+    rest_pose_presets loose into someone's directory (no double
+    nesting when they picked a folder already named that)."""
+    try:
+        prefs = addon_prefs()
+        if prefs and getattr(prefs, "presets_use_custom", False):
+            p = (getattr(prefs, "presets_custom_path", "") or "").strip()
+            if p and not _inside_addon_dir(p):
+                p = os.path.abspath(bpy.path.abspath(p))
+                base = os.path.basename(os.path.normpath(p))
+                if base.lower() != "blendcap presets":
+                    p = os.path.join(p, "BlendCap Presets")
+                return p
+    except Exception:
+        pass
+    return ""
+
+
+# Preset locations whose folders were already created this session
+# (see presets_root). A location that gets pruned after presets move out
+# of it is forgotten again (_prune_vacated_preset_root).
+_PRESET_DIRS_READY = set()
+
+
+def presets_root():
+    """Folder holding the user's saved presets (retarget_maps/ and
+    rest_pose_presets/ subfolders): the custom location from
+    preferences if set, else the extension user folder - both survive
+    addon updates. Custom presets used to save into the addon folder
+    itself, and replacing that folder on update deleted every one.
+    Configurable SEPARATELY from the dependency location on purpose."""
+    d = _presets_custom_dir() or _presets_default_dir()
+    # The root AND its two category folders exist from the first time
+    # the location is resolved (first start after install, or the
+    # moment a custom location is picked), so presets can be copied in
+    # by hand without saving a dummy one first to get the folders.
+    # Once per location per session: this runs from panel draws.
+    key = os.path.normcase(d)
+    if key not in _PRESET_DIRS_READY:
+        try:
+            os.makedirs(d, exist_ok=True)
+            for cat in ("retarget_maps", "rest_pose_presets"):
+                os.makedirs(os.path.join(d, cat), exist_ok=True)
+            _PRESET_DIRS_READY.add(key)
+        except Exception:
+            pass
+    return d
+
+
+def preset_read_dirs(sub):
+    """Ordered list of preset folders to READ for category `sub`
+    ('retarget_maps' / 'rest_pose_presets'): the resolved save home
+    first, then the default location when a custom one is set - so
+    switching the preset location never makes anything vanish from the
+    dropdowns. Callers append their own legacy locations after these
+    and dedupe by filename (first hit wins)."""
+    dirs = [os.path.join(presets_root(), sub)]
+    default = os.path.join(_presets_default_dir(), sub)
+    if os.path.normcase(default) != os.path.normcase(dirs[0]):
+        dirs.append(default)
+    return dirs
+
+
+def _deps_default_dir():
+    """Default home for the installed dependencies (venv/, checkpoints/,
+    install_marker.json) when no custom location is set."""
+    return os.path.join(_extension_user_root(), "deps")
+
+
+def _deps_custom_dir():
+    """The custom dependency location from preferences, or ''. Read
+    defensively - preferences may be unavailable during early
+    registration or headless use. A value inside the addon folder is
+    IGNORED (treated as unset) - the prefs panel shows why in red
+    next to the field."""
+    try:
+        prefs = addon_prefs()
+        if prefs and getattr(prefs, "deps_use_custom", False):
+            p = (getattr(prefs, "deps_custom_path", "") or "").strip()
+            if p and not _inside_addon_dir(p):
+                return os.path.abspath(bpy.path.abspath(p))
+    except Exception:
+        pass
+    return ""
+
+
+def deps_uninstall_roots():
+    """Every location an installed environment could plausibly sit,
+    for Uninstall to sweep: the resolved location, the default, the
+    addon folder (legacy), and the stored custom path EVEN WHEN the
+    custom checkbox is off - unticking leaves the path in the field,
+    and an environment left behind there would otherwise survive an
+    uninstall. Deduped. (A custom path RETYPED to something else is
+    genuinely unknowable and stays uncovered - accepted.)"""
+    roots = [deps_root(), _deps_default_dir(), _addon_dir()]
+    p = _deps_stored_custom_dir()
+    if p:
+        roots.append(p)
+    out, seen = [], set()
+    for r in roots:
+        k = os.path.normcase(os.path.abspath(r))
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
+    return out
+
+
+def deps_target():
+    """Where dependencies SHOULD live per configuration (custom pref
+    or default) - as opposed to deps_root(), which is where they
+    actually are. The two differ on an unmoved legacy install or
+    after the user changes the location; the Move buttons close the
+    gap."""
+    return _deps_custom_dir() or _deps_default_dir()
+
+
+def _deps_stored_custom_dir():
+    """The custom dependency path as STORED in preferences, whether or
+    not the checkbox is ticked. Unticking the checkbox keeps the path
+    in the field, and an environment living there must stay findable -
+    otherwise unticking abandons the venv and the addon reports
+    'not installed' with everything present (live report 2026-08-30).
+    Same inside-the-addon guard as the active resolver."""
+    try:
+        prefs = addon_prefs()
+        p = ((getattr(prefs, "deps_custom_path", "") or "").strip()
+             if prefs else "")
+        if p and not _inside_addon_dir(p):
+            return os.path.abspath(bpy.path.abspath(p))
+    except Exception:
+        pass
+    return ""
+
+
+def _lp(p):
+    """Extended-length path prefix on Windows. The venv holds package
+    test-data files whose full path can cross 260 characters (measured
+    262 at the default storage location; deeper custom folders make it
+    worse) - uv writes them fine (Rust is long-path aware), but plain
+    Python file ops fail on them: an uninstall's rmtree left exactly
+    those files behind (live report 2026-08-30). Use for pure-Python
+    file IO on dependency trees; never hand these paths to Blender."""
+    if sys.platform == "win32":
+        p = os.path.abspath(p)
+        if not p.startswith("\\\\?\\"):
+            return "\\\\?\\" + p
+    return p
+
+
+# Written into a move DESTINATION before the first byte is copied and
+# removed after the last source is deleted. A folder carrying it is a
+# half-finished move (cancelled, or Blender killed mid-copy): the
+# resolver must never mistake it for an installed environment just
+# because python.exe happened to be copied early, and the next move
+# attempt wipes it and starts clean.
+MOVE_SENTINEL = ".blendcap_move_in_progress"
+
+
+def _dir_has_venv(d):
+    if os.path.isfile(os.path.join(d, MOVE_SENTINEL)):
+        return False
+    if sys.platform == "win32":
+        return os.path.isfile(os.path.join(d, "venv", "Scripts",
+                                           "python.exe"))
+    return os.path.isfile(os.path.join(d, "venv", "bin", "python"))
+
+
+# deps_root() resolution cache. The uncached path touches bpy
+# (preferences + extension_path_user), which only the main thread may
+# do - but capture/BVH monitor threads can land here through the
+# _python_exe fallback in mocap. The cache is primed at register and
+# refreshed by every operation that can change the answer (pref
+# update, install, uninstall, migration, storage move) via
+# _invalidate_deps_cache, so thread-side calls always hit the cache.
+_DEPS_ROOT_CACHE = None
+
+
+def _invalidate_deps_cache():
+    global _DEPS_ROOT_CACHE
+    _DEPS_ROOT_CACHE = None
+    try:
+        _MARKER_CACHE['key'] = None
+        _MARKER_CACHE['data'] = None
+    except NameError:
+        pass
+    try:
+        _DEPS_REV_CACHE['key'] = None
+        _DEPS_REV_CACHE['value'] = None
+    except NameError:
+        pass
+
+
+def deps_root():
+    """Folder holding the installed dependencies: venv/, checkpoints/,
+    and install_marker.json.
+
+    Resolution prefers wherever a venv ACTUALLY exists, so every
+    layout keeps working without a flag day:
+      1. the custom location from preferences (if enabled),
+      2. the default (extension user folder / deps),
+      3. the addon folder itself - the pre-1.0.6 layout, still live
+         when migration couldn't move the files (cross-volume install).
+    With no venv anywhere (fresh install) the custom location (or
+    default) is returned as the INSTALL TARGET. The addon folder is
+    deliberately last and only ever wins when a legacy venv is present:
+    new installs must never land inside the addon folder, because
+    updates replace it."""
+    global _DEPS_ROOT_CACHE
+    if _DEPS_ROOT_CACHE:
+        return _DEPS_ROOT_CACHE
+    # Preferences are not readable while register() runs (and for a
+    # moment after), so a custom folder can't be seen yet. A result
+    # computed then must NOT be cached: it would pin the default
+    # folder for the whole session, showing "Install" instead of
+    # "Reinstall" and telling capture nothing is installed, until a
+    # preference toggle happened to clear it (seen live 2026-11-05
+    # with the dependencies on an external drive).
+    prefs_readable = addon_prefs() is not None
+    custom = _deps_custom_dir()
+    candidates = ([custom] if custom else []) + [_deps_default_dir(),
+                                                 _addon_dir()]
+    # A custom path left in the UNTICKED field is still a place the
+    # files may actually be (unticking must not abandon them) - last
+    # in line, like the legacy addon folder.
+    stored = _deps_stored_custom_dir()
+    if stored and not any(os.path.normcase(stored) == os.path.normcase(c)
+                          for c in candidates):
+        candidates.append(stored)
+    resolved = None
+    for c in candidates:
+        if _dir_has_venv(c):
+            resolved = c
+            break
+    if resolved is None:
+        resolved = custom or _deps_default_dir()
+    if prefs_readable:
+        _DEPS_ROOT_CACHE = resolved
+    return resolved
+
+
+def checkpoints_dir():
+    """The downloaded model files folder."""
+    return os.path.join(deps_root(), "checkpoints")
+
+
+# Per-drive volume info cache for storage_speed_warning - the prefs
+# panel calls it every redraw, and the underlying OS query shouldn't
+# run that often.
+_VOLUME_WARNING_CACHE = {}
+
+
+def storage_speed_warning(path):
+    """Pre-operation heads-up for a storage target, or None.
+
+    Returns (kind, [lines]): kind 'slow_fs' for exFAT/FAT-family
+    volumes (pathological with the venv's ~47k small files - the
+    2026-07-31 two-hour-crawl ticket), 'removable' for removable
+    drives (fine, but it has to be present whenever BlendCap runs).
+    Best-effort: any detection failure returns None rather than
+    blocking anything."""
+    try:
+        p = os.path.abspath(bpy.path.abspath(path or ""))
+        if not p:
+            return None
+        if sys.platform == "win32":
+            drive = os.path.splitdrive(p)[0]
+            if not drive:
+                return None
+            key = os.path.normcase(drive)
+            if key in _VOLUME_WARNING_CACHE:
+                return _VOLUME_WARNING_CACHE[key]
+            import ctypes
+            root = drive + "\\"
+            fsbuf = ctypes.create_unicode_buffer(64)
+            ok = ctypes.windll.kernel32.GetVolumeInformationW(
+                ctypes.c_wchar_p(root), None, 0, None, None, None,
+                fsbuf, 64)
+            fs = fsbuf.value.upper() if ok else ""
+            dtype = ctypes.windll.kernel32.GetDriveTypeW(
+                ctypes.c_wchar_p(root))
+            result = None
+            if fs in ("EXFAT", "FAT32", "FAT"):
+                result = ("slow_fs", [
+                    f"This drive is formatted {fs}, which is very slow "
+                    f"with the",
+                    "tens of thousands of small files in the Python "
+                    "environment.",
+                    "It will work, but can take a very long time. An "
+                    "NTFS drive",
+                    "is much faster."])
+            elif dtype == 2:  # DRIVE_REMOVABLE
+                result = ("removable", [
+                    "This looks like a removable drive. It has to be "
+                    "plugged in,",
+                    "with the same drive letter, whenever BlendCap "
+                    "runs."])
+            _VOLUME_WARNING_CACHE[key] = result
+            return result
+        if sys.platform.startswith("linux"):
+            # Same per-session cache as the Windows branch (keyed on the
+            # path): this runs from the preferences draw.
+            key = p
+            if key in _VOLUME_WARNING_CACHE:
+                return _VOLUME_WARNING_CACHE[key]
+            best, fstype = "", ""
+            with open("/proc/mounts", "r") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    mnt = parts[1].replace("\\040", " ")
+                    if p.startswith(mnt) and len(mnt) > len(best):
+                        best, fstype = mnt, parts[2]
+            result = None
+            if fstype.lower() in ("vfat", "exfat", "msdos", "fat32"):
+                result = ("slow_fs", [
+                    f"This drive uses a {fstype} filesystem, which is "
+                    f"very slow",
+                    "with the tens of thousands of small files in the "
+                    "Python",
+                    "environment. It will work, but can take a very "
+                    "long time."])
+            _VOLUME_WARNING_CACHE[key] = result
+            return result
+    except Exception:
+        pass
+    return None
+
+
 def _python_exe():
-    d = _addon_dir()
+    d = deps_root()
     if sys.platform == "win32":
         return os.path.join(d, "venv", "Scripts", "python.exe")
     return os.path.join(d, "venv", "bin", "python")
@@ -314,11 +1088,25 @@ def _steam_launched():
             or "gameoverlayrenderer" in os.environ.get("LD_PRELOAD", ""))
 
 
+_VGL_FAKERS = ("libvglfaker.so", "libdlfaker.so", "libgefaker.so")
+
+
 def _subprocess_env(overrides=None):
     """Environment for installer / venv-python subprocesses.
 
-    Returns None (= inherit Blender's env unchanged, what every caller
-    passed before) unless something needs changing:
+    ALWAYS returns a dict - never None. The one setting every child
+    needs is PYTHONIOENCODING (see below), so there is no such thing as
+    "nothing to change" any more; the old early return that inherited
+    Blender's env untouched is exactly what let the child pick the
+    system code page.
+      - PYTHONIOENCODING=utf-8: pins the child's stdout/stderr encoding.
+        Both readers here already decode as utf-8, but the child used to
+        default its stdout to the system code page, so ANY non-ASCII
+        character reaching a print raised UnicodeEncodeError and killed
+        the run. Two triggers, both reported by customers: a non-UTF-8
+        console locale (cp932), and - on an ordinary English install -
+        a non-ASCII character anywhere in the video path, which the
+        cache folder name carries into every downstream path.
       - overrides: {VAR: VALUE} injected on top (capture backend pins).
       - Steam-launched Blender: the Steam runtime's library overrides
         are stripped (see _steam_launched). LD_LIBRARY_PATH is restored
@@ -326,9 +1114,18 @@ def _subprocess_env(overrides=None):
         (usually empty -> dropped); only the gameoverlayrenderer entries
         are removed from LD_PRELOAD, anything user-set is kept.
     """
-    if not overrides and not _steam_launched():
-        return None
     env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    # Where the model files live. save_mhr_data.py / save_face_data.py
+    # default to <script dir>/checkpoints, which was correct when the
+    # models lived inside the addon folder; now that dependencies live
+    # in their own storage location (deps_root) the children need to be
+    # told. Guarded: if resolution fails (exotic headless use) the var
+    # is simply absent and the children fall back to the legacy layout.
+    try:
+        env["BLENDCAP_CHECKPOINTS"] = checkpoints_dir()
+    except Exception:
+        pass
     if _steam_launched():
         orig = env.get("SYSTEM_LD_LIBRARY_PATH")
         if orig:
@@ -345,6 +1142,23 @@ def _subprocess_env(overrides=None):
             else:
                 env.pop("LD_PRELOAD", None)
         env.pop("STEAM_RUNTIME", None)
+    # VirtualGL (vglrun / TurboVNC remote-desktop GPU setups) injects its
+    # fakers through LD_PRELOAD; libdlfaker.so interposes dlopen(), and a
+    # capture child that inherits it can't load the bundled cuDNN (ORT
+    # aborts with "Invalid handle. Cannot load symbol cudnnCreate",
+    # exit -6). The children do no OpenGL, so the fakers serve no purpose
+    # there; Blender's own viewport keeps them, only the child env
+    # changes. Reported with a fix by ptrthomas 2026-07-29 (item 8).
+    pre = env.get("LD_PRELOAD")
+    if pre and any(f in pre for f in _VGL_FAKERS):
+        kept = [p for p in re.split(r"[:\s]+", pre)
+                if p and os.path.basename(p) not in _VGL_FAKERS]
+        if kept:
+            env["LD_PRELOAD"] = ":".join(kept)
+        else:
+            env.pop("LD_PRELOAD", None)
+        print("[BlendCap] VirtualGL detected: removed its dlopen fakers from "
+              "LD_PRELOAD for the helper process.")
     if overrides:
         env.update(overrides)
     return env
@@ -377,6 +1191,11 @@ def _host_spawn_prefix(directory=None, extra_env=None):
     - extra_env: {VAR: VALUE} injected on the host side. flatpak-spawn does
       not reliably forward the env set on the Popen, so capture's USE_ORT /
       BLENDCAP_FORCE_CPU / BLENDCAP_ORT_CPU must ride here.
+    - PYTHONIOENCODING=utf-8 is injected unconditionally for the same
+      reason: _subprocess_env sets it on the Popen env, which does not
+      survive the spawn, so under Flatpak it has to be re-stated here or
+      the host-side child falls back to the system code page (see
+      _subprocess_env). Caller-supplied extra_env can still override it.
 
     Requires a one-time host grant (an addon cannot edit Blender's own
     Flatpak manifest):
@@ -393,7 +1212,9 @@ def _host_spawn_prefix(directory=None, extra_env=None):
     # host; every command we launch uses absolute paths, so the working
     # directory only needs to be valid, not meaningful. $HOME always is.
     pre.append("--directory=" + (directory or os.path.expanduser("~")))
-    for k, v in (extra_env or {}).items():
+    host_env = {"PYTHONIOENCODING": "utf-8"}
+    host_env.update(extra_env or {})
+    for k, v in host_env.items():
         pre.append("--env=%s=%s" % (k, v))
     return pre
 
@@ -450,13 +1271,403 @@ def _host_spawn_ok(force=False):
     return ok
 
 
+def _installer_candidates():
+    """Where a relocated installer/ may live. Since 2026-11-05 it is
+    always the DEFAULT dependency storage on the addon's drive, even
+    when the dependencies themselves sit in a custom folder (user
+    decision: the installer is small, must still be there when an
+    external drive is unplugged, and must survive the custom folder
+    being unticked). A copy next to a custom folder, placed by earlier
+    builds, is still found second."""
+    roots = [_deps_default_dir()]
+    custom = _deps_stored_custom_dir()
+    if custom:
+        roots.append(custom)
+    return [os.path.join(r, "installer") for r in roots]
+
+
 def _installer_dir():
     """Folder holding install.ps1 / install.bat / install.sh.
 
-    Only present in PAID artifacts — the public GitHub source
+    Only present in PAID artifacts - the public GitHub source
     distribution ships the addon without it (see
-    installer_files_present below)."""
+    installer_files_present below). Since 1.1.0 the shipped installer/
+    is moved out of the addon folder into the dependency storage at
+    register (relocate_installer), so addon updates - which replace
+    the addon folder - can't delete it and the public zip served by
+    the updater leaves it alone. The addon folder is the fallback for
+    the legacy in-addon layout and for the moment between install and
+    relocation."""
+    for d in _installer_candidates():
+        if os.path.isdir(d):
+            return d
     return os.path.join(_addon_dir(), "installer")
+
+
+def relocate_installer():
+    """Move an installer/ shipped inside the addon folder into the
+    dependency storage, REPLACING whatever installer was there. The
+    copy that ships with the addon being enabled is the right one for
+    that addon version, so a paid zip installed over an existing
+    install (the normal way to update the installer) lands its new
+    scripts here on the spot. The public zip has no installer/ and
+    therefore never touches the stored one: paid stays paid through
+    public updates.
+
+    Skipped on the legacy layout (dependencies still inside the addon
+    folder): there the installer already sits where it belongs. An
+    _offline_stash/ in the old stored copy is carried over when the
+    shipped copy has none (offline-bundle users updating with an
+    online zip). Returns the destination, or None when nothing moved."""
+    src = os.path.join(_addon_dir(), "installer")
+    if not os.path.isdir(src):
+        return None
+    if os.path.isdir(os.path.join(_addon_dir(), ".git")):
+        # A developer's checkout: leave the tree alone.
+        return None
+    if _inside_addon_dir(deps_root() or ""):
+        # Legacy layout: the installer already sits where it belongs.
+        return None
+    # Always the default storage on the addon's drive, never a custom
+    # dependency folder (see _installer_candidates). Needs no
+    # preference to be readable, so the move is right at register.
+    root = _deps_default_dir()
+    dst = os.path.join(root, "installer")
+    try:
+        from .operators_pipeline import _rm_readonly
+    except Exception:
+        _rm_readonly = None
+    keep = None
+    try:
+        os.makedirs(root, exist_ok=True)
+        if os.path.isdir(dst):
+            old_stash = os.path.join(dst, "_offline_stash")
+            if (os.path.isdir(old_stash)
+                    and not os.path.isdir(os.path.join(src, "_offline_stash"))):
+                keep = os.path.join(root, "_offline_stash.keep")
+                if os.path.isdir(keep):
+                    shutil.rmtree(_lp(keep), onerror=_rm_readonly)
+                shutil.move(old_stash, keep)
+            shutil.rmtree(_lp(dst), onerror=_rm_readonly)
+            if os.path.isdir(dst):
+                raise OSError("the old installer folder could not be removed")
+        shutil.move(src, dst)
+        if keep and os.path.isdir(keep):
+            shutil.move(keep, os.path.join(dst, "_offline_stash"))
+    except Exception as e:
+        print(f"[BlendCap] installer relocation skipped: {e}")
+        return None
+    _invalidate_deps_cache()
+    _INSTALLER_VER_CACHE['key'] = None
+    print(f"[BlendCap] Installer moved out of the addon folder to {dst}")
+    return dst
+
+
+# The installer version this addon needs. Bumped with the installer
+# (installer/pyproject.toml) at release; the updater's index carries
+# the same number so the notice can say "your installer also needs
+# updating". The paid zip is the delivery route: installing it over
+# the existing copy replaces the stored installer via
+# relocate_installer.
+REQUIRED_INSTALLER_VERSION = "1.1.0"
+
+_INSTALLER_VER_CACHE = {'key': None, 'version': ""}
+
+
+def installer_version():
+    """Version from the (relocated or shipped) installer's
+    pyproject.toml, '' when absent. Stat-keyed cache: read from the
+    preferences draw."""
+    p = os.path.join(_installer_dir(), "pyproject.toml")
+    try:
+        st = os.stat(p)
+    except OSError:
+        return ""
+    key = (p, st.st_mtime_ns, st.st_size)
+    if _INSTALLER_VER_CACHE['key'] == key:
+        return _INSTALLER_VER_CACHE['version']
+    ver = ""
+    try:
+        import tomllib
+        with open(p, "rb") as f:
+            ver = str(tomllib.load(f).get("project", {}).get("version", "") or "")
+    except Exception:
+        ver = ""
+    _INSTALLER_VER_CACHE['key'] = key
+    _INSTALLER_VER_CACHE['version'] = ver
+    return ver
+
+
+def parse_version(s):
+    """Comparable tuple for '1.1.0', '1.1.0-dev', '1.0.6.dev0', 'v1.2':
+    (major, minor, patch, is_final). A final release outranks any
+    pre-release of the same number. Unparseable -> (0, 0, 0, 0)."""
+    import re
+    s = (s or "").strip().lstrip("vV")
+    m = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(.*)$", s)
+    if not m:
+        return (0, 0, 0, 0)
+    nums = tuple(int(m.group(i) or 0) for i in (1, 2, 3))
+    rest = (m.group(4) or "").strip().lower()
+    final = 0 if rest and any(t in rest for t in ("dev", "rc", "alpha",
+                                                     "beta", "a", "b",
+                                                     "-")) else 1
+    return nums + (final,)
+
+
+def installer_outdated():
+    """(installed version, required version) when the paid installer is
+    older than this addon needs; None otherwise (including when no
+    installer is present)."""
+    cur = installer_version()
+    if not cur:
+        return None
+    if parse_version(cur) < parse_version(REQUIRED_INSTALLER_VERSION):
+        return (cur, REQUIRED_INSTALLER_VERSION)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Dependency revision: "were these dependencies built for this BlendCap?"
+# ---------------------------------------------------------------------------
+# Two copies of one number. DEPS_REVISION below is what this code needs;
+# bump it at release time ONLY when requirements.txt, the installer lock
+# or the model list changes (see the note at the top of requirements.txt).
+# The other copy sits INSIDE the venv (blendcap_deps_revision.txt) and
+# says what the environment was built for. Updates replace the addon
+# folder and never touch the venv, so after an update the two can
+# differ - that is the whole signal, no runtime checking beyond reading
+# one small file. Who writes the venv copy: the installer at the end of
+# a successful run (it gets the number in BLENDCAP_DEPS_REVISION), the
+# addon the first time it sees a working environment with no stamp
+# (hand-built venvs, and every environment on the first release that
+# ships this), and the "Dependencies Rebuilt" button. Deleting and
+# recreating the venv drops the stamp with it, so a fresh hand rebuild
+# clears the banner on its own.
+DEPS_REVISION = 1
+_DEPS_STAMP_NAME = "blendcap_deps_revision.txt"
+_DEPS_REV_CACHE = {'key': None, 'value': None}
+
+
+def deps_stamp_path():
+    """The stamp file inside the venv (next to Scripts/ or bin/)."""
+    return os.path.join(os.path.dirname(os.path.dirname(_python_exe())),
+                        _DEPS_STAMP_NAME)
+
+
+def read_deps_stamp():
+    """Revision the environment was stamped with, or None when there is
+    no stamp (or it is unreadable). Stat-keyed cache: read from panel
+    draws."""
+    p = deps_stamp_path()
+    try:
+        st = os.stat(p)
+    except OSError:
+        return None
+    key = (p, st.st_mtime_ns, st.st_size)
+    if _DEPS_REV_CACHE['key'] == key:
+        return _DEPS_REV_CACHE['value']
+    val = None
+    try:
+        with open(p, encoding="utf-8") as f:
+            val = int(f.read().strip())
+    except Exception:
+        val = None
+    _DEPS_REV_CACHE['key'] = key
+    _DEPS_REV_CACHE['value'] = val
+    return val
+
+
+def write_deps_stamp(revision=None):
+    """Stamp the venv with DEPS_REVISION (or the given number). False
+    when nothing is installed or the file can't be written."""
+    if not is_dependencies_installed():
+        return False
+    try:
+        with open(deps_stamp_path(), "w", encoding="utf-8") as f:
+            f.write(f"{DEPS_REVISION if revision is None else int(revision)}\n")
+    except OSError:
+        return False
+    _DEPS_REV_CACHE['key'] = None
+    return True
+
+
+def deps_outdated():
+    """(stamped revision, required revision) when the installed
+    environment was built for an earlier BlendCap; None when it is
+    current, unstamped, or not installed."""
+    if not is_dependencies_installed():
+        return None
+    stamped = read_deps_stamp()
+    if stamped is None or stamped >= DEPS_REVISION:
+        return None
+    return (stamped, DEPS_REVISION)
+
+
+def install_incomplete():
+    """True when a paid copy has a venv but the installer never reached
+    its final phase: the marker next to the venv says "running" (written
+    at the start of every run since 1.1.0), or there is no marker at all.
+    A half-built venv passes is_dependencies_installed (deliberately, see
+    constraint 40 there), so this is what tells the UI to say "the last
+    install didn't finish" instead of "Dependencies installed". Source
+    copies (no installer) are never flagged: their venv is hand-built and
+    has no marker by design."""
+    try:
+        if not installer_files_present() or not is_dependencies_installed():
+            return False
+        marker = read_install_marker()
+        if marker is None:
+            return True
+        return str(marker.get("status", "")).lower() != "success"
+    except Exception:
+        return False
+
+
+INSTALL_INCOMPLETE_NOTE = (
+    "The last dependency install didn't finish. If the installer window "
+    "is still running, wait for it; otherwise click Reinstall Dependencies "
+    "to continue where it stopped (finished downloads are kept). Capture "
+    "will fail until the install completes.")
+
+
+def stamp_deps_if_unstamped():
+    """Startup: a working environment with no stamp gets the current
+    revision. One write per environment, ever."""
+    try:
+        if is_dependencies_installed() and read_deps_stamp() is None:
+            write_deps_stamp()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Windows Smart App Control
+# ---------------------------------------------------------------------------
+# Smart App Control (Windows 11) only allows files Microsoft's cloud
+# recognises; the capture engine's open-source binaries (Python, torch,
+# onnxruntime...) are not signed by Microsoft, so when it is ENFORCING
+# it blocks them, and Blender's own extension installer too (its ctypes
+# DLL). Windows currently offers no per-app exception. Windows records the state in
+# the registry: 0 off, 1 on (enforcing), 2 evaluation (not blocking).
+# One registry read, cached for the session; refreshed at startup, when
+# the user clicks Install/Reinstall, and from the notice's Check Again
+# button. It only ever switches itself on after a Windows update, i.e.
+# a reboot, so a startup read is current for the session.
+_SAC_CACHE = {'state': None}
+SAC_FIX = ("Go to Windows Security > App & browser control > Smart App "
+           "Control settings > Off")
+SAC_ANTIVIRUS = ("This is separate from your antivirus, which will keep "
+                 "running as usual.")
+SAC_INFO_NOTE = ("Smart App Control is on. It checks each file against "
+                 "Microsoft's cloud and can block parts of BlendCap's capture "
+                 "engine, which is built from open-source components that "
+                 "Microsoft hasn't signed. It can also slow captures down and "
+                 "cause hard to predict behaviour. Turning it off is "
+                 "recommended: " + SAC_FIX + ". " + SAC_ANTIVIRUS)
+SAC_ALERT_NOTE = ("Smart App Control has blocked part of BlendCap's capture "
+                  "engine. You will need to turn it off in order to run "
+                  "BlendCap: " + SAC_FIX + ". " + SAC_ANTIVIRUS)
+SAC_EVAL_NOTE = ("Windows is currently deciding whether to turn on Smart App "
+                 "Control. If it turns on, it will block BlendCap's capture "
+                 "engine, and BlendCap will tell you. To avoid the "
+                 "interruption, you can turn it off now: " + SAC_FIX + ".")
+
+
+def smart_app_control_state(refresh=False):
+    """'ON' (enforcing), 'EVAL', 'OFF', or '' (not Windows / unreadable)."""
+    if _SAC_CACHE['state'] is not None and not refresh:
+        return _SAC_CACHE['state']
+    # Testing override, development builds only (same pattern as the
+    # update index override): a user can never put Smart App Control
+    # back into evaluation mode, so the notices for ON / EVAL can only
+    # be seen this way once it has been turned off.
+    forced = os.environ.get("BLENDCAP_SAC_STATE", "").strip().upper()
+    if forced in ('ON', 'EVAL', 'OFF'):
+        try:
+            from .updater import is_dev_build
+            if is_dev_build():
+                _SAC_CACHE['state'] = forced
+                return forced
+        except Exception:
+            pass
+    state = ''
+    if sys.platform == "win32":
+        try:
+            import winreg   # built into python's DLL, not a .pyd
+            with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SYSTEM\CurrentControlSet\Control\CI\Policy") as k:
+                v, _t = winreg.QueryValueEx(
+                    k, "VerifiedAndReputablePolicyState")
+            state = {0: 'OFF', 1: 'ON', 2: 'EVAL'}.get(int(v), '')
+        except Exception:
+            state = ''
+    _SAC_CACHE['state'] = state
+    return state
+
+
+def smart_app_control_on(refresh=False):
+    """True when Smart App Control is enforcing. Being on is a RISK, not
+    a certainty: it decides per file by reputation, and files it has
+    seen enough of get through (a capture ran fine on an enforcing
+    machine 2026-10-30, two days after the same python was refused)."""
+    return smart_app_control_state(refresh) == 'ON'
+
+
+_SAC_SEEN_FALLBACK = {'seen': False}   # when preferences aren't reachable
+
+
+def sac_block_seen():
+    """Has this machine actually had a file blocked (a capture / BVH run
+    dying with 0xC0E90002 or the 'Application Control policy' text, or
+    Blender's installer unable to load its ctypes DLL)? Remembered in
+    preferences so the alert survives a restart; forgotten when a
+    capture succeeds or Check Again finds the setting off."""
+    try:
+        prefs = addon_prefs()
+        if prefs is not None:
+            return bool(getattr(prefs, "sac_block_seen", False))
+    except Exception:
+        pass
+    return _SAC_SEEN_FALLBACK['seen']
+
+
+def set_sac_block_seen(flag):
+    _SAC_SEEN_FALLBACK['seen'] = bool(flag)
+    try:
+        prefs = addon_prefs()
+        if prefs is not None and bool(getattr(prefs, "sac_block_seen", False)) != bool(flag):
+            prefs.sac_block_seen = bool(flag)
+    except Exception:
+        pass
+
+
+def smart_app_control_blocking(refresh=False):
+    """The ALERT: Smart App Control is enforcing AND it has actually
+    blocked something here. Drives the red note, the sidebar strip and
+    the greyed install buttons. Off (any state) clears the memory."""
+    if smart_app_control_state(refresh) != 'ON':
+        if sac_block_seen():
+            set_sac_block_seen(False)
+        return False
+    return sac_block_seen()
+
+
+def sac_blocks_this_process():
+    """Ground truth for Update Now: can Blender's extension installer
+    load the ctypes DLL it needs? Tries the import (cached by Python
+    once it succeeds, so this costs nothing after the first call)."""
+    try:
+        import ctypes  # noqa: F401
+        return False
+    except ImportError as e:
+        blocked = "Application Control" in str(e) or smart_app_control_on()
+        if blocked:
+            set_sac_block_seen(True)   # an observed block
+        return blocked
+    except Exception:
+        return False
 
 
 def _license_path(filename):
@@ -509,8 +1720,23 @@ def is_paid_build():
 
 
 def _install_marker_path():
-    """install_marker.json, written by the installer's final phase."""
+    """install_marker.json, written by the installer's final phase.
+    Lives next to the venv it describes (deps_root); pre-1.0.6
+    installers wrote it into installer/ inside the addon folder -
+    read_install_marker still falls back there so an unmigrated
+    install keeps its recorded GPU/version details."""
+    return os.path.join(deps_root(), "install_marker.json")
+
+
+def _install_marker_path_legacy():
     return os.path.join(_installer_dir(), "install_marker.json")
+
+
+# read_install_marker() is called from the preferences draw (twice per
+# redraw) - keep the parsed file keyed on (path, mtime, size) so a
+# redraw costs a stat, not an open + json.load. Self-invalidating when
+# the installer rewrites the file; _invalidate_deps_cache clears it too.
+_MARKER_CACHE = {'key': None, 'data': None}
 
 
 def read_install_marker():
@@ -519,18 +1745,335 @@ def read_install_marker():
     The installer writes this from PowerShell, which on 5.1 can emit a
     UTF-8 BOM (or UTF-16); try a few encodings before giving up so a
     perfectly valid marker isn't missed over an encoding quirk."""
-    p = _install_marker_path()
-    if not os.path.isfile(p):
-        return None
-    for enc in ("utf-8-sig", "utf-16", "utf-8"):
+    for p in (_install_marker_path(), _install_marker_path_legacy()):
         try:
-            with open(p, "r", encoding=enc) as f:
-                return json.load(f)
-        except (UnicodeError, ValueError):
+            st = os.stat(p)
+        except OSError:
             continue
-        except Exception:
-            return None
+        key = (p, st.st_mtime_ns, st.st_size)
+        if _MARKER_CACHE['key'] == key:
+            data = _MARKER_CACHE['data']
+            return dict(data) if data is not None else None
+        data = None
+        for enc in ("utf-8-sig", "utf-16", "utf-8"):
+            try:
+                with open(p, "r", encoding=enc) as f:
+                    data = json.load(f)
+                break
+            except (UnicodeError, ValueError):
+                continue
+            except Exception:
+                data = None
+                break
+        _MARKER_CACHE['key'] = key
+        _MARKER_CACHE['data'] = data
+        return dict(data) if data is not None else None
     return None
+
+
+def deps_in_addon_folder():
+    """True when dependency files still sit inside the addon folder -
+    the pre-1.0.6 layout, which the next update would wipe. Drives the
+    warning + Move button in preferences. True both when the addon
+    folder IS the live deps location (migration couldn't move, e.g.
+    cross-volume) and when a stale copy lingers there next to a live
+    one elsewhere."""
+    try:
+        return _dir_has_venv(_addon_dir())
+    except Exception:
+        return False
+
+
+def _files_identical(a, b):
+    """Byte-compare two small files; False on any read problem."""
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read() == fb.read()
+    except Exception:
+        return False
+
+
+def _migrate_preset_tree(src_dir, dst_dir, skip_filenames=(),
+                         skip_subdir=None, bundled_dir=None, log=None):
+    """Move every custom .json under src_dir into dst_dir, preserving
+    subfolder structure. Shipped filenames and the shipped subtree are
+    skipped. A file whose basename also exists in bundled_dir and is
+    byte-identical to it is a drag-merge leftover of a shipped preset
+    that moved - deleted, not migrated. Destination collisions: an
+    identical file drops the source; a differing one moves in under a
+    '_migrated' suffix so nothing is silently lost."""
+    if not os.path.isdir(src_dir):
+        return 0
+    moved = 0
+    for root, dirs, files in os.walk(src_dir):
+        if skip_subdir:
+            dirs[:] = [d for d in dirs
+                       if os.path.join(root, d) != skip_subdir]
+        for fn in files:
+            if not fn.endswith(".json") or fn in skip_filenames:
+                continue
+            src = os.path.join(root, fn)
+            if bundled_dir:
+                shipped_twin = os.path.join(bundled_dir, fn)
+                if (os.path.isfile(shipped_twin)
+                        and _files_identical(src, shipped_twin)):
+                    try:
+                        os.remove(src)
+                        if log is not None:
+                            log.append(f"removed stale shipped copy {fn}")
+                    except Exception:
+                        pass
+                    continue
+            rel = os.path.relpath(src, src_dir)
+            dst = os.path.join(dst_dir, rel)
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.exists(dst):
+                    if _files_identical(src, dst):
+                        os.remove(src)
+                        continue
+                    # Differing twin: keep both. _migrated, then
+                    # _migrated2, 3... for repeated moves; a copy
+                    # identical to one already moved is dropped instead.
+                    stem, ext = os.path.splitext(dst)
+                    dst = None
+                    for i in range(1, 100):
+                        cand = stem + ("_migrated" if i == 1
+                                       else f"_migrated{i}") + ext
+                        if not os.path.exists(cand):
+                            dst = cand
+                            break
+                        if _files_identical(src, cand):
+                            break
+                    if dst is None:
+                        os.remove(src)
+                        continue
+                shutil.move(src, dst)
+                moved += 1
+                if log is not None:
+                    log.append(f"moved {rel}")
+            except Exception as e:
+                if log is not None:
+                    log.append(f"FAILED to move {rel}: {e}")
+    return moved
+
+
+def _legacy_preset_sources():
+    """(src_dir, category, skip_filenames, skip_subdir, bundled_dir)
+    for every LEGACY location that can hold custom presets an update
+    would delete or that should consolidate into presets_root():
+    the addon's own two folders, and the ancient CONFIG-dir maps."""
+    from .retarget.preset_io import (SHIPPED_PRESET_FILENAMES,
+                                     _retarget_maps_dir_legacy_config)
+    a = _addon_dir()
+    rm = os.path.join(a, "retarget_maps")
+    rp = os.path.join(a, "rest_pose_presets")
+    return [
+        (rm, "retarget_maps", SHIPPED_PRESET_FILENAMES,
+         os.path.join(rm, "blendcap_standard"), None),
+        (rp, "rest_pose_presets", frozenset(),
+         os.path.join(rp, "bundled"), os.path.join(rp, "bundled")),
+        (_retarget_maps_dir_legacy_config(), "retarget_maps",
+         SHIPPED_PRESET_FILENAMES, None, None),
+    ]
+
+
+def _count_presets_in(src_dir, skip_filenames=(), skip_subdir=None):
+    if not os.path.isdir(src_dir):
+        return 0
+    n = 0
+    for root, dirs, files in os.walk(src_dir):
+        if skip_subdir:
+            dirs[:] = [d for d in dirs
+                       if os.path.join(root, d) != skip_subdir]
+        n += sum(1 for fn in files
+                 if fn.endswith(".json") and fn not in skip_filenames)
+    return n
+
+
+def pending_user_data_moves():
+    """{'presets': n, 'deps': bool} - what still sits inside the addon
+    folder, where an update can delete it. Drives the startup consent
+    dialog (fires every launch until this is empty; NOTHING moves
+    without the user choosing) and the prefs warnings. Only the
+    ADDON-folder locations count as at-risk; the old CONFIG-dir maps
+    are safe from updates and merely consolidate on a Move."""
+    n = 0
+    for src, _cat, skip, skip_subdir, _b in _legacy_preset_sources():
+        if not _inside_addon_dir(src):
+            continue
+        n += _count_presets_in(src, skip, skip_subdir)
+    return {"presets": n, "deps": _dir_has_venv(_addon_dir())}
+
+
+def presets_need_move():
+    """True when any readable preset location other than the current
+    save home still holds custom presets - the addon folder (at risk)
+    or, after a location change, the default/CONFIG folders
+    (consolidation). Shows the Move Presets button."""
+    target = presets_root()
+    for src, _cat, skip, skip_subdir, _b in _legacy_preset_sources():
+        if os.path.normcase(src) == os.path.normcase(target):
+            continue
+        if _count_presets_in(src, skip, skip_subdir):
+            return True
+    default = _presets_default_dir()
+    if os.path.normcase(default) != os.path.normcase(presets_root()):
+        for sub in ("retarget_maps", "rest_pose_presets"):
+            if _count_presets_in(os.path.join(default, sub)):
+                return True
+    return False
+
+
+def move_user_presets(log=None):
+    """Move every custom preset into presets_root() - out of the
+    addon folder (the at-risk case) and out of any other readable
+    location (consolidation after a location change). Returns the
+    number of files moved. Runs ONLY on user consent (the startup
+    dialog's move buttons or Move Presets in prefs) - never
+    automatically. Small files; synchronous is fine."""
+    target = presets_root()
+    moved = 0
+    for src, cat, skip, skip_subdir, bundled in _legacy_preset_sources():
+        if os.path.normcase(src) == os.path.normcase(target):
+            continue
+        moved += _migrate_preset_tree(
+            src, os.path.join(target, cat),
+            skip_filenames=skip, skip_subdir=skip_subdir,
+            bundled_dir=bundled, log=log)
+    default = _presets_default_dir()
+    if os.path.normcase(default) != os.path.normcase(target):
+        for cat in ("retarget_maps", "rest_pose_presets"):
+            moved += _migrate_preset_tree(
+                os.path.join(default, cat),
+                os.path.join(target, cat), log=log)
+    return moved
+
+
+# Last-known preset root, so a location change knows where to move
+# FROM. Primed at register; refreshed by every relocation.
+_CURRENT_PRESETS_ROOT = None
+
+
+def _track_presets_root():
+    global _CURRENT_PRESETS_ROOT
+    _CURRENT_PRESETS_ROOT = presets_root()
+
+
+def _prune_vacated_preset_root(old_root):
+    """After presets move OUT of a location, remove the folders they
+    leave behind - but ONLY empty ones, and only folders that are
+    ours: empty dirs under the old root's two category folders, the
+    category folders themselves, and finally the root - that last one
+    only when it's literally named 'BlendCap Presets' (never the
+    user's own parent folder, and never the default root, which is
+    BlendCap's home inside Blender's config). Anything the user put
+    there makes a folder non-empty and everything above it stays."""
+    try:
+        if not old_root or not os.path.isdir(old_root):
+            return
+        if (os.path.normcase(os.path.abspath(old_root))
+                == os.path.normcase(os.path.abspath(
+                    _presets_default_dir()))):
+            return
+        for cat in ("retarget_maps", "rest_pose_presets"):
+            d = os.path.join(old_root, cat)
+            if not os.path.isdir(d):
+                continue
+            # Bottom-up: empty subfolders first, then the category dir.
+            for root, dirs, files in os.walk(d, topdown=False):
+                if not os.listdir(root):
+                    os.rmdir(root)
+        if (os.path.basename(os.path.normpath(old_root)).lower()
+                == "blendcap presets" and not os.listdir(old_root)):
+            os.rmdir(old_root)
+    except Exception:
+        pass  # cleanup is a courtesy - never let it break the move
+    # Its folders may be gone now: create them again if this location is
+    # ever chosen again.
+    try:
+        _PRESET_DIRS_READY.discard(os.path.normcase(old_root))
+    except Exception:
+        pass
+
+
+def on_presets_location_changed():
+    """Choosing a preset location IS the move (presets are tiny and
+    instant - unlike the dependencies, which get an explicit button).
+    Called by the preset-location preference updates: consolidates
+    from the previous root, the default, and every legacy location
+    into the new root. No-op when the resolved root didn't change
+    (e.g. an invalid path that resolution ignores)."""
+    global _CURRENT_PRESETS_ROOT
+    old = _CURRENT_PRESETS_ROOT
+    new = presets_root()
+    if old and os.path.normcase(old) == os.path.normcase(new):
+        print(f"[BlendCap] preset location unchanged ({new})")
+        return 0
+    log = []
+    moved = 0
+    if old and os.path.isdir(old):
+        for cat in ("retarget_maps", "rest_pose_presets"):
+            moved += _migrate_preset_tree(
+                os.path.join(old, cat), os.path.join(new, cat),
+                log=log)
+    moved += move_user_presets(log=log)
+    _CURRENT_PRESETS_ROOT = new
+    _prune_vacated_preset_root(old)
+    print(f"[BlendCap] preset location changed:")
+    print(f"[BlendCap]   from: {old}")
+    print(f"[BlendCap]   to:   {new}")
+    print(f"[BlendCap]   moved {moved} file(s)")
+    for line in log:
+        print("[BlendCap]   " + line)
+    return moved
+
+
+def scan_user_data():
+    """Register-time scan. Deliberately moves NO user data - moving is
+    consent-only (the startup dialog / prefs Move buttons). The single
+    automatic action here
+    is deleting drag-merge leftovers of the SHIPPED rest poses:
+    top-level copies of files that moved into bundled/, deleted only
+    when byte-identical to the bundled original (shipped content
+    cleanup, not user data). Returns pending_user_data_moves() so
+    register can decide whether to arm the consent dialog."""
+    try:
+        rp = os.path.join(_addon_dir(), "rest_pose_presets")
+        bundled = os.path.join(rp, "bundled")
+        if os.path.isdir(rp) and os.path.isdir(bundled):
+            for fn in os.listdir(rp):
+                if not fn.endswith(".json"):
+                    continue
+                stale = os.path.join(rp, fn)
+                twin = os.path.join(bundled, fn)
+                if (os.path.isfile(stale) and os.path.isfile(twin)
+                        and _files_identical(stale, twin)):
+                    os.remove(stale)
+                    print(f"[BlendCap] removed stale copy of shipped "
+                          f"preset {fn} (now in bundled/)")
+    except Exception:
+        pass
+    return pending_user_data_moves()
+
+
+def deps_unreachable_path():
+    """The configured custom dependency folder when it CANNOT BE
+    REACHED (typically an unplugged external drive) and no environment
+    exists anywhere else - else ''. Discriminates the two not-installed
+    stories: a reachable-but-empty folder is a normal fresh install,
+    while an unreachable one means the files probably exist and the
+    drive is simply absent - telling that user to 'Install
+    Dependencies' would send them into an 11 GB re-download instead of
+    plugging a cable back in (support-cost decision 2026-08-30)."""
+    if is_dependencies_installed():
+        return ""
+    p = _deps_stored_custom_dir()
+    if p and not os.path.isdir(p):
+        return p
+    return ""
 
 
 def is_dependencies_installed():
@@ -645,6 +2188,77 @@ def _strip_visible_end(strip):
         warnings.simplefilter("ignore", DeprecationWarning)
         return int(getattr(strip, 'frame_final_end', _strip_visible_start(strip) + 1))
 
+def _linked_sound_strip(seq_ed, strip):
+    """SOUND strip that belongs to a MOVIE strip — the inverse of
+    _linked_video_strip, same resolution order: the 5.2+ connection
+    made at import time first, then a same-source-file match with ties
+    broken by identical visible start. Ambiguous = None, never guess."""
+    if strip is None or getattr(strip, "type", "") != 'MOVIE':
+        return None
+    for other in (getattr(strip, "connections", None) or ()):
+        if getattr(other, "type", "") == 'SOUND':
+            return other
+    src = getattr(strip, "filepath", "") or str(strip.get("blendcap_source", ""))
+    if not src:
+        return None
+    src = os.path.normpath(bpy.path.abspath(src))
+    seq_all, _ = _seq_accessors(seq_ed)
+    matches = []
+    for s in seq_all:
+        if getattr(s, "type", "") != 'SOUND':
+            continue
+        snd = getattr(s, "sound", None)
+        sp = getattr(snd, "filepath", "") if snd is not None else ""
+        if sp and os.path.normpath(bpy.path.abspath(sp)) == src:
+            matches.append(s)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        vis = _strip_visible_start(strip)
+        tied = [s for s in matches if _strip_visible_start(s) == vis]
+        if len(tied) == 1:
+            return tied[0]
+    return None
+
+
+def _strip_slip(strip, delta):
+    """Slide a strip's CONTENT under its fixed timeline window (a slip
+    edit): +N shows N source-frames later at every timeline frame. The
+    visible range does not move, so channels, cuts, and neighbours are
+    untouched. Returns the leftover frames it could NOT slip because
+    the strip ran out of trimmed-off footage in that direction — the
+    caller decides whether to fall back to physically moving the strip.
+    """
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        off_s = int(getattr(strip, "frame_offset_start", 0))
+        off_e = int(getattr(strip, "frame_offset_end", 0))
+        applied = max(-off_s, min(int(delta), off_e))
+        if applied:
+            strip.frame_offset_start = off_s + applied
+            strip.frame_offset_end = off_e - applied
+            strip.frame_start = int(strip.frame_start) - applied
+    return int(delta) - applied
+
+
+def _strip_frame_start(strip):
+    """Read a strip's frame_start, suppressing the 5.1+ deprecation warning."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return int(getattr(strip, 'frame_start', 0))
+
+def _strip_set_frame_start(strip, value):
+    """Slide a strip along the timeline. Same deprecation suppression as
+    the readers above — frame_start is deprecated from Blender 5.1 and
+    slated for removal in 6.0, and there is no replacement that moves a
+    strip without also changing its trim."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        strip.frame_start = int(value)
+
 def _delete_armature_in_place(obj):
     """Delete an armature object plus its data block and any solo-owned
     action. Idempotent — no-op if obj is None or not an armature.
@@ -664,6 +2278,55 @@ def _delete_armature_in_place(obj):
         bpy.data.armatures.remove(armature_data)
     if action is not None and action.users == 0:
         bpy.data.actions.remove(action)
+
+
+_BVH_IMPORTER_SUFFIX = "io_anim_bvh"
+
+
+def _bvh_importer_module():
+    """Module name of Blender's bundled BVH importer, or None if this
+    Blender build doesn't have it at all.
+
+    Matched by SUFFIX, never hardcoded: it ships as a core add-on named
+    "io_anim_bvh" in every version BlendCap supports (verified on disk
+    for 4.2 / 4.3 / 4.4 / 4.5 / 5.2, all under scripts/addons_core), but
+    extension-style installs prefix the module path, so an exact-name
+    lookup would silently read as "absent" there.
+    """
+    try:
+        import addon_utils
+        for mod in addon_utils.modules():
+            name = getattr(mod, "__name__", "")
+            if name == _BVH_IMPORTER_SUFFIX or name.endswith(
+                    "." + _BVH_IMPORTER_SUFFIX):
+                return name
+    except Exception:
+        pass
+    return None
+
+
+def bvh_importer_state():
+    """Whether Blender can import a BVH right now. Three states, because
+    they need three different answers:
+
+      'OK'       - registered, nothing to do.
+      'DISABLED' - the add-on is present but switched off. This is the
+                   common one by a wide margin (five tickets in sixteen
+                   days, one refund) and we can fix it in one click.
+      'ABSENT'   - not in this Blender build at all. We cannot fix it,
+                   so we must NOT block the export: the BVH file itself
+                   is still worth producing so the user can import it
+                   elsewhere.
+
+    'OK' keys off the registered operator type rather than the add-on's
+    enabled flag - the operator is what _import_bvh actually calls, and
+    it is what goes missing (bpy.ops raises AttributeError: "Calling
+    operator bpy.ops.import_anim.bvh error, could not be found", which
+    is verbatim what customers pasted).
+    """
+    if hasattr(bpy.types, "IMPORT_ANIM_OT_bvh"):
+        return 'OK'
+    return 'DISABLED' if _bvh_importer_module() else 'ABSENT'
 
 
 def _import_bvh(filepath, armature_name=None):
@@ -1115,10 +2778,25 @@ def _file_mode_source(context):
     naming) resolves through here so they can't disagree.
     """
     props = context.scene.blendcap_props
-    field = bpy.path.abspath(props.video_path) if props.video_path else ""
     obj = context.active_object
     empty = (obj if obj and obj.type == 'EMPTY' and "blendcap_source" in obj
              else None)
+    from . import multicam
+    if multicam.is_multi_mode(props):
+        # Multi-Camera Capture from File Path: the take is the clips
+        # selected in the panel (multicam.py), not the single Video
+        # field. Same rule as below: the active plane carries the
+        # identity unless the panel now holds a DIFFERENT take.
+        infos = multicam.file_infos(props)
+        take = multicam.files_clip_id(infos) if len(infos) >= 2 else ""
+        if empty is not None and (
+                not take
+                or str(empty.get("blendcap_source_strip", "") or "") == take):
+            return bpy.path.abspath(str(empty["blendcap_source"])), empty
+        if take:
+            return bpy.path.abspath(str(infos[0]["path"])), None
+        return "", None
+    field = bpy.path.abspath(props.video_path) if props.video_path else ""
     if empty is None:
         return field, None
     stored = bpy.path.abspath(str(empty["blendcap_source"]))
@@ -1237,6 +2915,77 @@ def source_mode_error(context):
             "Video Sequencer, or switch Source to 'File Path'.")
 
 
+# ------------------------------------------------------------
+# BVH names
+# ------------------------------------------------------------
+# A BVH (and the armature imported from it) is named after its capture
+# plus letters for what is in it: B body, H hands, R root motion, F
+# face. A multi-camera take puts its number of cameras in front of the
+# letters ("4c"), and a person of a multi-person capture comes before
+# that (the user's scheme, 2026-11-25: "So the filenames don't get any
+# longer than they need to be"):
+#
+#   the capture (clip id)     the name
+#   Demo                      Demo_BHR
+#   Demo_4cam                 Demo_4cBHR
+#   Demo_P2                   Demo_P2_BHR
+#   Demo_4cam_P2              Demo_P2_4cBHR
+#
+# Until then the name was the clip id plus the letters
+# (Demo_4cam_BHR, Demo_4cam_P2_BHR); names of that shape are still
+# read. The CAPTURE keeps its id (its cache folder, the rig's
+# blendcap_source_video): only the name is shorter. bvh_stem makes a
+# name; stem_parts and stem_clip read one back.
+_TAKE_CLIP = re.compile(r"^(?P<base>.+)_(?P<cams>[1-9]\d*)cam(?P<person>_P\d+)?$")
+_STEM_TAGS = re.compile(r"^(?:(?P<cams>[1-9]\d*)c)?(?P<codes>[BHRF]+)$")
+_PERSON_TAIL = re.compile(r"^(?P<base>.+)(?P<person>_P\d+)$")
+
+
+def bvh_stem(clip, codes):
+    """The name of a capture's BVH holding `codes` (letters of BHRF;
+    "" gives what all of its names start with)."""
+    m = _TAKE_CLIP.match(clip or "")
+    if m:
+        return f"{m.group('base')}{m.group('person') or ''}_{m.group('cams')}c{codes}"
+    return f"{clip}_{codes}"
+
+
+def stem_parts(stem):
+    """One clip's part of a BVH name read back: (the clip ids it can
+    stand for, the likeliest first; its letters), or None when it does
+    not follow the naming. Two clip ids come back for a name like
+    Demo_P2_4cBHR, which is person 2 of the take Demo_4cam and would
+    also be the take of a clip that is itself called Demo_P2."""
+    head, sep, tags = (stem or "").rpartition("_")
+    m = _STEM_TAGS.match(tags) if (sep and head) else None
+    if m is None:
+        return None
+    cams = m.group("cams")
+    if not cams:
+        return [head], m.group("codes")
+    clips = []
+    p = _PERSON_TAIL.match(head)
+    if p:
+        clips.append(f"{p.group('base')}_{cams}cam{p.group('person')}")
+    clips.append(f"{head}_{cams}cam")
+    return clips, m.group("codes")
+
+
+def stem_clip(stem, cache_dir=None):
+    """The clip id one clip's part of a BVH name stands for, or None.
+    Where it can be read two ways (stem_parts), the one whose capture
+    is in the cache."""
+    got = stem_parts(stem)
+    if got is None:
+        return None
+    clips = got[0]
+    if len(clips) > 1 and cache_dir:
+        for clip in clips:
+            if os.path.isdir(os.path.join(cache_dir, f"Capture_{clip}")):
+                return clip
+    return clips[0]
+
+
 def _strip_capture_prefix(folder):
     """Strip the leading 'Capture_' prefix from a cache folder name to
     get the bare clip identifier. Used both for user-visible dropdown
@@ -1309,9 +3058,19 @@ def _sanitize_clip_name(name):
     return out.strip().strip('_')
 
 
+def _is_multi_mode(props):
+    from . import multicam
+    return multicam.is_multi_mode(props)
+
+
 def _resolve_clip_name(context):
     """Bare clip identifier (sanitized) used to build cache folder and
     proxy strip names.
+
+    A Multi-Camera Capture needs nothing special here: its multiview
+    strip is stamped with the capture's clip id (blendcap/multicam.py)
+    like any capture overlay, and the merged NPZ sits at the top level
+    of that folder exactly where a single capture's would.
 
     The Capture_ / Preview_ prefix is applied at the call site so this
     function returns just the source-side identifier.
@@ -1335,6 +3094,10 @@ def _resolve_clip_name(context):
             stored = str(empty.get("blendcap_source_strip", "") or "")
             # Stored stamps are already extension-stripped at write time.
             raw = stored or _strip_media_extension(empty.name)
+        elif vp and _is_multi_mode(props):
+            # the take selected in the panel (see _file_mode_source)
+            from . import multicam
+            raw = multicam.files_clip_id(multicam.file_infos(props))
         elif vp:
             base = os.path.basename(vp.rstrip(os.sep))
             stem = os.path.splitext(base)[0]

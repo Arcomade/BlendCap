@@ -13,12 +13,66 @@
 #   Anything else     -> CPUExecutionProvider    (slow fallback)
 
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 import torch
 from torch import nn
+
+
+# -- NVIDIA wheel library preload (Linux) ------------------------------
+# ORT dlopen()s libcudnn_graph.so.9 / libcublas.so.12 etc. by soname. In
+# the bundled venv those ship in site-packages/nvidia/*/lib, which is NOT
+# on the dynamic linker's search path, so on Linux the load aborts the
+# process:
+#
+#   Unable to load any of {libcudnn_graph.so.9.7, libcudnn_graph.so.9, ...}
+#   Invalid handle. Cannot load symbol cudnnCreate      -> SIGABRT (exit -6)
+#
+# torch preloads its own bundled CUDA libs this way; ORT does not, which
+# is why a torch-only run succeeds and the first ORT session kills the
+# capture. Loading them RTLD_GLOBAL registers each soname in the process,
+# so ORT's later dlopen()-by-name resolves against the already-loaded
+# copy. Contributed by ptrthomas (AWS EC2 Ubuntu + NVIDIA, 2026-07-29),
+# support item 8.
+#
+# Linux only: Windows resolves via DLL directories, macOS has no CUDA.
+# Set BLENDCAP_NO_CUDA_PRELOAD=1 to skip.
+_nvidia_preloaded = False
+
+
+def _preload_nvidia_libs() -> None:
+    """Make the venv's NVIDIA wheel libs resolvable by soname. Idempotent."""
+    global _nvidia_preloaded
+    if _nvidia_preloaded or not sys.platform.startswith("linux"):
+        return
+    if os.environ.get("BLENDCAP_NO_CUDA_PRELOAD", "0") == "1":
+        _nvidia_preloaded = True
+        return
+    try:
+        import ctypes
+        import glob
+        import sysconfig
+
+        nvidia_root = os.path.join(sysconfig.get_paths()["purelib"], "nvidia")
+        # cudnn last so its deps (cuda_runtime, nvrtc, nvjitlink, cublas)
+        # are in already; each CDLL is best-effort because not every EP
+        # needs every lib.
+        for pkg in ("cuda_runtime", "cuda_nvrtc", "nvjitlink", "cublas",
+                    "cufft", "curand", "cusolver", "cusparse", "cudnn"):
+            for so in sorted(glob.glob(os.path.join(nvidia_root, pkg, "lib", "*.so*"))):
+                try:
+                    ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+    except Exception:
+        pass  # never block the capture; ORT falls back to CPU and reports why
+    _nvidia_preloaded = True
+
+
+_preload_nvidia_libs()
 
 
 # Priority order — ORT picks the first available EP from this list.

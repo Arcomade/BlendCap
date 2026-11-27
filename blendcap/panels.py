@@ -12,12 +12,26 @@ from .helpers import (
     _strip_visible_start, _strip_visible_end, addon_prefs,
     is_paid_build, _active_video_strip,
 )
+from . import multicam
+from . import people_ui
+from . import scene_camera
 
 # Channel detection lives in helpers.is_paid_build (shared with the
 # prefs panel's installer checks so the two can never drift). Evaluated
 # once at addon registration; editable by hand if a build ever needs to
 # force it either way.
 SHOW_DONATE_BUTTON = not is_paid_build()
+
+
+def refresh_donate_flag():
+    """Recompute after register: the installer may have just been moved
+    out of the addon folder (helpers.relocate_installer), and preferences
+    (a custom dependency folder) weren't readable at import time."""
+    global SHOW_DONATE_BUTTON
+    try:
+        SHOW_DONATE_BUTTON = not is_paid_build()
+    except Exception:
+        pass
 
 
 def _source_rig_has_recognized_face_bones(src_rig):
@@ -117,8 +131,121 @@ def _draw_setup_section(layout, hide_setup):
         row.operator("blendcap.install_open_prefs", icon='PREFERENCES',
                      text="Open Preferences")
         row.operator("blendcap.append_workspace", text="Open Workspace", icon='WORKSPACE')
+        box.operator("blendcap.open_docs", text="Documentation", icon='HELP')
 
         layout.separator()
+
+
+def _draw_update_strip(layout, prefs):
+    # One line at the very top when a newer release is known. Passive:
+    # it reads the result the preferences box already holds, so drawing
+    # it costs nothing and there is no extra checking. Hidden by the
+    # Interface preference, by Remind me tomorrow (24 h) and by Skip
+    # this version (until a newer one appears). Stays up during jobs;
+    # Update Now itself refuses to start while one runs.
+    from . import updater
+    if not updater.strip_wanted(prefs):
+        return
+    latest = updater.known_latest() or {}
+    box = layout.box()
+    box.label(text=f"BlendCap {latest.get('version', '?')} is available",
+              icon='FILE_REFRESH')
+    row = box.row(align=True)
+    sub = row.row(align=True)
+    # Greyed when the release needs a newer installer than this paid
+    # copy has: the store package comes first (preferences explain).
+    sub.enabled = not updater.update_blocked(latest)
+    sub.operator("blendcap.update_now", text="Update Now", icon='IMPORT')
+    row.operator("blendcap.install_open_prefs", text="Preferences",
+                 icon='PREFERENCES')
+    layout.separator()
+
+
+def _draw_lock_strip(layout):
+    # A leftover extension-repository lock (updater.repo_lock_stale, a
+    # cached flag refreshed at startup / Check now / Update Now) blocks
+    # every extension install, Blender's own Install from Disk and
+    # drag-and-drop included. Say so before the user tries one.
+    from . import updater
+    if not updater.repo_lock_stale():
+        return
+    box = layout.box()
+    box.alert = True
+    col = box.column(align=True)
+    col.label(text="Extensions locked", icon='ERROR')
+    col.label(text="An addon install didn't finish.")
+    col.label(text="Installs and updates will fail")
+    col.label(text="until it's cleared.")
+    box.operator("blendcap.repo_unlock", text="Unlock Extensions",
+                 icon='UNLOCKED')
+    layout.separator()
+
+
+def _draw_sac_strip(layout):
+    # Windows Smart App Control is enforcing (helpers.smart_app_control_
+    # blocking, a cached flag): the capture engine will be blocked.
+    # Points at Preferences, where the full note and Check Again live.
+    from .helpers import smart_app_control_blocking
+    if not smart_app_control_blocking():
+        return
+    box = layout.box()
+    box.alert = True
+    col = box.column(align=True)
+    col.label(text="Blocked by Windows", icon='ERROR')
+    col.label(text="Smart App Control blocked BlendCap's")
+    col.label(text="capture engine. See Preferences")
+    col.label(text="for the fix.")
+    box.operator("blendcap.install_open_prefs", text="Preferences",
+                 icon='PREFERENCES')
+    layout.separator()
+
+
+def _draw_deps_outdated_strip(layout):
+    # The installed environment was built for an earlier BlendCap
+    # (helpers.deps_outdated). Not hideable by preference: it clears
+    # when the environment is rebuilt (installer stamps it, a recreated
+    # venv loses the old stamp) or when the user presses Dependencies
+    # Rebuilt. Reads one cached number; no checking at draw time.
+    from .helpers import deps_outdated, installer_files_present
+    if not deps_outdated():
+        return
+    box = layout.box()
+    box.alert = True
+    col = box.column(align=True)
+    col.label(text="Rebuild needed", icon='ERROR')
+    col.label(text="Dependencies were built for an")
+    col.label(text="earlier BlendCap. See requirements.txt.")
+    row = box.row(align=True)
+    if installer_files_present():
+        # Paid: the installer rewrites the stamp when it finishes, so
+        # there is nothing to confirm by hand. Rebuild opens Preferences
+        # with the wizard (the wizard only draws there).
+        row.operator("blendcap.install_dependencies", text="Rebuild",
+                     icon='FILE_REFRESH').force = True
+    else:
+        # Source: rebuilt by hand, so the user says when it's done.
+        row.operator("blendcap.open_docs", text="Documentation", icon='HELP')
+        row.operator("blendcap.deps_mark_rebuilt", text="Rebuilt",
+                     icon='CHECKMARK')
+    layout.separator()
+
+
+def _draw_install_incomplete_strip(layout):
+    # A venv exists but the installer never finished (helpers.
+    # install_incomplete: marker says "running" or is missing, paid
+    # copies only). Clears when a Reinstall reaches its final phase.
+    from .helpers import install_incomplete
+    if not install_incomplete():
+        return
+    box = layout.box()
+    box.alert = True
+    col = box.column(align=True)
+    col.label(text="Install not finished", icon='ERROR')
+    col.label(text="The dependency install stopped early.")
+    col.label(text="Reinstall continues where it left off.")
+    box.operator("blendcap.install_dependencies", text="Reinstall",
+                 icon='FILE_REFRESH').force = True
+    layout.separator()
 
 
 def _draw_donate_section(layout, prefs):
@@ -154,7 +281,10 @@ def _draw_source_section(layout, context, props):
         # row "live" and silently revert to File Path when the mouse moved back
         # over it. A dropdown commits cleanly and can't change on hover/drag.
         box.prop(props, "video_source", text="")
-        if props.video_source == 'FILE':
+        if props.video_source == 'FILE' and multicam.is_multi_mode(props):
+            # the single Video field has no say in a multi-camera take
+            box.label(text="Clips are selected under Capture.", icon='INFO')
+        elif props.video_source == 'FILE':
             box.prop(props, "video_path", text="")
         else:
             box.label(text="Uses active Video Sequencer strip.", icon='SEQ_SEQUENCER')
@@ -171,6 +301,188 @@ def _draw_source_section(layout, context, props):
     layout.separator()
 
 
+def _draw_multicam_section(box, context, props, is_running):
+    """Multi-Camera Capture: what to select before syncing, or one row
+    per camera while syncing (drawn just above the buttons); for File
+    Path, the clips of the take (drawn under the mode dropdown)."""
+    scene = context.scene
+    col = box.column(align=True)
+    if props.video_source != 'VSE':
+        _draw_multicam_files(box, col, props, is_running)
+        return
+
+    if not multicam.sync_active(scene):
+        done = multicam.strip_record(multicam.active_multicam_strip(context))
+        if done is not None and done.get("preview"):
+            # The active strip is a multi-camera PREVIEW. Run Capture
+            # works straight from it, so the focal lengths it needs are
+            # here; the sync itself is changed by reverting.
+            col.label(text=f"Multi-camera preview, {done.get('n', 0)} cameras.",
+                      icon='CHECKMARK')
+            col.label(text="Revert it to change the sync.", icon='BLANK1')
+            rows = col.column(align=True)
+            rows.enabled = not is_running
+            for i, cam in enumerate(done.get("cams", [])):
+                letter = multicam.LETTERS[i]
+                rows.separator(factor=0.6)
+                rows.label(text=f"{letter}:  {cam.get('name', '')}", icon='SEQUENCE')
+                focal = rows.row(align=True)
+                focal.alert = multicam.focal_mm(props, i) <= 0.0
+                focal.prop(props, f"multicam_focal_{letter.lower()}_mm")
+            return
+        if done is not None:
+            # The active strip already IS a multi-camera capture.
+            col.label(text=f"Multi-camera capture, {done.get('n', 0)} cameras.",
+                      icon='CHECKMARK')
+            col.label(text="Revert it to sync or capture again.", icon='BLANK1')
+            return
+        clips, lines = multicam.selection(context)
+        if not clips:
+            for i, line in enumerate(lines):
+                col.label(text=line, icon='ERROR' if i == 0 else 'BLANK1')
+            return
+        for i, s in enumerate(clips):
+            col.label(text=f"{multicam.LETTERS[i]}:  {s.name}", icon='SEQUENCE')
+        return
+
+    # --- syncing mode: the clips are pinned, selection no longer matters
+    if multicam.stepped_out(scene) and not is_running:
+        # The user stepped out of the nested view by themselves (Tab):
+        # that ends syncing mode, on the next tick like the case below.
+        multicam.schedule_sync_autoclear()
+        col.label(text="Ending sync.", icon='INFO')
+        return
+    clips = multicam.pinned_strips(scene)
+    if clips is None:
+        # A pinned clip stopped existing: end the session on the next
+        # tick (draw itself may not write scene data). The label shows
+        # for the one redraw before the restore lands.
+        multicam.schedule_sync_autoclear()
+        col.label(text="A synced clip was removed. Ending sync.", icon='INFO')
+        return
+    col.enabled = not is_running
+    for i, s in enumerate(clips):
+        letter = multicam.LETTERS[i]
+        if i:
+            col.separator(factor=0.6)
+        col.label(text=f"{letter}:  {s.name}", icon='SEQUENCE')
+        # red while it is empty: the same test that blocks Run Capture
+        # (multicam.run_blockers), so the field shows WHICH camera
+        focal = col.row(align=True)
+        focal.alert = multicam.focal_mm(props, i) <= 0.0
+        focal.prop(props, f"multicam_focal_{letter.lower()}_mm")
+        if i:
+            col.prop(props, f"multicam_slide_{letter.lower()}")
+    # Sync by Sound sets the slides above. Greyed out, with the reason,
+    # when there is no sound to go by.
+    col.separator(factor=0.6)
+    no_sound = multicam.sound_gaps(clips)
+    row = col.row()
+    row.enabled = not no_sound
+    row.operator("blendcap.multicam_sync_sound", icon='SOUND',
+                 text="Sync by Sound")
+    if no_sound:
+        col.label(text=no_sound, icon='BLANK1')
+    for line in multicam.sound_result_lines(scene):
+        col.label(text=line, icon='BLANK1')
+
+
+def _warning_lines(layout, lines):
+    """Message lines, with the warning icon on the line that names the
+    problem and the lines that follow it indented under it."""
+    for line in lines:
+        head = line.startswith(("These clips", "Enter ", "Body ", "Select ",
+                                "A synced", "'Multi-Camera"))
+        layout.label(text=line, icon='ERROR' if head else 'BLANK1')
+
+
+def _draw_multicam_files(box, col, props, is_running):
+    """Multi-Camera Capture from File Path: the clips of one take that
+    is already synced. No syncing step; anything that needs one goes
+    through the Sequencer."""
+    infos = multicam.file_infos(props)
+    if not infos:
+        # what this route expects, until clips are in
+        for i, line in enumerate(multicam.FILE_INTRO_LINES):
+            col.label(text=line, icon='INFO' if i == 0 else 'BLANK1')
+    else:
+        for i, info in enumerate(infos):
+            col.label(text=f"{multicam.LETTERS[i]}:  "
+                           f"{bpy.path.basename(info['path'])}", icon='FILE_MOVIE')
+        warn, refuse = multicam.file_warnings(infos)
+        if len(infos) >= multicam.MIN_CAMERAS and not warn and not refuse:
+            col.label(text=f"{len(infos)} clips, ready to capture.",
+                      icon='CHECKMARK')
+        _warning_lines(col, warn)
+        col.separator(factor=0.6)
+        # red while it is empty (multicam.file_blockers' test)
+        focal = col.row(align=True)
+        focal.alert = float(props.multicam_focal_mm) <= 0.0
+        focal.prop(props, "multicam_focal_mm")
+    row = box.row(align=True)
+    row.enabled = not is_running
+    row.operator("blendcap.multicam_select_clips", icon='FILEBROWSER',
+                 text="Select Clips")
+    if infos:
+        row.operator("blendcap.multicam_clear_clips", icon='X',
+                     text="Clear Clips")
+
+
+def _multicam_run_row(box, preview_blocked, capture_blocked):
+    """Run Preview and Run Capture side by side, as in the single-camera
+    capture. Each is greyed out on its own: a preview needs no focal
+    lengths, so it is there before they are filled in."""
+    row = box.row(align=True)
+    left = row.row(align=True)
+    left.enabled = not preview_blocked
+    left.operator("blendcap.multicam_capture", icon='FILE_REFRESH',
+                  text="Run Preview").is_update_only = True
+    right = row.row(align=True)
+    right.enabled = not capture_blocked
+    right.operator("blendcap.multicam_capture", icon='PLAY',
+                   text="Run Capture").is_update_only = False
+
+
+def _draw_multicam_buttons(box, context, props):
+    """The button row of Multi-Camera Capture (not running): Sync Clips
+    before syncing; Run Capture and Exit Syncing Mode while syncing,
+    with what is blocking Run Capture spelled out next to it."""
+    scene = context.scene
+    if props.video_source != 'VSE':
+        # File Path: no syncing step, Run Capture straight away. What
+        # stops it is spelled out; the warnings above do not stop it.
+        blocked = multicam.file_blockers(context)
+        if multicam.file_infos(props):
+            # one tight block, like the warnings in the clip list above
+            _warning_lines(box.column(align=True), blocked)
+        _multicam_run_row(box, multicam.file_blockers(context, preview=True), blocked)
+        return
+    if not multicam.sync_active(scene):
+        pv_rec = multicam.preview_strip(context)[1]
+        if pv_rec is not None:
+            # A preview strip: preview again or capture, straight from it.
+            blocked = multicam.strip_blockers(context, pv_rec)
+            for line in blocked:
+                box.label(text=line, icon='BLANK1' if line.startswith("Revert")
+                          or multicam.continues(line) else 'ERROR')
+            _multicam_run_row(box, multicam.strip_blockers(context, pv_rec, preview=True),
+                              blocked)
+            return
+        col = box.column()
+        col.enabled = bool(multicam.selection(context)[0])
+        col.operator("blendcap.multicam_sync", icon='ARROW_LEFTRIGHT',
+                     text="Sync Clips")
+        return
+    blocked = multicam.run_blockers(context)
+    # A greyed-out button with no reason given is confusing: the reason
+    # stays here until it is dealt with.
+    for line in blocked:
+        box.label(text=line, icon='BLANK1' if multicam.continues(line) else 'ERROR')
+    _multicam_run_row(box, multicam.run_blockers(context, preview=True), blocked)
+    box.operator("blendcap.multicam_sync_exit", icon='LOOP_BACK',
+                 text="Exit Syncing Mode")
+
+
 def _draw_capture_section(layout, context, props, is_running, hide_clear_all):
     # --- CAPTURE ---
     box = layout.box()
@@ -180,20 +492,56 @@ def _draw_capture_section(layout, context, props, is_running, hide_clear_all):
                     emboss=False, text="")
     cap_header.label(text="Capture", icon='VIEW_CAMERA')
     if props.capture_expanded:
+        box.prop(props, "capture_mode", text="")
+        is_multi = multicam.is_multi_mode(props)
+        is_people = multicam.is_people_mode(props)
+        # The Sequencer route's camera rows go BELOW the capture options,
+        # right above the button they lead to (the user, 2026-11-17: rows
+        # appearing above everything else when Sync Clips is pressed felt
+        # wrong). The File Path route starts with picking its clips, so
+        # its part stays up here.
+        multi_low = is_multi and props.video_source == 'VSE'
+        if is_multi and not multi_low:
+            _draw_multicam_section(box, context, props, is_running)
+
         row = box.row()
         row.prop(props, "track_body", text="Body")
-        row.prop(props, "track_face", text="Face")
+        # Multi-person: each face is found from its body's head, so
+        # there is no face without the body (greyed, not hidden).
+        face = row.row()
+        if is_people and not props.track_body:
+            # the stand-in, for its tooltip (properties.track_face_people_off)
+            face.enabled = False
+            face.prop(props, "track_face_people_off", text="Face")
+        else:
+            face.prop(props, "track_face", text="Face")
+        # Session checkbox (WindowManager) over the prefs master -
+        # surfaced HERE because it decides whether Rebuild Finger
+        # Motion has anything good to work with, and buried in
+        # preferences nobody found it. Hands ride the body pass, so
+        # it greys out with Body.
+        hands = box.row()
+        hands.enabled = props.track_body
+        hands.prop(context.window_manager, "blendcap_refine_hands")
 
         # FOV / camera field-of-view (body tracking only). Plain dropdown.
-        fov_col = box.column(align=True)
-        fov_col.enabled = props.track_body
-        fov_col.prop(props, "fov_mode")
-        if props.fov_mode == 'MANUAL':
-            fov_col.prop(props, "fov_focal_mm")
+        # Hidden in Multi-Camera mode: the per-camera focal fields
+        # replace it entirely, and auto-estimation is not offered there
+        # (a wrong focal inflates the whole scene and the merge's
+        # centimetre thresholds silently stop working).
+        if not is_multi:
+            fov_col = box.column(align=True)
+            fov_col.enabled = props.track_body
+            fov_col.prop(props, "fov_mode")
+            if props.fov_mode == 'MANUAL':
+                fov_col.prop(props, "fov_focal_mm")
 
         if props.track_body:
             box.prop(props, "preview_step", slider=True)
             box.prop(props, "capture_skip", slider=True)
+
+        if multi_low:
+            _draw_multicam_section(box, context, props, is_running)
 
         if is_running:
             box.operator("blendcap.cancel", icon='CANCEL', text="Cancel")
@@ -204,8 +552,18 @@ def _draw_capture_section(layout, context, props, is_running, hide_clear_all):
             _draw_progress_bar(box, pct, label, scale_y=1.4)
             for warn in blendcap_state.get('warnings', []):
                 box.label(text=warn, icon='ERROR')
+        elif is_multi:
+            _draw_multicam_buttons(box, context, props)
+        elif multicam.single_capture_block(context):
+            # Single-Camera mode pointed at a multi-camera capture:
+            # capturing it as one clip would overwrite the merged data.
+            for i, line in enumerate(multicam.single_capture_block(context)):
+                box.label(text=line, icon='INFO' if i == 0 else 'BLANK1')
         else:
             row = box.row(align=True)
+            if is_people:
+                # every person needs their body: no face-only capture
+                row.enabled = props.track_body
             row.operator("blendcap.generate_mocap", icon='FILE_REFRESH', text="Run Preview").is_update_only = True
             row.operator("blendcap.generate_mocap", icon='PLAY', text="Run Capture").is_update_only = False
 
@@ -217,8 +575,12 @@ def _draw_capture_section(layout, context, props, is_running, hide_clear_all):
                 box.separator()
                 row = box.row()
                 row.enabled = not is_running
-                row.operator("blendcap.revert_strip", icon='LOOP_BACK',
-                             text="Revert to Original Video")
+                if multicam.is_multicam_strip(active):
+                    row.operator("blendcap.revert_strip", icon='LOOP_BACK',
+                                 text="Revert to Original Clips")
+                else:
+                    row.operator("blendcap.revert_strip", icon='LOOP_BACK',
+                                 text="Revert to Original Video")
                 box.label(text="Proxy clip — edits won't carry over, Revert first", icon='INFO')
 
         # Extra gap so the destructive cache buttons sit clear of Run Capture.
@@ -244,6 +606,9 @@ def _draw_bvh_settings_section(layout, context, props, is_running, is_bvh_runnin
                     emboss=False, text="")
     bvh_header.label(text="BVH Settings", icon='EXPORT')
     if props.bvh_settings_expanded:
+        # Who the BVH is for, when the selected capture holds more than
+        # one person. Nothing is drawn for any other capture.
+        people_view = people_ui.draw_panel(box, context)
         col = box.column(align=True)
         row = col.row()
         row.prop(props, "export_body")
@@ -261,6 +626,9 @@ def _draw_bvh_settings_section(layout, context, props, is_running, is_bvh_runnin
         hs_row = col.row()
         hs_row.enabled = bool(props.export_hands)
         hs_row.prop(props, "bvh_hand_solver")
+        col.prop(props, "bvh_hold_cropped_limbs")
+        if people_view is not None:
+            col.prop(props, "bvh_people_in_place")
 
         box.separator()
         if is_bvh_running:
@@ -268,6 +636,9 @@ def _draw_bvh_settings_section(layout, context, props, is_running, is_bvh_runnin
                          text="Cancel BVH Export")
             pct = bvh_state.get('progress', 0.0)
             status = bvh_state.get('status_text', '')
+            if people_ui.queue_active():
+                # Generate/Reload All: the bar is the whole list's
+                pct, status = people_ui.queue_status(pct, status)
             label = (f"{int(pct)}%  {status}" if status
                      else f"Generating BVH... {int(pct)}%")
             _draw_progress_bar(box, pct, label, scale_y=1.4)
@@ -276,6 +647,12 @@ def _draw_bvh_settings_section(layout, context, props, is_running, is_bvh_runnin
             bvh_row.enabled = not is_running
             bvh_row.operator("blendcap.generate_bvh", icon='IMPORT',
                              text="Generate/Reload BVH")
+            if people_view is not None:
+                # everybody in the People list, one after the other
+                all_row = box.row()
+                all_row.enabled = not is_running
+                all_row.operator("blendcap.generate_bvh_all", icon='IMPORT',
+                                 text="Generate/Reload All")
 
         _draw_bvh_post_processing(box, context, props)
 
@@ -299,6 +676,25 @@ def _draw_bvh_settings_section(layout, context, props, is_running, is_bvh_runnin
             bake_row.scale_y = 1.2
             bake_row.operator("blendcap.bake_camera_offset",
                               icon='IMPORT')
+
+        # --- CAMERA ---
+        # Add Camera, under a heading of its own (the user, 2026-11-19):
+        # for the selected rig, or the selected clip's one rig, from
+        # what its last Generate or Bake recorded (scene_camera.py).
+        # ALWAYS drawn, so the panel does not jump when an export
+        # starts: greyed out while one runs, and by its poll() when
+        # there is no rig for it to act on (it says which, under its
+        # tooltip).
+        # Which camera, for a rig from a multi-camera take, sits above
+        # the button (choose, then click) and is only there for such a
+        # rig.
+        box.separator()
+        box.label(text="Camera", icon='CAMERA_DATA')
+        cam_col = box.column()
+        cam_col.enabled = not is_bvh_running
+        if len(scene_camera.target_views(context)) > 1:
+            cam_col.prop(props, "multicam_camera_view")
+        cam_col.operator("blendcap.add_camera", icon='ADD')
 
     layout.separator()
 
@@ -328,11 +724,58 @@ def _draw_bvh_post_processing(box, context, props):
     pp_col = box.column(align=True)
 
     _draw_bvh_camera_angle_offset(pp_col, context, props, active, is_blendcap_rig)
-    _draw_bvh_smoothing(pp_col, props)
-    _draw_bvh_depth_noise_filtering(pp_col, props)
+    _draw_bvh_jitter_control(pp_col, props)
     _draw_bvh_foot_locking(pp_col, props)
-    _draw_bvh_face_noise_filtering(pp_col, props)
     _draw_bvh_motion_scaling(pp_col, props)
+
+
+def _draw_bvh_jitter_control(pp_col, props):
+    # --- JITTER CONTROL ---
+    # One home for everything that removes capture noise: Smoothing,
+    # Head Noise Filtering, Face Noise Filtering, and Depth Noise
+    # Filtering live as flat sub-sections inside. Foot Locking stays
+    # outside — it corrects contact behavior, not jitter.
+    pp_col.separator()
+    jc_header = pp_col.row(align=True)
+    jc_header.prop(props, "bvh_jitter_expanded",
+                   icon=('TRIA_DOWN' if props.bvh_jitter_expanded
+                         else 'TRIA_RIGHT'),
+                   emboss=False, text="")
+    jc_header.label(text="Jitter Control")
+    if props.bvh_jitter_expanded:
+        # Indent the sub-sections so they visibly nest under the
+        # header — drawn flush they read as four more top-level
+        # sections. A horizontal separator in a row is the indent.
+        jc_row = pp_col.row()
+        jc_row.separator(factor=2.0)
+        jc_col = jc_row.column(align=True)
+        _draw_bvh_smoothing(jc_col, props)
+        _draw_bvh_depth_noise_filtering(jc_col, props)
+        _draw_bvh_head_noise_filtering(jc_col, props)
+        _draw_bvh_face_noise_filtering(jc_col, props)
+
+
+def _draw_bvh_head_noise_filtering(pp_col, props):
+    # --- HEAD NOISE FILTERING ---
+    # Per-axis rotation dead-zone on Head+Neck (nod/turn/tilt in
+    # degrees). Mirrors the Face Noise Filtering pattern: master
+    # toggle inside the collapsible, sliders greyed when off.
+    pp_col.separator()
+    hn_header = pp_col.row(align=True)
+    hn_header.prop(props, "bvh_head_denoise_expanded",
+                   icon=('TRIA_DOWN' if props.bvh_head_denoise_expanded
+                         else 'TRIA_RIGHT'),
+                   emboss=False, text="")
+    hn_header.label(text="Head Noise Filtering")
+    if props.bvh_head_denoise_expanded:
+        hn_col = pp_col.column(align=True)
+        hn_col.prop(props, "bvh_head_denoise_enabled",
+                    text="Use Head Noise Filtering")
+        sub = hn_col.column(align=True)
+        sub.enabled = bool(props.bvh_head_denoise_enabled)
+        sub.prop(props, "bvh_head_denoise_nod")
+        sub.prop(props, "bvh_head_denoise_turn")
+        sub.prop(props, "bvh_head_denoise_tilt")
 
 
 def _draw_bvh_camera_angle_offset(pp_col, context, props, active, is_blendcap_rig):
@@ -415,6 +858,7 @@ def _draw_bvh_smoothing(pp_col, props):
         sm_sub = sm_col.column(align=True)
         sm_sub.enabled = props.smoothing_enabled
         sm_sub.prop(props, "smooth_face", text="Face (s)")
+        sm_sub.prop(props, "smooth_head", text="Head (s)")
         sm_sub.prop(props, "smooth_body", text="Body (s)")
         sm_sub.prop(props, "smooth_root", text="Root (s)")
         sm_sub.prop(props, "smooth_vertical", text="Vertical (s)")
@@ -881,6 +1325,12 @@ def _draw_retarget_advanced(col, scene, props):
         # property tooltip in registration.py for full rationale.
         adv_col.prop(scene, "blendcap_retarget_use_world_location")
 
+        # Mute Limits and Drivers (+ Include Unmapped Bones once ticked):
+        # per target rig, for rigs whose Limit Rotation constraints or
+        # drivers override the retargeted motion. See rig_conflicts.py.
+        from . import rig_conflicts
+        rig_conflicts.draw_rows(adv_col, scene)
+
         # Face Expression -- global Strength + per-region overrides.
         # Layout matches BVH and ARKit Face Expression sections.
         # Strength applies uniformly to every face bone pair (LOC +
@@ -1109,6 +1559,11 @@ def _draw_bvh_library_section(layout, context, props):
     lib_header.label(text="BVH Library", icon='ASSET_MANAGER')
     if props.bvh_library_expanded:
         scene = context.scene
+        # Read-only freshness check (one directory listing, only while
+        # this panel is expanded); schedules a resync only if the folder
+        # and the list disagree.
+        from .properties import bvh_library_check
+        bvh_library_check(scene)
         entries = scene.blendcap_bvh_entries
         if len(entries) == 0:
             lib_box.label(text="Library is empty.")
@@ -1139,6 +1594,11 @@ def draw_blendcap_ui(self, context):
     hide_setup = bool(prefs and prefs.hide_setup_section)
     hide_clear_all = bool(prefs and prefs.hide_clear_all)
 
+    _draw_update_strip(layout, prefs)
+    _draw_sac_strip(layout)
+    _draw_lock_strip(layout)
+    _draw_deps_outdated_strip(layout)
+    _draw_install_incomplete_strip(layout)
     _draw_setup_section(layout, hide_setup)
     # Donate goes right BELOW Setup, in its own labeled box (see
     # _draw_donate_section): clearly part of BlendCap's UI yet still prominent.
@@ -1146,7 +1606,8 @@ def draw_blendcap_ui(self, context):
     _draw_source_section(layout, context, props)
 
     is_running = blendcap_state['running']
-    is_bvh_running = bvh_state['running']
+    # Generate/Reload All counts as running between two people's exports
+    is_bvh_running = bvh_state['running'] or people_ui.queue_active()
 
     _draw_capture_section(layout, context, props, is_running, hide_clear_all)
     _draw_bvh_settings_section(layout, context, props, is_running, is_bvh_running)

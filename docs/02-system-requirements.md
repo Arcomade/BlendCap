@@ -25,6 +25,8 @@ BlendCap is a Blender **extension** and requires **Blender 4.2 or newer**.
 ### Windows 10 / 11: fully supported
 This is the primary, directly validated platform and the one with the strongest reliability guarantee. If you're on Windows with an NVIDIA GPU, you're on the happy path.
 
+**Windows 11: turning off Smart App Control is recommended.** It checks each file against Microsoft's cloud service and can block parts of BlendCap's capture engine, which is built from open-source components that Microsoft hasn't signed, and it can slow captures down. Windows currently offers no per-app exception. See [Installation](03-installation.md) for how to turn it off.
+
 ### Linux: supported
 Linux is supported, including both standard installs and **Flatpak** Blender. The one-click installer opens a terminal so you can watch the setup and approve the system packages it needs.
 
@@ -41,9 +43,10 @@ BlendCap's body capture runs a large pose estimation model. A capable GPU is wha
 - **Minimum architecture:** RTX 20-series / GTX 16-series, or newer (this is the "Turing" generation). Newer cards including the RTX 30, 40 and 50 series are supported.
 - **VRAM:** 6 GB or more recommended. Cards with less will still install but may run out of memory and lead to a failed capture, the installer warns you if it sees less than 6 GB.
 - **Older cards:** GTX 10-series and older are **not supported**. The installer detects this and tells you clearly rather than failing later.
-- **Typical performance:** roughly a third of a second per frame on a modern NVIDIA card.
+- **Typical performance:** For single person single camera captures, roughly a third of a second per frame on a modern NVIDIA card. Every extra person or camera angle adds to capture time (see [Capturing](05-capturing.md)).
 
 ### AMD / Intel GPUs: experimental
+- **Recommended minimum:** an AMD RX 6000 series card or newer, or a discrete Intel Arc card, no integrated graphics.
 - **Windows (AMD/Intel):** supported on an **experimental** basis through DirectML. The code path is in place but has not been hardware-validated across the range of cards, so treat it as best-effort.
 - **Linux (AMD):** experimental GPU acceleration via ROCm on supported discrete AMD cards (RX 6000 / 7000 class). Without a supported AMD GPU stack, Linux falls back to CPU-only capture.
 
@@ -54,8 +57,10 @@ A **CPU Only** capture mode is available as a universal fallback. It needs no GP
 
 ## Disk space
 
-The BlendCap download itself is small (around 2 MB). The first time you install its dependencies, it downloads roughly **11 GB** of models and supporting libraries. Allow **at least 32 GB of free space** on the drive where BlendCap is installed.
+The BlendCap download itself is small (around 2 MB). The first time you install its dependencies, it downloads roughly **11 GB** of models and supporting libraries. Allow **at least 32 GB of free space** on the drive where BlendCap is installed. The dependencies can also be kept on a different drive than the add-on itself, see [Installation](03-installation.md).
 
 ## Internet connection
 
 An internet connection is required **once**, during installation, to download the models and dependencies. After that, **capture runs completely offline**: your video footage never leaves your computer, which is good for both privacy and working on the move.
+
+The only other time BlendCap goes online by itself is a once-a-day check for a newer version, which you can turn off in [Preferences](11-preferences.md).

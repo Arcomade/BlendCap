@@ -475,7 +475,7 @@ def compute_face_bone_data(face_data, head_local_landmarks, rest_face=None,
             src_jaw = np.array(entry["head"], dtype=np.float64)
     if src_eye_L is None or src_eye_R is None:
         raise RuntimeError(
-            "Source skeleton missing LeftEye / RightEye — cannot anchor face "
+            "Source skeleton missing LeftEye / RightEye - cannot anchor face "
             "to the tracked head.")
 
     def _axis_swap(v):

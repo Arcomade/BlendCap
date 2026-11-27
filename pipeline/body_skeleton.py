@@ -58,6 +58,19 @@ def load_skeleton(mhr_model_path):
     return parents, offsets, prerotations
 
 
+def model_height(mhr_model_path):
+    """How tall the body model stands, metres (the rest mesh, soles to
+    crown): the height of every armature the export makes, before a
+    person's own size (body_scale) is applied. None when the model
+    file does not say."""
+    model = torch.jit.load(mhr_model_path, map_location="cpu")
+    for name, buf in model.named_buffers():
+        if name.endswith("mesh.rest_vertices"):
+            y = buf.numpy().astype(np.float64)[:, 1]
+            return float(y.max() - y.min()) * 0.01
+    return None
+
+
 # NOTE: a previous version of this file shipped an `apply_rest_pose_preset`
 # function that consumed a JSON of saved Blender pose deltas and rewrote
 # R0 / offsets_cm to bake a "custom rest pose" into the BVH file. It was

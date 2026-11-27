@@ -1,0 +1,8 @@
+{
+  "version": "1.1.0",
+  "url": "https://github.com/Arcomade/BlendCap/releases/download/v1.1.0/BlendCap-1.1.0.zip",
+  "sha256": "bb7395bb2d7fb77d0be01869cfbc14edb1ab21345e0f615058a265c0b3c48429",
+  "notes": "https://github.com/Arcomade/BlendCap/releases/tag/v1.1.0",
+  "required_installer": "1.1.0",
+  "deps_revision": 1
+}

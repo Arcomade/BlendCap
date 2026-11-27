@@ -37,7 +37,7 @@ The **ARKit Shape Keys** section lives just below the **Retargeting** section of
 
 1. Select the mesh object that carries your character's ARKit shape keys.
 2. Set **ARKit Face Data**. **Auto (active video)** uses the face capture that matches your currently selected video source; you can also pick any cached face capture from the list.
-3. Click **Apply ARKit Shape Keys**. BlendCap keyframes the matching shape keys across the clip and reports how many of the 52 ARKit shapes it found on your mesh. (The tuning sliders between the dropdown and the Apply button are covered in below in "Tuning the performance".)
+3. Click **Apply ARKit Shape Keys**. BlendCap keyframes the matching shape keys across the clip and reports how many of the 52 ARKit shapes it found on your mesh. (The tuning sliders between the dropdown and the Apply button are covered below in "Tuning the performance".)
 
 ![The ARKit Shape Keys section](images/15-2-arkit-shape-keys.png)
 
@@ -80,15 +80,23 @@ If the clips aren't the same length, the shorter clip simply holds its last pose
 
 ---
 
+## Faces in multi-camera captures
+
+In the multi-camera modes the face is read from one camera at a time, it's never blended between cameras. BlendCap stays with a camera for as long as it can see the face, and when that camera loses it, switches to whichever camera has the steadiest view of the face at that moment. Keep your expectations modest here. Cameras set up for a full-body take see the face small and often from the side, and that gives a rough reading in any mode. For a face that needs to hold up, record it as its own closer clip and combine it with the body (see above).
+
+---
+
 ## Tuning the performance
 
 Faces are expressive and personal, so BlendCap gives you tuning control over eight specific regions: **Jaw, Gaze, Eyelids, Brows, Lips, Cheeks, Nose and Tongue**. The same three controls, **Face Smoothing**, **Face Noise Filtering**, and **Face Expression** scaling, appear on whichever path you're using: the **BVH Post Processing** and **ARKit Shape Keys** versions are covered in [BVH Generation and Post-Processing](08-bvh-generation-and-post-processing.md), and the retarget-time version under **Retargeting ▸ Advanced** in [Retargeting](09-retargeting.md).
 
-![Combining body and face](images/15-5-FaceScaling.png)
+![Expression Sliders](images/15-5-FaceScaling.png)
 
 You'll find the same **Face Expression** sliders in a few places, and they don't all work the same way. The **BVH Post Processing** and **ARKit** sliders scale the captured expression itself, only the motion the capture read for that region. The **Retargeting** sliders scale the face bones instead, where the regions aren't cleanly separate, a bone can carry motion from its neighbors. So scaling a region there grows that borrowed motion too: turn up **Tongue** and you also scale the tongue movement that's really just the jaw opening. Use the BVH or ARKit sliders to adjust expression strength precisely, and the Retargeting sliders for more general adjustments.
 
 ![Face Noise Filtering and Face Expression sliders](images/18-1-face-tuning.png)
+
+Face smoothing only affects the expression, never the head itself. If it's the head that wobbles, reach for **Head Noise Filtering** instead (see [BVH Generation and Post-Processing](08-bvh-generation-and-post-processing.md)).
 
 ---
 

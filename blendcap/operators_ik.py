@@ -836,6 +836,173 @@ def _build_ik_pairs(scene, src_rig, tgt_rig):
     return pairs, skipped
 
 
+def _switch_host_candidates(rig, row, chains_by_owner, fk_end=None):
+    """Pose bones that may carry a chain's IK/FK switch, most likely
+    first: Rigify's `*_parent` properties bone (derived from the FK
+    root of the discovered chain, or from any FK ancestor of the baked
+    FK chain end - on Rigify upper_arm_fk.L's parent IS
+    upper_arm_parent.L), the FK chain end and its parents, the IK
+    control and its parents, the constraint owner and its parents, the
+    discovered subtarget. Same walk _flip_pole_vector uses."""
+    pbs = rig.pose.bones
+    candidates = []
+    seen = set()
+
+    def _add(pb, depth=0):
+        if pb is None or pb.name in seen:
+            return
+        seen.add(pb.name)
+        candidates.append(pb)
+        p = pb.parent
+        d = 0
+        while p is not None and d < depth:
+            if p.name not in seen:
+                seen.add(p.name)
+                candidates.append(p)
+            p = p.parent
+            d += 1
+
+    c = chains_by_owner.get(row.owner)
+    if c is not None:
+        fk_chain = c.get('fk_chain') or []
+        if fk_chain:
+            root_fk = fk_chain[-1]
+            prop_name = _derive_rigify_properties_bone_name(root_fk.name)
+            if prop_name and prop_name in pbs:
+                _add(pbs[prop_name], depth=0)
+            _add(root_fk, depth=4)
+    if fk_end and fk_end in pbs:
+        # Chain-independent route: derived properties bone for every
+        # FK ancestor, then the ancestors themselves.
+        p = pbs[fk_end]
+        d = 0
+        while p is not None and d < 6:
+            prop_name = _derive_rigify_properties_bone_name(p.name)
+            if prop_name and prop_name in pbs:
+                _add(pbs[prop_name], depth=0)
+            p = p.parent
+            d += 1
+        _add(pbs[fk_end], depth=6)
+    if row.ik_control in pbs:
+        _add(pbs[row.ik_control], depth=6)
+    if c is not None:
+        _add(c.get('subtarget'), depth=6)
+        _add(c.get('owner_ik'), depth=6)
+    elif row.owner in pbs:
+        _add(pbs[row.owner], depth=6)
+    return candidates
+
+
+def _baked_chain_switches(rig, ik_chains_collection, baked):
+    """[(row, pose bone, key, ik_value)] for every baked chain whose
+    IK/FK switch could be found. `baked` maps ik_control name -> baked
+    FK chain end name. Rigify IK_FK / ARP ik_fk_switch (IK = 0) via the
+    candidate walk; CloudRig ik_<side>_<limb> (IK = 1) by key name on
+    any bone. Chains without a recognisable switch are reported once
+    on the console and skipped."""
+    from .operators_retarget import _is_cloudrig, _FK_SWITCH_KEYS
+    out = []
+    if rig is None or rig.type != 'ARMATURE' or not baked:
+        return out
+    pbs = rig.pose.bones
+    rows = [r for r in ik_chains_collection
+            if r.ik_control and r.ik_control in baked]
+    if _is_cloudrig(rig):
+        for row in rows:
+            key = (f"ik_{'left' if row.side == 'L' else 'right'}_"
+                   f"{'arm' if row.limb_kind == 'ARM' else 'leg'}")
+            host = next((pb for pb in pbs if key in pb.keys()), None)
+            if host is None:
+                print(f"[BlendCap] FK->IK: no '{key}' switch found for "
+                      f"{_chain_label_str(row)}; left as-is.")
+                continue
+            out.append((row, host, key, 1))
+        return out
+    chains_by_owner = {}
+    try:
+        for c in _discover_ik_chains(rig):
+            if not c.get('skip_reason'):
+                chains_by_owner[c['owner_ik'].name] = c
+    except Exception:
+        pass
+    for row in rows:
+        found = None
+        for pb in _switch_host_candidates(rig, row, chains_by_owner,
+                                          baked.get(row.ik_control)):
+            for key in _FK_SWITCH_KEYS:
+                if key in pb.keys():
+                    found = (pb, key)
+                    break
+            if found:
+                break
+        if found is None:
+            print(f"[BlendCap] FK->IK: no IK/FK switch found for "
+                  f"{_chain_label_str(row)}; left as-is.")
+            continue
+        out.append((row, found[0], found[1], 0))
+    return out
+
+
+def _set_switch(pb, key, value):
+    cur = pb[key]
+    if isinstance(cur, bool):
+        pb[key] = bool(value)
+    else:
+        pb[key] = type(cur)(value)
+
+
+def set_baked_chains_to_ik(rig, ik_chains_collection, baked):
+    """After a MANUAL FK->IK convert: switch the chains that actually
+    baked to IK, so the freshly keyed IK controls drive the rig
+    (support item 22: 'IK controls don't do anything'). Only the baked
+    chains; everything else (other limbs, ARP finger switches) keeps
+    FK, where its keys are. Set-only, never keyed. Returns the number
+    of chains switched."""
+    switched = 0
+    for _row, pb, key, ik_value in _baked_chain_switches(
+            rig, ik_chains_collection, baked):
+        try:
+            _set_switch(pb, key, ik_value)
+            switched += 1
+        except Exception:
+            pass
+    if switched:
+        try:
+            rig.update_tag()
+        except Exception:
+            pass
+    return switched
+
+
+def restore_baked_chain_switches(rig, ik_chains_collection, baked, snap):
+    """Auto-bake path: put back the pre-Apply switch value ONLY for the
+    chains the IK bake covered. Every other switch Apply flipped stays
+    in FK - on ARP that includes each finger's own ik_fk_switch, and
+    the fingers were baked in FK; restoring those to IK silently drops
+    the finger motion (the 2026-09-03 live-test failure). Returns the
+    number of switches restored."""
+    if not snap:
+        return 0
+    restored = 0
+    for _row, pb, key, _ik_value in _baked_chain_switches(
+            rig, ik_chains_collection, baked):
+        value = snap.get((pb.name, key))
+        if value is None:
+            continue
+        try:
+            if pb[key] != value:
+                _set_switch(pb, key, value)
+                restored += 1
+        except Exception:
+            pass
+    if restored:
+        try:
+            rig.update_tag()
+        except Exception:
+            pass
+    return restored
+
+
 def _flip_pole_vector(rig, ik_chains_collection):
     """Set `pole_vector` to "Pole" mode on every ARM/LEG chain whose row
     is being baked. Rigify hosts this property on a sibling `*_parent`
@@ -954,6 +1121,11 @@ class BLENDCAP_OT_convert_fk_to_ik(bpy.types.Operator):
     _prev_active = None
     _frames_done = 0
     _n_frames = 0
+    # Support item 22: snapshot handed over by Apply (auto-bake path),
+    # restored on success; and the ik_control names that baked, so a
+    # manual convert switches exactly those chains to IK.
+    _switch_restore = None
+    _baked_ik_controls = None
 
     # Soft per-tick budget. Same convention as operators_retarget.
     TICK_BUDGET = 0.02
@@ -1128,6 +1300,16 @@ class BLENDCAP_OT_convert_fk_to_ik(bpy.types.Operator):
         # Pole-vector flip (Rigify carve-out, allowed by Protocols).
         _flip_pole_vector(tgt, scene.blendcap_retarget_ik_chains)
 
+        # Switch bookkeeping (support item 22): which chains bake, and
+        # whether Apply handed us a pre-flip snapshot to restore
+        # (auto-bake path) - else this is a manual convert and the
+        # baked chains get switched to IK on success.
+        self._baked_ik_controls = {
+            p.target: getattr(p, 'target_chain_end', '')
+            for p in pairs if getattr(p, 'kind', '') == 'BONE'}
+        from .operators_retarget import take_pending_switch_restore
+        self._switch_restore = take_pending_switch_restore(tgt)
+
         # CloudRig carve-out (same Protocols carve-out as the FK
         # retarget's switch flip): the convert reads the TARGET's FK
         # chain, and CloudRig's FK controls are constraint-slaved to
@@ -1209,8 +1391,29 @@ class BLENDCAP_OT_convert_fk_to_ik(bpy.types.Operator):
 
     def _report_and_finalize(self, context):
         n_pairs = len(self._pairs or [])
+        # Success only (cancel/failure never reach here): leave the rig
+        # listening to what was just baked.
+        suffix = ""
+        try:
+            if self._switch_restore:
+                if restore_baked_chain_switches(
+                        self._tgt, context.scene.blendcap_retarget_ik_chains,
+                        self._baked_ik_controls or {}, self._switch_restore):
+                    suffix = "; IK/FK switches restored"
+            else:
+                n = set_baked_chains_to_ik(
+                    self._tgt, context.scene.blendcap_retarget_ik_chains,
+                    self._baked_ik_controls or {})
+                if n:
+                    suffix = (f"; {n} chain{'s' if n != 1 else ''} "
+                              f"switched to IK")
+        except Exception as e:
+            print(f"[BlendCap] FK->IK switch update skipped: {e}")
+        self._switch_restore = None
+        self._baked_ik_controls = None
         self._finalize(context)
-        msg = (f"Baked IK across {n_pairs} pair{'s' if n_pairs != 1 else ''}")
+        msg = (f"Baked IK across {n_pairs} pair{'s' if n_pairs != 1 else ''}"
+               f"{suffix}")
         self.report({'INFO'}, msg)
         return {'FINISHED'}
 
@@ -1276,6 +1479,13 @@ class BLENDCAP_OT_convert_fk_to_ik(bpy.types.Operator):
             pass
         self._coroutine = None
         self._wm = None
+        # A retarget with auto-bake IK holds its rig limits dialog back
+        # until this conversion is over, however it ended (item 14).
+        try:
+            from . import rig_conflicts
+            rig_conflicts.show_pending()
+        except Exception:
+            pass
 
 
 class BLENDCAP_OT_cancel_fk_to_ik(bpy.types.Operator):

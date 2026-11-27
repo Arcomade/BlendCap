@@ -38,6 +38,18 @@
 # place; frames it can't trust keep the model's rotations, with a short
 # quaternion cross-fade at solved/unsolved boundaries so switches don't
 # pop.
+#
+# MULTI-CAMERA TAKES (solve_hands_merged): the fit above runs once per
+# camera, each in that camera's own picture and frame, and the results
+# are merged before anything is written. Finger angles are measured in
+# the hand's own frame, so two cameras' answers for one finger are the
+# same quantity and can be mixed as plain numbers. Each camera's say in
+# each angle is weighted by three things: whether the body merge
+# trusted that camera for the arm (its sightline test; the fit itself
+# cannot tell, it "solves" a hidden hand as happily as a visible one),
+# how well the finger fitted, and how the bend lies to that camera (a
+# finger curling straight toward a lens barely changes in its picture;
+# the same curl seen from the side is plain).
 
 import numpy as np
 
@@ -96,6 +108,18 @@ _MIN_PALM_SPAN_PX = 15.0     # projected palm smaller than this = no signal
 _PALM_RESID_FRAC = 0.30      # palm fit residual vs palm span
 _FINGER_RESID_FRAC = 0.22    # mean finger residual vs palm span
 _BLEND_SIGMA_FRAMES = 1.2    # solved/unsolved cross-fade width
+# Multi-camera merge of the fits (solve_hands_merged).
+_K_VIEW = 0.85               # how much less a camera is believed about
+                             # a bend that moves the finger ALONG its
+                             # sightline (two_camera_merge.K_AXIS, for
+                             # the same reason)
+_RESID_FLOOR = 0.05          # weight ~ 1 / (floor + fit residual)^2
+_WEIGHT_SIGMA_FRAMES = 2.0   # weights are eased over time so a change
+                             # of camera is a glide, not a switch
+_PALM_AGREE_DEG = (60.0, 120.0)   # a camera whose palm sits this far
+                             # from the merged hand loses its say
+                             # (full below the first, none past the
+                             # second): a flipped hand estimate
 _STATIC_EPS_FRAC = 0.02      # skip-static: max keypoint move (fraction
                              # of palm span, ~4px on a 180px hand) below
                              # which a frame reuses the last solved
@@ -457,13 +481,12 @@ def _valid_2d(pts):
     return np.all(np.isfinite(pts)) and np.all(np.abs(pts) < 1e5)
 
 
-def _calibrate(hm, kp2d, global_rots, sample_frames):
-    """Pick (image y-sign, flexion sign) per hand by trying all four
-    combos on sample frames and keeping the best-fitting one."""
+def _calibration_costs(hm, kp2d, global_rots, sample_frames):
+    """Fit cost of each (image y-sign, flexion sign) combination on the
+    sample frames: {(ay, fs): (mean cost, fingers used)}."""
     side = hm["side"]
     k = _KP2D[side]
-    best = (1.0, 1.0)
-    best_cost = np.inf
+    costs = {}
     for ay in (1.0, -1.0):
         A = np.array([[1.0, 0.0, 0.0], [0.0, ay, 0.0]])
         for fs in (1.0, -1.0):
@@ -490,10 +513,235 @@ def _calibrate(hm, kp2d, global_rots, sample_frames):
                     cost += r / norm
                     used += 1
             if used:
-                cost /= used
-                if cost < best_cost:
-                    best_cost, best = cost, (ay, fs)
+                costs[(ay, fs)] = (cost / used, used)
+    return costs
+
+
+def _calibrate(hm, kp2d, global_rots, sample_frames):
+    """Pick (image y-sign, flexion sign) per hand by trying all four
+    combos on sample frames and keeping the best-fitting one."""
+    best = (1.0, 1.0)
+    best_cost = np.inf
+    for combo, (cost, _used) in _calibration_costs(
+            hm, kp2d, global_rots, sample_frames).items():
+        if cost < best_cost:
+            best_cost, best = cost, combo
     return best, best_cost
+
+
+def _fit_side(hm, kp2d, global_rots, ay, flex_sign, progress=None):
+    """Fit one hand to one camera's 2D keypoints, frame by frame. Reads
+    global_rots (for the hand bone's orientation) and changes nothing.
+    progress(frame) is called once per frame.
+
+    Returns the raw per-frame result: which frames were solved, the
+    finger angles and the palm correction on those frames, and how
+    well each finger and the palm fitted (residual as a fraction of
+    the palm's size in the picture; inf where not solved)."""
+    side = hm["side"]
+    k = _KP2D[side]
+    n_frames = global_rots.shape[0]
+    A = np.array([[1.0, 0.0, 0.0], [0.0, ay, 0.0]])
+
+    solved_mask = np.zeros(n_frames, bool)
+    th_arr = {name: np.zeros((n_frames, 3))
+              for name in hm["fingers"]}
+    rv_arr = np.zeros((n_frames, 3))
+    th_prev = {name: np.zeros(3) for name in hm["fingers"]}
+    finger_names = list(hm["fingers"])
+    palm_res = np.full(n_frames, np.inf)
+    finger_res = {name: np.full(n_frames, np.inf) for name in finger_names}
+
+    # Skip-static reuse: when this frame's hand keypoints barely
+    # moved from the LAST SOLVED frame, reuse that frame's result
+    # instead of re-solving. Comparing to the last *solved* frame
+    # (not the previous frame) means slow drift still accumulates
+    # to a real re-solve once it crosses the threshold, so this is
+    # effectively output-identical, not a running approximation.
+    last_solved_obs = None   # (K,2) keypoints of the last real solve
+    last_solved_norm = 0.0
+    last_solved_rv = np.zeros(3)
+    last_solved_fr = -1
+    reused = 0
+
+    def _gather_obs(fr):
+        palm = np.stack(
+            [kp2d[fr, k["wrist"]]]
+            + [kp2d[fr, k["fingers"][nm][0]] for nm in finger_names])
+        fobs = {nm: kp2d[fr, list(k["fingers"][nm][1:])]
+                for nm in finger_names}
+        ok = _valid_2d(palm) and all(_valid_2d(o) for o in fobs.values())
+        allpts = np.concatenate([palm] + [fobs[nm] for nm in finger_names])
+        return palm, fobs, ok, allpts
+
+    for fr in range(n_frames):
+        if progress is not None:
+            progress(fr)
+        obs_palm, finger_obs, all_ok, all_pts = _gather_obs(fr)
+        if not _valid_2d(obs_palm):
+            continue
+
+        # Reuse the last solved frame if the hand is effectively
+        # static (all keypoints within _STATIC_EPS_FRAC of the palm
+        # span). The solver is deterministic + continuous, so near-
+        # identical input gives near-identical output; smoothing
+        # erases the sub-threshold difference.
+        if (all_ok and last_solved_obs is not None
+                and np.max(np.linalg.norm(
+                    all_pts - last_solved_obs, axis=1))
+                < _STATIC_EPS_FRAC * last_solved_norm):
+            solved_mask[fr] = True
+            rv_arr[fr] = last_solved_rv
+            palm_res[fr] = palm_res[last_solved_fr]
+            for nm in finger_names:
+                th_arr[nm][fr] = th_prev[nm]
+                finger_res[nm][fr] = finger_res[nm][last_solved_fr]
+            reused += 1
+            continue
+
+        M3, s, c, p_resid, rv = _refine_palm_pose(
+            A, global_rots[fr, hm["hand"]], hm["palm_pts"], obs_palm)
+        norm = max(s * hm["palm_extent"], 1e-6)
+        if norm < _MIN_PALM_SPAN_PX or p_resid > _PALM_RESID_FRAC * norm:
+            continue
+
+        resids, frame_th = [], {}
+        for name, f in hm["fingers"].items():
+            obs3 = finger_obs[name]
+            if not _valid_2d(obs3):
+                frame_th = None
+                break
+            th, r = _solve_finger(f, M3, s, c, obs3, norm,
+                                  th_prev[name], flex_sign)
+            resids.append(r)
+            frame_th[name] = th
+            th_prev[name] = th
+        if frame_th is None:
+            continue
+        if np.mean(resids) > _FINGER_RESID_FRAC * norm:
+            continue
+
+        solved_mask[fr] = True
+        rv_arr[fr] = rv
+        palm_res[fr] = p_resid / norm
+        for (name, th), r in zip(frame_th.items(), resids):
+            th_arr[name][fr] = th
+            finger_res[name][fr] = r / norm
+        # Anchor for skip-static: this frame's keypoints + result.
+        if all_ok:
+            last_solved_obs = all_pts
+            last_solved_norm = norm
+            last_solved_rv = rv
+            last_solved_fr = fr
+
+    return {"solved": solved_mask, "th": th_arr, "rv": rv_arr,
+            "reused": reused, "palm_res": palm_res,
+            "finger_res": finger_res}
+
+
+def _smooth_fit(hm, th_arr, rv_arr, solved_mask):
+    """Light temporal smoothing of the solved angles AND the palm
+    correction: per-frame keypoint noise otherwise reads as
+    finger/wrist jitter on quiet hands. Window 5 / order 2 keeps
+    real transitions (a counted finger flips in ~4-6 frames)
+    while flattening 1-frame noise. Unsolved frames are filled by
+    interpolation. Returns new (th_arr, rv_arr)."""
+    n_frames = len(solved_mask)
+    th_arr = dict(th_arr)
+    idx = np.where(solved_mask)[0]
+    grid = np.arange(n_frames)
+    if len(idx) >= 5 and n_frames >= 5:
+        from scipy.signal import savgol_filter
+        for name in hm["fingers"]:
+            th = th_arr[name]
+            filled = np.stack(
+                [np.interp(grid, idx, th[idx, c3]) for c3 in range(3)],
+                axis=1)
+            th_arr[name] = savgol_filter(filled, 5, 2, axis=0)
+        rv_filled = np.stack(
+            [np.interp(grid, idx, rv_arr[idx, c3]) for c3 in range(3)],
+            axis=1)
+        rv_arr = savgol_filter(rv_filled, 5, 2, axis=0)
+    return th_arr, _cap_palm_correction(rv_arr)
+
+
+def _cap_palm_correction(rv_arr):
+    """Safety cap on the palm correction magnitude (~57 deg)."""
+    rv_arr = np.array(rv_arr, dtype=np.float64)
+    mags = np.linalg.norm(rv_arr, axis=1)
+    over = mags > 1.0
+    if np.any(over):
+        rv_arr[over] *= (1.0 / mags[over])[:, None]
+    return rv_arr
+
+
+def _write_side(global_rots, hm, th_arr, rv_arr, solved_mask, flex_sign,
+                R0):
+    """Write one hand's (smoothed) solution into global_rots: the palm
+    correction on the hand bone, and the finger chains. Frames that
+    were not solved keep the model's rotations, with a short
+    cross-fade at the boundaries."""
+    n_frames = global_rots.shape[0]
+    idx = np.where(solved_mask)[0]
+    n_solved = int(solved_mask.sum())
+
+    # Chain rotations from the (smoothed) angles.
+    chain_R = {name: np.tile(np.eye(3), (n_frames, 3, 1, 1))
+               for name in hm["fingers"]}
+    for name, f in hm["fingers"].items():
+        th = th_arr[name]
+        for fr in idx:
+            Rs = _finger_fk(f, th[fr], flex_sign)[0]
+            chain_R[name][fr, 0] = Rs[0]
+            chain_R[name][fr, 1] = Rs[1]
+            chain_R[name][fr, 2] = Rs[2]
+
+    # Cross-fade weight: 1 on solved frames, easing to 0 near
+    # unsolved ones so the model/solver switch never pops.
+    w = solved_mask.astype(np.float64)
+    if 0 < n_solved < n_frames:
+        radius = int(np.ceil(3 * _BLEND_SIGMA_FRAMES))
+        kern = np.exp(-0.5 * (np.arange(-radius, radius + 1)
+                              / _BLEND_SIGMA_FRAMES) ** 2)
+        kern /= kern.sum()
+        w = np.convolve(w, kern, mode="same")
+        w[~solved_mask] = np.minimum(w[~solved_mask], 0.85)
+        w = np.clip(w, 0.0, 1.0)
+
+    hand = hm["hand"]
+    # Palm-orientation write-back: rotate the hand bone by the
+    # fitted correction (blended by w like the fingers) so the
+    # whole hand faces where the video says it faces. Without this
+    # the solved curls attach to the model's mis-rotated palm and
+    # sweep diagonally toward the knife edge of the hand.
+    G_hand_corr = np.stack(
+        [_rot_about_vec(rv_arr[f]) @ global_rots[f, hand]
+         for f in range(n_frames)])
+    q_old_h = _rotmats_to_quats_xyzw(global_rots[:, hand])
+    q_new_h = _rotmats_to_quats_xyzw(G_hand_corr)
+    global_rots[:, hand] = quats_xyzw_to_rotmats(
+        _slerp_quats_xyzw(q_old_h, q_new_h, w[:, None]))
+
+    # Write back fingers: solved world rotation for chain joint j is
+    #   G_hand @ R_chain @ R0[hand]^T @ R0[j]
+    # (rigid hand carry composed with the solved hand-frame chain,
+    # G_hand now palm-corrected), blended toward the model's own
+    # rotation by w.
+    R0h_T = R0[hand].T
+    for name, f in hm["fingers"].items():
+        joints = f["joints"]           # (mcp, pip, dip, tip)
+        for ci, j in enumerate(joints):
+            rig = R0h_T @ R0[j]
+            chain_idx = min(ci, 2)      # tip rides the distal chain
+            G_new = np.einsum(
+                "nij,njk,kl->nil",
+                global_rots[:, hand],
+                chain_R[name][:, chain_idx],
+                rig)
+            q_new = _rotmats_to_quats_xyzw(G_new)
+            q_old = _rotmats_to_quats_xyzw(global_rots[:, j])
+            q = _slerp_quats_xyzw(q_old, q_new, w[:, None])
+            global_rots[:, j] = quats_xyzw_to_rotmats(q)
 
 
 def solve_hands(global_rots, keypoints_2d, parents, offsets_cm, R0,
@@ -527,188 +775,226 @@ def solve_hands(global_rots, keypoints_2d, parents, offsets_cm, R0,
 
     for hnum, side in enumerate(("right", "left"), 1):
         hm = _build_hand_model(side, parents, rest, R0)
-        k = _KP2D[side]
         (ay, flex_sign), cal_cost = _calibrate(hm, kp2d, global_rots,
                                                sample)
-        A = np.array([[1.0, 0.0, 0.0], [0.0, ay, 0.0]])
 
-        solved_mask = np.zeros(n_frames, bool)
-        th_arr = {name: np.zeros((n_frames, 3))
-                  for name in hm["fingers"]}
-        rv_arr = np.zeros((n_frames, 3))
-        th_prev = {name: np.zeros(3) for name in hm["fingers"]}
-        finger_names = list(hm["fingers"])
-
-        # Skip-static reuse: when this frame's hand keypoints barely
-        # moved from the LAST SOLVED frame, reuse that frame's result
-        # instead of re-solving. Comparing to the last *solved* frame
-        # (not the previous frame) means slow drift still accumulates
-        # to a real re-solve once it crosses the threshold, so this is
-        # effectively output-identical, not a running approximation.
-        last_solved_obs = None   # (K,2) keypoints of the last real solve
-        last_solved_norm = 0.0
-        last_solved_rv = np.zeros(3)
-        reused = 0
-
-        def _gather_obs(fr):
-            palm = np.stack(
-                [kp2d[fr, k["wrist"]]]
-                + [kp2d[fr, k["fingers"][nm][0]] for nm in finger_names])
-            fobs = {nm: kp2d[fr, list(k["fingers"][nm][1:])]
-                    for nm in finger_names}
-            ok = _valid_2d(palm) and all(_valid_2d(o) for o in fobs.values())
-            allpts = np.concatenate([palm] + [fobs[nm] for nm in finger_names])
-            return palm, fobs, ok, allpts
-
-        for fr in range(n_frames):
+        def _tick(fr, hnum=hnum):
             steps_done[0] += 1
             if progress_cb is not None and (fr & 7) == 0:
                 progress_cb(steps_done[0], total_steps,
                             f"hand {hnum}/2, frame {fr + 1}/{n_frames}")
-            obs_palm, finger_obs, all_ok, all_pts = _gather_obs(fr)
-            if not _valid_2d(obs_palm):
-                continue
 
-            # Reuse the last solved frame if the hand is effectively
-            # static (all keypoints within _STATIC_EPS_FRAC of the palm
-            # span). The solver is deterministic + continuous, so near-
-            # identical input gives near-identical output; smoothing
-            # erases the sub-threshold difference.
-            if (all_ok and last_solved_obs is not None
-                    and np.max(np.linalg.norm(
-                        all_pts - last_solved_obs, axis=1))
-                    < _STATIC_EPS_FRAC * last_solved_norm):
-                solved_mask[fr] = True
-                rv_arr[fr] = last_solved_rv
-                for nm in finger_names:
-                    th_arr[nm][fr] = th_prev[nm]
-                reused += 1
-                continue
-
-            M3, s, c, p_resid, rv = _refine_palm_pose(
-                A, global_rots[fr, hm["hand"]], hm["palm_pts"], obs_palm)
-            norm = max(s * hm["palm_extent"], 1e-6)
-            if norm < _MIN_PALM_SPAN_PX or p_resid > _PALM_RESID_FRAC * norm:
-                continue
-
-            resids, frame_th = [], {}
-            for name, f in hm["fingers"].items():
-                obs3 = finger_obs[name]
-                if not _valid_2d(obs3):
-                    frame_th = None
-                    break
-                th, r = _solve_finger(f, M3, s, c, obs3, norm,
-                                      th_prev[name], flex_sign)
-                resids.append(r)
-                frame_th[name] = th
-                th_prev[name] = th
-            if frame_th is None:
-                continue
-            if np.mean(resids) > _FINGER_RESID_FRAC * norm:
-                continue
-
-            solved_mask[fr] = True
-            rv_arr[fr] = rv
-            for name, th in frame_th.items():
-                th_arr[name][fr] = th
-            # Anchor for skip-static: this frame's keypoints + result.
-            if all_ok:
-                last_solved_obs = all_pts
-                last_solved_norm = norm
-                last_solved_rv = rv
-
-        # Light temporal smoothing of the solved angles AND the palm
-        # correction: per-frame keypoint noise otherwise reads as
-        # finger/wrist jitter on quiet hands. Window 5 / order 2 keeps
-        # real transitions (a counted finger flips in ~4-6 frames)
-        # while flattening 1-frame noise.
-        idx = np.where(solved_mask)[0]
-        grid = np.arange(n_frames)
-        if len(idx) >= 5 and n_frames >= 5:
-            from scipy.signal import savgol_filter
-            for name in hm["fingers"]:
-                th = th_arr[name]
-                filled = np.stack(
-                    [np.interp(grid, idx, th[idx, c3]) for c3 in range(3)],
-                    axis=1)
-                th_arr[name] = savgol_filter(filled, 5, 2, axis=0)
-            rv_filled = np.stack(
-                [np.interp(grid, idx, rv_arr[idx, c3]) for c3 in range(3)],
-                axis=1)
-            rv_arr = savgol_filter(rv_filled, 5, 2, axis=0)
-        # Safety cap on the palm correction magnitude (~57 deg).
-        mags = np.linalg.norm(rv_arr, axis=1)
-        over = mags > 1.0
-        if np.any(over):
-            rv_arr[over] *= (1.0 / mags[over])[:, None]
-
-        # Chain rotations from the (smoothed) angles.
-        chain_R = {name: np.tile(np.eye(3), (n_frames, 3, 1, 1))
-                   for name in hm["fingers"]}
-        for name, f in hm["fingers"].items():
-            th = th_arr[name]
-            for fr in idx:
-                Rs = _finger_fk(f, th[fr], flex_sign)[0]
-                chain_R[name][fr, 0] = Rs[0]
-                chain_R[name][fr, 1] = Rs[1]
-                chain_R[name][fr, 2] = Rs[2]
+        fit = _fit_side(hm, kp2d, global_rots, ay, flex_sign, _tick)
+        solved_mask = fit["solved"]
+        th_arr, rv_arr = _smooth_fit(hm, fit["th"], fit["rv"], solved_mask)
 
         n_solved = int(solved_mask.sum())
         summary[side] = n_solved
         summary[side + "_mask"] = solved_mask
         if verbose:
             print(f"       Hand solver [{side:5s}]: {n_solved}/{n_frames} "
-                  f"frames fit ({reused} reused static, axis cal "
+                  f"frames fit ({fit['reused']} reused static, axis cal "
                   f"{ay:+.0f}/{flex_sign:+.0f})")
         if not n_solved:
             continue
         summary["any_solved"] = True
+        _write_side(global_rots, hm, th_arr, rv_arr, solved_mask,
+                    flex_sign, R0)
 
-        # Cross-fade weight: 1 on solved frames, easing to 0 near
-        # unsolved ones so the model/solver switch never pops.
-        w = solved_mask.astype(np.float64)
-        if 0 < n_solved < n_frames:
-            radius = int(np.ceil(3 * _BLEND_SIGMA_FRAMES))
-            kern = np.exp(-0.5 * (np.arange(-radius, radius + 1)
-                                  / _BLEND_SIGMA_FRAMES) ** 2)
-            kern /= kern.sum()
-            w = np.convolve(w, kern, mode="same")
-            w[~solved_mask] = np.minimum(w[~solved_mask], 0.85)
-            w = np.clip(w, 0.0, 1.0)
+    return summary
 
+
+def _view_factors(hm, th_arr, flex_sign, G_hand, sight):
+    """How well a camera sees each of a finger's three angles, per
+    frame: {finger: (n, 3)} in [1 - _K_VIEW, 1].
+
+    The same reasoning as two_camera_merge.axis_precision, for a hinge:
+    changing an angle swings the rest of the finger about that joint's
+    axis, and the camera reads the swing well where it runs ACROSS the
+    picture and poorly where it runs along the sightline. So the factor
+    is 1 minus the share of that swing that points along the sightline.
+    G_hand: the hand's orientation, sight: unit direction from the
+    camera to the hand, both in the camera's own frame."""
+    n_frames = len(sight)
+    s_h = np.einsum('fji,fj->fi', G_hand, sight)    # in the hand frame
+    I = np.eye(3)
+    out = {}
+    for name, f in hm["fingers"].items():
+        v = np.empty((n_frames, 3))
+        Ks, KKs = f["K_spread"], f["KK_spread"]
+        for fr in range(n_frames):
+            th = th_arr[name][fr]
+            (R_m, _R_p, _R_d), (p_pip, p_dip, p_tip) = _finger_fk(
+                f, th, flex_sign)
+            R_s = I + np.sin(th[0]) * Ks + (1.0 - np.cos(th[0])) * KKs
+            base = f["h_mcp"]
+            knuckle = (p_pip - base, p_dip - base, p_tip - base)
+            mid = (p_dip - p_pip, p_tip - p_pip)
+            for dof, axis, levers in (
+                    (0, f["spread_axis"], knuckle),
+                    (1, R_s @ f["flex_axis"], knuckle),
+                    (2, R_m @ f["flex_axis"], mid)):
+                along = total = 0.0
+                for d in levers:
+                    swing = np.cross(axis, d)
+                    along += float(s_h[fr] @ swing) ** 2
+                    total += float(swing @ swing)
+                v[fr, dof] = 1.0 - _K_VIEW * (along / total
+                                              if total > 1e-12 else 0.5)
+        out[name] = v
+    return out
+
+
+def solve_hands_merged(global_rots, cameras, parents, offsets_cm, R0,
+                       verbose=True, progress_cb=None, details=None):
+    """solve_hands for a take merged from several cameras. Mutates
+    global_rots (the MERGED take's) in place and returns the same kind
+    of summary, plus 'cameras': {label: {'right': n, 'left': n}}.
+
+    cameras: one dict per camera, every array cut to the merged take's
+    frames:
+      label         'A', 'B', ...
+      global_rots   that camera's own capture (its raw frame)
+      keypoints_2d  that camera's 2D keypoints
+      joint_coords, cam_t   that camera's capture (for its sightline
+                    to each hand)
+      to_merged     3x3 rotation taking that camera's global_rots
+                    frame to the merged take's
+      share         optional {'right': (n,), 'left': (n,)}: how far the
+                    body merge trusted this camera for that arm, 0..1
+    details: pass a dict to receive the per-camera fits and the merged
+    result (dev tools measure with it)."""
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.spatial.transform import Rotation
+
+    n_frames = global_rots.shape[0]
+    rest = compute_world_positions(parents, offsets_cm, R0)
+    summary = {"n_frames": n_frames, "any_solved": False,
+               "cameras": {c["label"]: {} for c in cameras}}
+    sample = list(range(0, n_frames, max(1, n_frames // 12)))[:12]
+    total_steps = max(1, 2 * n_frames * len(cameras))
+    steps_done = [0]
+    flip = np.diag([1.0, -1.0, -1.0])     # camera space (y down) -> y up
+    lo_deg, hi_deg = _PALM_AGREE_DEG
+
+    def _ease(x):
+        return gaussian_filter1d(x, _WEIGHT_SIGMA_FRAMES, axis=0,
+                                 mode="nearest")
+
+    for hnum, side in enumerate(("right", "left"), 1):
+        hm = _build_hand_model(side, parents, rest, R0)
         hand = hm["hand"]
-        # Palm-orientation write-back: rotate the hand bone by the
-        # fitted correction (blended by w like the fingers) so the
-        # whole hand faces where the video says it faces. Without this
-        # the solved curls attach to the model's mis-rotated palm and
-        # sweep diagonally toward the knife edge of the hand.
-        G_hand_corr = np.stack(
-            [_rot_about_vec(rv_arr[f]) @ global_rots[f, hand]
-             for f in range(n_frames)])
-        q_old_h = _rotmats_to_quats_xyzw(global_rots[:, hand])
-        q_new_h = _rotmats_to_quats_xyzw(G_hand_corr)
-        global_rots[:, hand] = quats_xyzw_to_rotmats(
-            _slerp_quats_xyzw(q_old_h, q_new_h, w[:, None]))
 
-        # Write back fingers: solved world rotation for chain joint j is
-        #   G_hand @ R_chain @ R0[hand]^T @ R0[j]
-        # (rigid hand carry composed with the solved hand-frame chain,
-        # G_hand now palm-corrected), blended toward the model's own
-        # rotation by w.
-        R0h_T = R0[hand].T
-        for name, f in hm["fingers"].items():
-            joints = f["joints"]           # (mcp, pip, dip, tip)
-            for ci, j in enumerate(joints):
-                rig = R0h_T @ R0[j]
-                chain_idx = min(ci, 2)      # tip rides the distal chain
-                G_new = np.einsum(
-                    "nij,njk,kl->nil",
-                    global_rots[:, hand],
-                    chain_R[name][:, chain_idx],
-                    rig)
-                q_new = _rotmats_to_quats_xyzw(G_new)
-                q_old = _rotmats_to_quats_xyzw(global_rots[:, j])
-                q = _slerp_quats_xyzw(q_old, q_new, w[:, None])
-                global_rots[:, j] = quats_xyzw_to_rotmats(q)
+        # One axis calibration for every camera: the angles are only
+        # the same quantity if every camera calls the same way "curl".
+        tally = {}
+        for cam in cameras:
+            for combo, (cost, used) in _calibration_costs(
+                    hm, cam["keypoints_2d"].astype(np.float64),
+                    cam["global_rots"], sample).items():
+                t = tally.setdefault(combo, [0.0, 0])
+                t[0] += cost * used
+                t[1] += used
+        ay, flex_sign = (min(tally, key=lambda c: tally[c][0] / tally[c][1])
+                         if tally else (1.0, 1.0))
+
+        G_m = global_rots[:, hand].copy()
+        per = []
+        for cam in cameras:
+            def _tick(fr, label=cam["label"]):
+                steps_done[0] += 1
+                if progress_cb is not None and (fr & 7) == 0:
+                    progress_cb(steps_done[0], total_steps,
+                                f"camera {label}, hand {hnum}/2, "
+                                f"frame {fr + 1}/{n_frames}")
+
+            g = cam["global_rots"]
+            fit = _fit_side(hm, cam["keypoints_2d"].astype(np.float64), g,
+                            ay, flex_sign, _tick)
+            th, rv = _smooth_fit(hm, fit["th"], fit["rv"], fit["solved"])
+            G_corr = np.stack([_rot_about_vec(rv[fr]) @ g[fr, hand]
+                               for fr in range(n_frames)])
+            to_hand = (np.asarray(cam["joint_coords"], np.float64)[:, hand]
+                       + np.asarray(cam["cam_t"], np.float64))
+            sight = (to_hand / np.maximum(np.linalg.norm(
+                to_hand, axis=1, keepdims=True), 1e-9)) @ flip
+            # this camera's palm, as a turn of the MERGED hand
+            T = np.asarray(cam["to_merged"], np.float64)
+            rvm = Rotation.from_matrix(np.einsum(
+                'ij,fjk,flk->fil', T, G_corr, G_m)).as_rotvec()
+            off = np.degrees(np.linalg.norm(rvm, axis=1))
+            agree = np.clip((hi_deg - off) / (hi_deg - lo_deg), 0.0, 1.0)
+            share = (cam.get("share") or {}).get(side)
+            share = (np.ones(n_frames) if share is None
+                     else np.clip(np.asarray(share, np.float64), 0.0, 1.0))
+            base = fit["solved"] * share * agree
+            per.append({"cam": cam, "fit": fit, "th": th, "rv": rv,
+                        "G_corr": G_corr, "sight": sight, "rvm": rvm,
+                        "base": base, "T": T,
+                        "view": _view_factors(hm, th, flex_sign, G_corr,
+                                              sight)})
+            summary["cameras"][cam["label"]][side] = int(fit["solved"].sum())
+
+        solved_mask = np.zeros(n_frames, bool)
+        for p in per:
+            solved_mask |= p["base"] > 0.02
+
+        # Fingers: each angle is the weighted mean of the cameras'.
+        th_m = {}
+        for name in hm["fingers"]:
+            num = np.zeros((n_frames, 3))
+            den = np.zeros((n_frames, 3))
+            for p in per:
+                res = p["fit"]["finger_res"][name]
+                q = np.where(np.isfinite(res), p["base"] / (
+                    _RESID_FLOOR + np.where(np.isfinite(res), res, 0.0)) ** 2,
+                    0.0)
+                W = _ease(q[:, None] * p["view"][name])
+                num += W * p["th"][name]
+                den += W
+            # where no camera has a say, the plain mean (those frames
+            # are not written; this only keeps the values finite)
+            plain = np.mean([p["th"][name] for p in per], axis=0)
+            th_m[name] = np.where(den > 1e-30,
+                                  num / np.maximum(den, 1e-30), plain)
+
+        # Palm: each camera is believed about the turn it sees flat in
+        # its picture (about its own sightline), less about the tilts.
+        num = np.zeros((n_frames, 3))
+        den = np.zeros((n_frames, 3, 3))
+        for p in per:
+            res = p["fit"]["palm_res"]
+            q = _ease(np.where(np.isfinite(res), p["base"] / (
+                _RESID_FLOOR + np.where(np.isfinite(res), res, 0.0)) ** 2,
+                0.0))
+            s_m = p["sight"] @ p["T"].T
+            P = ((1.0 - _K_VIEW) * np.eye(3)
+                 + _K_VIEW * s_m[:, :, None] * s_m[:, None, :])
+            den += q[:, None, None] * P
+            num += q[:, None] * np.einsum('fij,fj->fi', P, p["rvm"])
+        scale = np.trace(den, axis1=1, axis2=2)[:, None, None]
+        rv_m = _cap_palm_correction(np.linalg.solve(
+            den + (1e-6 * scale + 1e-30) * np.eye(3),
+            num[..., None])[..., 0])
+
+        n_solved = int(solved_mask.sum())
+        summary[side] = n_solved
+        summary[side + "_mask"] = solved_mask
+        if verbose:
+            each = ", ".join(
+                f"camera {p['cam']['label']} "
+                f"{int(p['fit']['solved'].sum())}" for p in per)
+            print(f"       Hand solver [{side:5s}]: {n_solved}/{n_frames} "
+                  f"frames fit ({each}; axis cal "
+                  f"{ay:+.0f}/{flex_sign:+.0f})")
+        if details is not None:
+            details[side] = {"hm": hm, "per": per, "th": th_m, "rv": rv_m,
+                             "solved": solved_mask, "ay": ay,
+                             "flex_sign": flex_sign, "G_m": G_m}
+        if not n_solved:
+            continue
+        summary["any_solved"] = True
+        _write_side(global_rots, hm, th_m, rv_m, solved_mask, flex_sign,
+                    R0)
 
     return summary

@@ -274,7 +274,7 @@ def stabilize_landmarks(landmarks, detected, mp_blendshape_sum=None,
     if template[MOUTH_CORNER_LEFT, 0] <= template[MOUTH_CORNER_RIGHT, 0]:
         print("  WARNING: canonical-frame side check failed "
               "(left mouth corner not at +X). Left/Right face channels "
-              "may be swapped — please report this clip.")
+              "may be swapped - please report this clip.")
 
     return {
         "stab": stab,

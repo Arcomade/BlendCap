@@ -40,6 +40,10 @@
 #   --smooth-vertical N  Gaussian on vertical root motion, sigma N seconds
 #                     (e.g. 0.08). Kept separate and small so jump arcs survive.
 #   --smooth-face N   Savitzky-Golay on face data, window N seconds (e.g. 0.23)
+#   --smooth-head N   Savitzky-Golay on Head+Neck rotations, window N seconds
+#                     (these joints are excluded from --smooth)
+#   --head-denoise-nod/turn/tilt D   per-axis dead-zone on Head+Neck rotation
+#                     jitter, threshold D degrees (pitch/yaw/roll)
 #                     Smooths landmarks, blendshapes, eye gaze.
 #
 # Face bones (from face_frames.npz):
@@ -73,7 +77,7 @@ import argparse
 import os
 import sys
 
-from pipeline.bvh_math import HAS_SCIPY, smooth_face_data
+from pipeline.bvh_math import HAS_SCIPY, smooth_face_data, ease_face_dropouts
 from pipeline.face_export import load_face_data, load_face_calibration
 from pipeline.modes import run_body, run_face, run_hands, run_root
 
@@ -95,7 +99,7 @@ def _build_argparser():
                              "hands/root produce standalone armatures from "
                              "the body NPZ. template produces a 1-frame "
                              "T-pose body+hands armature with no input NPZ "
-                             "required — used by the BlendCap addon's "
+                             "required - used by the BlendCap addon's "
                              "'Import BlendCap Armature' button so users can "
                              "pose it and save a custom rest-pose preset.")
     parser.add_argument("--output", default="output.bvh",
@@ -127,7 +131,8 @@ def _build_argparser():
     parser.add_argument("--smooth-root", type=float, default=0,
                         help="Gaussian sigma for root position in seconds "
                              "(e.g. 0.27). FPS-independent: converted to "
-                             "frames at runtime. Depth axis auto gets 2x. "
+                             "frames at runtime. Depth axis auto gets 2x "
+                             "(not on a multi-camera take). "
                              "X/Z only. 0 = off.")
     parser.add_argument("--smooth-vertical", type=float, default=0,
                         help="Gaussian sigma for vertical root motion in "
@@ -140,6 +145,34 @@ def _build_argparser():
                              "converted to a frame window using the "
                              "face NPZ's fps. Zero-phase by construction "
                              "(centered convolution). 0 = off.")
+    parser.add_argument("--smooth-head", type=float, default=0.23,
+                        help="Savitzky-Golay window for Head+Neck "
+                             "rotations in seconds. These two joints are "
+                             "EXCLUDED from --smooth and owned by this "
+                             "flag, so head smoothing can be tuned "
+                             "independently of the body. Same filter as "
+                             "--smooth: at equal values the output is "
+                             "numerically identical to the old combined "
+                             "pass. 0 = off.")
+    parser.add_argument("--head-denoise-nod", type=float, default=0,
+                        help="Dead-zone threshold in DEGREES for head "
+                             "nodding wobble (pitch). WORLD-SPACE: the "
+                             "head's world orientation is stabilized "
+                             "and the correction written to the Head "
+                             "bone, because the wobble is smeared "
+                             "across the whole hips-spine-neck chain "
+                             "and no single joint's channels carry it. "
+                             "Wobble below the threshold collapses to "
+                             "a smoothed baseline; motion above 2x "
+                             "passes through untouched. 0 = off.")
+    parser.add_argument("--head-denoise-turn", type=float, default=0,
+                        help="Dead-zone threshold in DEGREES for head "
+                             "shake wobble (yaw), world-space as "
+                             "above. 0 = off.")
+    parser.add_argument("--head-denoise-tilt", type=float, default=0,
+                        help="Dead-zone threshold in DEGREES for head "
+                             "ear-to-shoulder wobble (roll), world-"
+                             "space as above. 0 = off.")
     parser.add_argument("--face-refine",
                         choices=["off", "geometric", "full"],
                         default=os.environ.get("BLENDCAP_FACE_REFINE",
@@ -214,6 +247,34 @@ def _build_argparser():
                              "real articulation the 3D rotation output "
                              "dampens. When on, --finger-boost is "
                              "skipped. Env override: BLENDCAP_HAND_SOLVER.")
+    parser.add_argument("--people-capture", default="",
+                        help="Multi-Person Capture: the capture's folder. The "
+                             "person named by --person is first written out as "
+                             "an ordinary capture into the folder --input (and "
+                             "--face) point into, with the corrections made in "
+                             "the addon's People list applied, and the export "
+                             "then runs on that. See pipeline/people_tracks.py.")
+    parser.add_argument("--person", type=int, default=0,
+                        help="Which person of --people-capture (their number "
+                             "in the People list).")
+    parser.add_argument("--camera-sidecar", default="",
+                        help="Write the capture camera (position, tilt, "
+                             "lens) in the BVH's world to this JSON file, "
+                             "for the addon's Add Camera. Body exports "
+                             "only. See pipeline/capture_camera.py.")
+    parser.add_argument("--camera-view", choices=["a", "b", "c", "d", "all"],
+                        default="a",
+                        help="Multi-camera takes: which of the cameras "
+                             "--camera-sidecar describes. 'all' writes "
+                             "every camera of the capture (what the addon "
+                             "asks for, so Add Camera needs no new export).")
+    parser.add_argument("--hold-cropped-limbs", action="store_true",
+                        help="Hold body parts still while they are outside "
+                             "the picture instead of animating the model's "
+                             "guess (per frame; legs -> standing pose, "
+                             "arms/head -> last seen pose). Feet that were "
+                             "not filmed give no plants to foot locking / "
+                             "grounding. See pipeline/cropped_limbs.py.")
     parser.add_argument("--face-boost", type=float, default=1.0,
                         help="Scale face bone blendshape-driven position offsets. "
                              "Higher = more expressive face animation. "
@@ -250,7 +311,7 @@ def _build_argparser():
                              "rises higher than this between contacts.")
     parser.add_argument("--recover-glitches", action="store_true",
                         help="Bridge longer gaps when the foot stayed "
-                             "near the floor and didn't move horizontally — "
+                             "near the floor and didn't move horizontally - "
                              "catches longer SAM tracking misreads. "
                              "Off by default; can erase small genuine "
                              "steps when on.")
@@ -380,6 +441,10 @@ def _validate_smoothing_flags(args):
         print("WARNING: --smooth-vertical requires scipy (pip install scipy)")
         args.smooth_vertical = 0
 
+    if args.smooth_head > 0 and not HAS_SCIPY:
+        print("WARNING: --smooth-head requires scipy (pip install scipy)")
+        args.smooth_head = 0
+
     if args.body_grounding and not HAS_SCIPY:
         print("WARNING: --body-grounding requires scipy (pip install scipy)")
         args.body_grounding = False
@@ -408,7 +473,9 @@ def _print_summary(args, export_mode, info):
         if not args.no_center:
             print(f"Root centered at origin: ON")
         if args.smooth_root > 0:
-            print(f"Root smoothing: Gaussian sigma={args.smooth_root:.2f} s (depth 2x)")
+            print(f"Root smoothing: Gaussian sigma={args.smooth_root:.2f} s "
+                  + ("(depth not doubled: multi-camera take)"
+                     if info.get("depth_measured") else "(depth 2x)"))
         if args.smooth_vertical > 0:
             print(f"Vertical smoothing: Gaussian sigma={args.smooth_vertical:.2f} s")
         if args.body_grounding:
@@ -416,6 +483,14 @@ def _print_summary(args, export_mode, info):
                   f"{args.body_catch_distance:.2f} m)")
         if args.smooth > 0:
             print(f"Rotation smoothing: Savitzky-Golay window={args.smooth:.2f} s")
+        if args.smooth_head > 0:
+            print(f"Head rotation smoothing: Savitzky-Golay "
+                  f"window={args.smooth_head:.2f} s (Head+Neck)")
+        _hd = (args.head_denoise_nod, args.head_denoise_turn,
+               args.head_denoise_tilt)
+        if any(t > 0 for t in _hd):
+            print(f"Head noise filtering: nod={_hd[0]:.1f}deg "
+                  f"turn={_hd[1]:.1f}deg tilt={_hd[2]:.1f}deg")
 
     if export_mode in ("face", "both"):
         face_bone_data = info.get("face_bone_data")
@@ -431,8 +506,36 @@ def _print_summary(args, export_mode, info):
         print(f"Root armature: standalone (single Root bone, cam_t motion)")
 
 
+def _extract_person(args):
+    """Multi-Person Capture: build the chosen person's own capture
+    before anything reads --input / --face."""
+    from pipeline.people_tracks import extract_person
+    target = args.input or args.face
+    if not target:
+        print("ERROR: --people-capture needs --input or --face to say "
+              "where the person's capture goes.")
+        sys.exit(1)
+    out_dir = os.path.dirname(os.path.abspath(target))
+    try:
+        # (a multi-camera take: the person's cameras are merged here,
+        # which needs the body model's file)
+        _body, face = extract_person(args.people_capture, args.person, out_dir,
+                                     mhr_model=args.mhr_model)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+    if args.face and face is None:
+        if not args.input or args.export == "face":
+            print(f"ERROR: Person {args.person} has no face data in this capture.")
+            sys.exit(1)
+        print(f"[WARNING] Person {args.person} has no face data; exported without a face.")
+        args.face = ""
+
+
 def main():
     args = _build_argparser().parse_args()
+    if args.people_capture:
+        _extract_person(args)
     export_mode = _resolve_export_mode(args)
     print(f"Export mode: {export_mode}")
 
@@ -473,6 +576,12 @@ def main():
         # 0 disables. See pipeline/bvh_math.py for the filter.
         if args.smooth_face > 0:
             smooth_face_data(face_data, window_s=float(args.smooth_face))
+
+        # Dropouts: the expression fades to rest into a stretch of
+        # frames without a face and back out of it, instead of cutting.
+        # After smoothing (which must see the readings as they are),
+        # with or without it.
+        ease_face_dropouts(face_data)
 
         # Face denoise: per-region dead-zone, applied AFTER smoothing
         # so the threshold operates on already-filtered values.

@@ -21,7 +21,7 @@ from .helpers import (
     _addon_dir, _python_exe, _tag_redraw, addon_prefs,
     _host_spawn_prefix, _subprocess_env,
     _seq_accessors, _strip_visible_start, _strip_visible_end,
-    _import_bvh, _write_cache_params,
+    _import_bvh, _write_cache_params, bvh_importer_state,
     _ansi_re, _progress_re, _warning_re, _frame_re, _tqdm_re,
     _capture_noise_re,
     format_workspace_status,
@@ -50,6 +50,11 @@ def load_proxy_to_viewport(proxy_path, source_path, strip_name="BlendCap_Preview
         empty.rotation_euler = (math.radians(90), 0, 0)
     else:
         empty.name = strip_name
+    # The plane is reused for every File Path capture: whatever it shows
+    # next is not the multi-camera capture it may have shown before
+    # (multicam.load_to_viewport stamps it again when it is one).
+    if "blendcap_multicam" in empty:
+        del empty["blendcap_multicam"]
 
     img_name = os.path.basename(proxy_path)
     if img_name in bpy.data.images:
@@ -75,6 +80,68 @@ def load_proxy_to_viewport(proxy_path, source_path, strip_name="BlendCap_Preview
     if source_strip:
         empty["blendcap_source_strip"] = source_strip
     _tag_redraw('VIEW_3D')
+
+
+def _strip_colorspace(strip):
+    """Name of a strip's input colour space, '' when it has none."""
+    try:
+        cs = getattr(strip, "colorspace_settings", None)
+        return str(cs.name) if cs is not None else ""
+    except Exception:
+        return ""
+
+
+def _set_strip_colorspace(strip, name):
+    """Set a strip's input colour space. True only when it changed;
+    a name this colour configuration doesn't have is left alone."""
+    if not name:
+        return False
+    try:
+        cs = getattr(strip, "colorspace_settings", None)
+        if cs is None or cs.name == name:
+            return False
+        cs.name = name
+        return cs.name == name
+    except Exception:
+        return False
+
+
+def _replaced_colorspace(strip):
+    """Colour spaces to carry over from a strip an overlay is about to
+    replace: (space for the overlay, space of the original clip).
+
+    The sequencer guard only acts when the strip count goes up, and a
+    replace leaves it unchanged, so without this the overlay comes in
+    as plain sRGB and shows tone-mapped under AgX / Filmic while the
+    clip it replaced showed as-is.
+
+    The overlay is an 8-bit movie holding the source's own pixels, so
+    it takes the replaced strip's space when that strip is a movie
+    (an earlier overlay included). An image sequence only passes on a
+    round-trip space ('AgX Base sRGB' / 'Filmic sRGB'): a linear EXR
+    space would be wrong on the overlay movie.
+
+    The original's space is what Revert puts back. An earlier overlay
+    hands on the one it was stamped with."""
+    space = _strip_colorspace(strip)
+    try:
+        is_overlay = "blendcap_source" in strip
+    except Exception:
+        is_overlay = False
+    if is_overlay:
+        try:
+            original = str(strip.get("blendcap_original_colorspace", "") or "")
+        except Exception:
+            original = ""
+        return space, original
+    if getattr(strip, "type", "") == 'IMAGE':
+        try:
+            from .sequencer_guard import _ROUNDTRIP
+            roundtrip = set(_ROUNDTRIP.values())
+        except Exception:
+            roundtrip = {'AgX Base sRGB', 'Filmic sRGB'}
+        return (space if space in roundtrip else ""), space
+    return space, space
 
 
 def load_proxy_to_vse(proxy_path, source_path, source_start, source_max,
@@ -103,12 +170,17 @@ def load_proxy_to_vse(proxy_path, source_path, source_start, source_max,
         insert_channel = 1
         replace_name = ''
 
+    # Colour space carried over from the strip being replaced, read
+    # before it is removed (see _replaced_colorspace).
+    overlay_space = original_space = ""
+
     # Remove the strip we're replacing (by name, use its visible position)
     if replace_name:
         for s in list(seq_all):
             if s.name == replace_name:
                 insert_frame = _strip_visible_start(s)
                 insert_channel = s.channel
+                overlay_space, original_space = _replaced_colorspace(s)
                 seq_coll.remove(s)
                 break
     else:
@@ -119,11 +191,13 @@ def load_proxy_to_vse(proxy_path, source_path, source_start, source_max,
                 if sp == os.path.normpath(bpy.path.abspath(proxy_path)):
                     insert_channel = s.channel
                     insert_frame = _strip_visible_start(s)
+                    overlay_space, original_space = _replaced_colorspace(s)
                     seq_coll.remove(s)
                     break
                 if "blendcap_source" in s and os.path.normpath(bpy.path.abspath(str(s["blendcap_source"]))) == os.path.normpath(bpy.path.abspath(source_path)):
                     insert_channel = s.channel
                     insert_frame = _strip_visible_start(s)
+                    overlay_space, original_space = _replaced_colorspace(s)
                     seq_coll.remove(s)
                     break
 
@@ -132,6 +206,9 @@ def load_proxy_to_vse(proxy_path, source_path, source_start, source_max,
     # Force channel in case Blender auto-placed on a higher one
     if strip.channel != insert_channel:
         strip.channel = insert_channel
+
+    # Show the overlay the way the clip it replaced was shown.
+    _set_strip_colorspace(strip, overlay_space)
 
     # Scale strip to fit project frame (letterbox/pillarbox, never over-expand)
     scene_w = scene.render.resolution_x
@@ -155,6 +232,9 @@ def load_proxy_to_vse(proxy_path, source_path, source_start, source_max,
     # rather than forking based on the proxy's current name.
     if source_strip:
         strip["blendcap_source_strip"] = source_strip
+    # The original clip's colour space, for Revert.
+    if original_space:
+        strip["blendcap_original_colorspace"] = original_space
 
     if vse_replace:
         orig_type = vse_replace.get('strip_type', 'MOVIE')
@@ -219,6 +299,15 @@ def _revert_proxy_strip(strip, seq_coll, seq_all):
     # video again, so capture must read trim from the strip itself,
     # not from stored proxy values.
     source_strip_id = str(strip.get("blendcap_source_strip", "") or "")
+
+    # Colour space to put back on the restored strip: the original's
+    # own, stamped at capture. An overlay from before that stamp hands
+    # a movie original the space the overlay carries now (an image
+    # sequence keeps whatever Blender gives it). Read before the
+    # overlay is removed.
+    restore_space = str(strip.get("blendcap_original_colorspace", "") or "")
+    if not restore_space and original_type != 'IMAGE':
+        restore_space = _strip_colorspace(strip)
 
     # Use proxy's current visible position (user may have moved it)
     proxy_position = _strip_visible_start(strip)
@@ -327,6 +416,8 @@ def _revert_proxy_strip(strip, seq_coll, seq_all):
     if source_strip_id:
         new_strip["blendcap_source_strip"] = source_strip_id
 
+    _set_strip_colorspace(new_strip, restore_space)
+
     # Scale to fit project frame
     scene = bpy.context.scene
     scene_w = scene.render.resolution_x
@@ -375,6 +466,14 @@ def monitor_progress_timer():
                 win.workspace.status_text_set(None)
     except Exception: pass
 
+    # Face data may have landed in an existing capture folder: let the
+    # face-data dropdowns rebuild on their next draw.
+    try:
+        from .properties import face_cache_changed
+        face_cache_changed()
+    except Exception:
+        pass
+
     # Compute strip name from the resolved source-strip identifier
     # (not the file basename) so Blender-split source strips get
     # separate proxy names like Capture_myclip_001. Falls back to
@@ -394,7 +493,33 @@ def monitor_progress_timer():
         strip_name = f"Capture_{clip_name}"
     blendcap_state['_strip_type'] = 'preview' if is_preview else 'capture'
 
-    if blendcap_state['return_code'] == 0:
+    # A multi-camera capture (multicam.py): its own loader, per-camera
+    # cache records, and none of the single-camera cancel dialogs.
+    multicam_run = blendcap_state.get('multicam')
+    if multicam_run:
+        from . import multicam as _mc
+        # Cameras that finished are reusable whatever happened after.
+        _mc.write_camera_params(blendcap_state)
+
+    if blendcap_state['return_code'] == 0 and multicam_run:
+        _forget_sac_block()
+        print("\n[BlendCap] Complete. Loading result...")
+        _mc.load_result(blendcap_state['proxy_path'], multicam_run['record'])
+        lines = _mc.result_lines(blendcap_state)
+        blendcap_state['multicam'] = None
+        blendcap_state['warnings'] = lines + [
+            w for w in blendcap_state.get('warnings', []) if w not in lines]
+        if blendcap_state['warnings']:
+            def _deferred_multicam_popup():
+                try:
+                    bpy.ops.blendcap.show_warnings('INVOKE_DEFAULT')
+                except Exception as e:
+                    print(f"[BlendCap] Could not show warning popup: {e}")
+                return None
+            bpy.app.timers.register(_deferred_multicam_popup, first_interval=0.3)
+
+    elif blendcap_state['return_code'] == 0:
+        _forget_sac_block()   # the engine ran: nothing is blocked now
         proxy = blendcap_state['proxy_path']
         if proxy and os.path.exists(proxy):
             print("\n[BlendCap] Complete. Loading result...")
@@ -433,6 +558,17 @@ def monitor_progress_timer():
                                 blendcap_state.get('cache_capture_sig', ''),
                                 blendcap_state.get('cache_video_path', ''))
 
+        # A face step that failed and was dropped: say so first, above
+        # any tracking warnings (the dialog draws these lines even when
+        # it collapses the rest into the multi-subject notice).
+        fallback = blendcap_state.get('face_fallback')
+        if fallback:
+            fb_lines = _face_fallback_lines(fallback, output_dir)
+            blendcap_state['face_fallback_lines'] = fb_lines
+            blendcap_state['warnings'] = fb_lines + [
+                w for w in blendcap_state.get('warnings', [])
+                if w not in fb_lines]
+
         # Show multi-subject warning popup if any warnings accumulated
         warnings = blendcap_state.get('warnings', [])
         if warnings:
@@ -455,8 +591,14 @@ def monitor_progress_timer():
         face_done = 'face' in completed_labels
         n_total_steps = len(labels)
 
+        if multicam_run and len(completed) >= n_total_steps \
+                and os.path.exists(blendcap_state.get('proxy_path') or ""):
+            print("\n[BlendCap] Cancel arrived after completion. Loading result...")
+            _mc.load_result(blendcap_state['proxy_path'], multicam_run['record'])
+            blendcap_state['multicam'] = None
+
         # Cancel race condition: if all pipeline steps completed, treat as success
-        if len(completed) >= n_total_steps or (len(completed) == n_total_steps - 1 and labels[-1] == 'overlay'):
+        elif not multicam_run and (len(completed) >= n_total_steps or (len(completed) == n_total_steps - 1 and labels[-1] == 'overlay')):
             # All real work done, overlay might have been interrupted
             # Try to load whatever we have
             proxy = blendcap_state['proxy_path']
@@ -484,7 +626,8 @@ def monitor_progress_timer():
             else:
                 print("\n[BlendCap] Cancelled. No usable output.")
 
-        elif (blendcap_state.get('track_body') and blendcap_state.get('track_face')
+        elif (not multicam_run
+                and blendcap_state.get('track_body') and blendcap_state.get('track_face')
                 and not blendcap_state.get('is_preview') and body_done and not face_done):
             print("\n[BlendCap] Body complete, face cancelled. Asking user...")
             def _deferred_cancel_dialog():
@@ -521,15 +664,26 @@ def monitor_progress_timer():
         # Surface the failure in a dialog instead of console-only: reuse
         # the warnings popup with the subprocess's last meaningful lines
         # so the user sees WHY without hunting for the System Console.
-        lines = [f"Capture failed (exit code {rc})."]
         tail = [t for t in blendcap_state.get('error_tail', []) if t][-5:]
-        if tail:
-            lines.append("Last output:")
-            lines.extend(f"  {t[:90]}" for t in tail)
+        tail = _tail_with_exit_code(tail, rc)
+        _remember_sac_block(tail)
         out_dir = blendcap_state.get('output_dir', '')
-        if out_dir:
-            lines.append("Full log: blendcap_capture_debug.log in the "
-                         "capture's cache folder.")
+        log_path = _ensure_debug_log(out_dir, blendcap_state.get('last_cmd'),
+                                     rc, tail)
+        # A recognised failure gets the plain explanation ALONE (user
+        # decision 2026-08-18: no raw clutter under it - the raw text
+        # already went to the console and the debug log, so nothing is
+        # lost if a translation ever mislabels). Unrecognised failures
+        # keep the raw tail: for those it IS the useful content.
+        lines = _plain_failure_explanation(tail)
+        if not lines:
+            lines = [f"Capture failed (exit code {rc})."]
+            if tail:
+                lines.append("Last output:")
+                lines.extend(f"  {t[:90]}" for t in tail)
+            if log_path:
+                lines.append("Full log: blendcap_capture_debug.log in the "
+                             "capture's cache folder.")
         blendcap_state['warnings'] = lines
 
         def _deferred_failure_popup():
@@ -540,6 +694,372 @@ def monitor_progress_timer():
             return None
         bpy.app.timers.register(_deferred_failure_popup, first_interval=0.3)
     return None
+
+
+# Plain-English translations for helper-process failures the user can
+# actually do something about. Each entry is (needles, lines): if ANY
+# needle appears in the child's captured output, those lines REPLACE
+# the raw output in the failure dialog (the raw text still reaches the
+# console and the debug log). lines=None is a FORCED-RAW guard: match
+# means "never translate this", protecting against a broader entry
+# further down claiming it.
+#
+# FIRST MATCH WINS, so these are ordered most-specific first - a missing
+# VC++ runtime reports ImportError, which must not be read as a missing
+# package, and an out-of-memory during model load must not be read as a
+# model-file problem just because a checkpoint path is in the tail.
+#
+# Two whole FAMILIES are covered generically (user decision 2026-08-18:
+# any venv-import or model-file problem should get the reinstall
+# advice, not just enumerated instances):
+#   - import failures: DLL load failed / ModuleNotFoundError / any
+#     other ImportError. If the child died importing, the install is
+#     broken by definition.
+#   - model files missing or damaged: one merged message, because the
+#     user action is identical either way. Missing-side needles are
+#     HARVESTED from the real scripts: "Checkpoint not found" and
+#     "YOLO weights not found" (save_mhr_data), "mhr_model.pt"
+#     (modes.py's '<path> not found'), "Unable to open file at"
+#     (mediapipe's exact FileNotFoundError text for a missing .task,
+#     reproduced against the venv).
+#
+# Everything else falls through to the raw tail ON PURPOSE: prescribing
+# a 13 GB reinstall for an out-of-memory, an unreadable video, or a
+# genuine pipeline bug is confidently-wrong advice, and the raw text is
+# how new failure classes become new entries here (one per ticket).
+_FAILURE_HINTS = (
+    (
+        # FORCED RAW: out-of-memory tracebacks routinely contain
+        # checkpoint paths and torch module names - nothing below may
+        # claim them. Reinstalling does not add VRAM.
+        ("out of memory", "OutOfMemoryError", "MemoryError"),
+        None,
+    ),
+    (
+        # Windows Smart App Control (Windows 11) refused to load one of
+        # the engine's unsigned open-source binaries. Must sit ABOVE the
+        # DLL row: its text also reads "DLL load failed", and the fix is
+        # a Windows setting, not a reinstall (helpers.smart_app_control_*).
+        ("Application Control policy",),
+        [
+            "Windows Smart App Control blocked a file BlendCap needs.",
+            "You will need to turn it off to continue: Go to Windows",
+            "Security > App & browser control > Smart App Control",
+            "settings > Off. This is separate from your antivirus,",
+            "which will keep running as usual.",
+        ],
+    ),
+    (
+        # The model ran but returned NaN / nonsense on every frame
+        # (save_mhr_data's invalid-output guard, support item 6). A
+        # hardware / driver limit, not an install problem: a reinstall
+        # changes nothing, the CPU backend does.
+        ("producing invalid results on this computer",),
+        [
+            "The tracking model is producing invalid results on this",
+            "computer, which usually means the graphics card or its",
+            "driver can't run it correctly (common on integrated",
+            "graphics). Open BlendCap's preferences (Edit > Preferences",
+            "> Add-ons > BlendCap) and set Capture Backend to CPU Only,",
+            "or use a supported NVIDIA GPU.",
+        ],
+    ),
+    (
+        # The DLL a package needs is absent, not the package itself.
+        # Overwhelmingly the Microsoft VC++ runtime on a clean machine.
+        # The installer bootstraps it, so Reinstall is the easy fix and
+        # is safer to recommend than sending anyone to a download page.
+        ("DLL load failed",),
+        [
+            "A component Windows needs to run BlendCap is missing",
+            "(the Microsoft Visual C++ Redistributable).",
+            "To fix this issue, open BlendCap's preferences",
+            "(Edit > Preferences > Add-ons > BlendCap) and run",
+            "\"Reinstall Dependencies\", which installs it for you.",
+        ],
+    ),
+    (
+        # The import-failure family. ModuleNotFoundError is the
+        # missing-package case; bare ImportError catches every other
+        # way an import can die (incl. lazy imports mid-run, e.g.
+        # scipy inside the grounding passes). If the child died
+        # importing, the code never ran - that is an install problem
+        # by definition. is_dependencies_installed() cannot catch this
+        # and is deliberately not changed to try (constraint 40).
+        ("ModuleNotFoundError", "No module named", "ImportError"),
+        [
+            "The dependency install looks incomplete.",
+            "To fix this issue, open BlendCap's preferences",
+            "(Edit > Preferences > Add-ons > BlendCap) and run",
+            "\"Reinstall Dependencies\" - or uninstall the",
+            "dependencies and install them again.",
+        ],
+    ),
+    (
+        # The model-file family, missing and damaged merged: the user
+        # action is identical, so distinguishing them in the dialog is
+        # precision nobody benefits from. Missing-side needles are the
+        # helpers' own printed lines (harvested, see header comment);
+        # damaged-side needles are the loader exceptions for truncated
+        # or corrupt files, where the existence check passes and the
+        # contents choke the loader.
+        ("Checkpoint not found", "YOLO weights not found", "mhr_model.pt",
+         "Unable to open file at",
+         "UnpicklingError", "pickle data was truncated", "invalid load key",
+         "PytorchStreamReader", "central directory", "SafetensorError",
+         "HeaderTooLarge"),
+        [
+            "Some of BlendCap's tracking model files are missing",
+            "or damaged.",
+            "To fix this issue, open BlendCap's preferences",
+            "(Edit > Preferences > Add-ons > BlendCap) and run",
+            "\"Reinstall Dependencies\" - it re-downloads only",
+            "what is missing or broken.",
+        ],
+    ),
+    (
+        # The card is real and the driver works, but the installed
+        # wheels carry no kernels for its architecture - the GTX 10 /
+        # Pascal case the cu128 pin dropped. is_available() says yes,
+        # which is why this only surfaces at run time.
+        ("no kernel image is available", "CUDA capability", "kernel image"),
+        [
+            "Your graphics card isn't supported by the AI",
+            "components BlendCap installed.",
+            "To fix this issue, set the Capture Backend to",
+            "\"CPU Only\" in BlendCap's preferences - it is much",
+            "slower, but it runs on any machine.",
+        ],
+    ),
+)
+
+
+# Windows exit status when the helper process itself was refused by
+# Smart App Control / App Control: "An Application Control policy has
+# blocked this file" (0xC0E90002). The process never ran, so there is
+# no output and no child-written log; the code is the only evidence.
+_SAC_EXIT_CODES = {0xC0E90002}
+_SAC_EXIT_LINE = ("An Application Control policy has blocked this file "
+                  "(exit code 0xC0E90002: the helper process was not "
+                  "allowed to start)")
+
+
+def _tail_with_exit_code(tail, rc):
+    """The hint table matches on text; a blocked-at-launch process
+    leaves none, so add a line that carries the exit code's meaning."""
+    try:
+        if int(rc) & 0xFFFFFFFF in _SAC_EXIT_CODES:
+            return list(tail) + [_SAC_EXIT_LINE]
+    except (TypeError, ValueError):
+        pass
+    return list(tail)
+
+
+def _ensure_debug_log(out_dir, cmd, rc, tail):
+    """The failure dialog promises blendcap_capture_debug.log in the
+    cache folder. The helper (save_mhr_data.py) writes it once it is
+    running; a process that never started leaves nothing, so write one
+    from what the addon knows. Returns the path when a log exists."""
+    if not out_dir:
+        return ""
+    p = os.path.join(out_dir, "blendcap_capture_debug.log")
+    if os.path.isfile(p):
+        # The helper wrote its log while it ran, but a hard crash (a
+        # SIGABRT from a native library, exit -6) never reaches its
+        # own log; the addon's captured tail is the only record of the
+        # last lines. Append them so the file the dialog points at
+        # really holds the failure (support item 8: a customer went to
+        # the log and found nothing about the crash).
+        try:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("\n--- added by the addon after the helper exited ---\n")
+                try:
+                    f.write(f"exit code: {rc} (0x{int(rc) & 0xFFFFFFFF:08X})\n")
+                except (TypeError, ValueError):
+                    f.write(f"exit code: {rc}\n")
+                if tail:
+                    f.write("last output seen by the addon:\n")
+                    for t in tail:
+                        f.write(f"  {t}\n")
+        except Exception:
+            pass
+        return p
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("BlendCap capture failure (written by the addon: the "
+                    "helper process left no log of its own)\n")
+            f.write(f"command: {cmd or '?'}\n")
+            try:
+                f.write(f"exit code: {rc} (0x{int(rc) & 0xFFFFFFFF:08X})\n")
+            except (TypeError, ValueError):
+                f.write(f"exit code: {rc}\n")
+            if tail:
+                f.write("last output:\n")
+                for t in tail:
+                    f.write(f"  {t}\n")
+            else:
+                f.write("last output: (none - the process produced nothing, "
+                        "most likely it was not allowed to start)\n")
+        return p
+    except Exception:
+        return ""
+
+
+def _remember_sac_block(tail):
+    """An observed Smart App Control block turns the preferences note
+    red (helpers.set_sac_block_seen); a later successful capture clears
+    it (_forget_sac_block)."""
+    if any("Application Control" in t for t in tail):
+        try:
+            from .helpers import set_sac_block_seen
+            set_sac_block_seen(True)
+        except Exception:
+            pass
+
+
+def _forget_sac_block():
+    try:
+        from .helpers import set_sac_block_seen, sac_block_seen
+        if sac_block_seen():
+            set_sac_block_seen(False)
+    except Exception:
+        pass
+
+
+def _plain_failure_explanation(tail):
+    """Plain-English REPLACEMENT for the failure dialog's content, or []
+    when the failure is not one we recognise (caller then shows the raw
+    tail - the honest answer for an unknown failure).
+
+    Matching is on the child's own error text because that is the only
+    evidence available after the fact - the addon cannot inspect a venv
+    it did not build. A forced-raw entry (lines=None) returns [] so
+    dangerous lookalikes are never translated."""
+    blob = "\n".join(tail)
+    for needles, lines in _FAILURE_HINTS:
+        if any(n in blob for n in needles):
+            return list(lines) if lines is not None else []
+    return []
+
+
+# ------------------------------------------------------------
+# Body + face capture whose face step failed: finish as body-only
+# ------------------------------------------------------------
+# The body step is the long one. A face step that then finds no face
+# in any frame (or dies for its own reasons) used to fail the whole
+# capture: no overlay, an error dialog, and - because the capture was
+# never recorded as finished - a body NPZ the next run tracked again
+# from scratch. Now the run carries on without the face.
+
+# save_face_data.py's own line when zero frames had a face.
+_NO_FACE_NEEDLE = "No frames with detected faces"
+
+
+def _script_name(cmd):
+    return os.path.basename(cmd[1]) if len(cmd) > 1 else ""
+
+
+def _cmd_value(cmd, flag):
+    try:
+        return cmd[cmd.index(flag) + 1]
+    except (ValueError, IndexError):
+        return ""
+
+
+def _face_step_fallback(cmds, step_idx, st, rc):
+    """True when the failed step is a capture's face step and the run
+    can finish as body-only. Decided from the commands themselves:
+
+      - the failed step is save_face_data.py, not a preview;
+      - body tracking was asked for (a face-only capture has nothing to
+        fall back to, even when an old body NPZ is lying in the folder);
+      - it is the only face step (single-camera), or the run is a
+        multi-camera capture, where each camera's face step stands on
+        its own: a camera that sees no face (one behind the performer)
+        must not fail the whole take;
+      - a later overlay step draws from a body NPZ that exists.
+
+    On True the remaining overlay steps lose their --face input, and a
+    face NPZ already in the folder is removed: the run re-tracked the
+    face because that file did not match this capture, and the capture
+    is about to be recorded as finished, which would make a later run
+    (and BVH export) take the old face data as this capture's."""
+    cmd = cmds[step_idx]
+    if _script_name(cmd) != "save_face_data.py" or "--preview" in cmd:
+        return False
+    if not st.get('track_body'):
+        return False
+    names = [_script_name(c) for c in cmds]
+    # (a Multi-Camera & Multi-Person capture matches its cameras' people
+    # where an ordinary one merges them)
+    multicam = "two_camera_merge.py" in names or "people_cameras.py" in names
+    if not multicam and names.count("save_face_data.py") != 1:
+        return False
+    overlays = [c for c in cmds[step_idx + 1:]
+                if _script_name(c) == "overlay_track.py"]
+    if multicam:
+        # only THIS camera's overlay: the one drawing this face file
+        this_face = _cmd_value(cmd, "--output")
+        overlays = [c for c in overlays
+                    if this_face and _cmd_value(c, "--face") == this_face]
+    if not any(os.path.isfile(_cmd_value(c, "--input")) for c in overlays):
+        return False
+
+    for c in overlays:
+        while "--face" in c:
+            i = c.index("--face")
+            del c[i:i + 2]
+
+    face_npz = _cmd_value(cmd, "--output")
+    if face_npz and os.path.isfile(face_npz):
+        try:
+            os.remove(face_npz)
+            print(f"[BlendCap] Removed face data from an earlier capture: "
+                  f"{os.path.basename(face_npz)}")
+        except Exception as e:
+            print(f"[BlendCap] Could not remove old face data ({e}).")
+
+    tail = [t for t in st.get('error_tail', []) if t][-5:]
+    info = {
+        'rc': rc,
+        'tail': tail,
+        'cmd': ' '.join(cmd),
+        'no_face': any(_NO_FACE_NEEDLE in t for t in st.get('error_tail', [])),
+    }
+    if multicam:
+        # Reported per camera by multicam.result_lines; the error tail
+        # is cleared so the next camera's failure is judged on its own.
+        st.setdefault('multicam_face_skipped', []).append(
+            dict(info, step=step_idx))
+        st['error_tail'] = []
+    else:
+        st['face_fallback'] = info
+    return True
+
+
+def _face_fallback_lines(info, out_dir):
+    """Dialog lines for a capture that finished body-only. No face in
+    the clip gets the plain statement alone; any other face-step
+    failure also says why, the same way the failure dialog would."""
+    if info.get('no_face'):
+        return ["No face was found in this clip.",
+                "The body capture was kept and finished without it."]
+    rc = info.get('rc')
+    tail = _tail_with_exit_code(info.get('tail') or [], rc)
+    log_path = _ensure_debug_log(out_dir, info.get('cmd'), rc, tail)
+    lines = ["Face capture failed.",
+             "The body capture was kept and finished without it."]
+    plain = _plain_failure_explanation(tail)
+    if plain:
+        return lines + plain
+    if tail:
+        lines.append(f"Last output (exit code {rc}):")
+        lines.extend(f"  {t[:90]}" for t in tail)
+    if log_path:
+        lines.append("Full log: blendcap_capture_debug.log in the "
+                     "capture's cache folder.")
+    return lines
 
 
 def _run_fallback_overlay(output_dir, body_npz, face_npz, strip_name):
@@ -583,7 +1103,9 @@ def _run_fallback_overlay(output_dir, body_npz, face_npz, strip_name):
 
 def run_mocap_thread(cmds, proxy_path, insert_frame, insert_channel,
                      source_path, source_start, source_max, mode, step_weights=None,
-                     use_ort=None, force_cpu=False):
+                     use_ort=None, force_cpu=False, step_prefixes=None):
+    """step_prefixes: optional text put in front of each step's status
+    line ("Camera B: "), one per command (multi-camera captures)."""
     n = len(cmds)
     if step_weights and len(step_weights) == n:
         total_w = sum(step_weights)
@@ -611,14 +1133,22 @@ def run_mocap_thread(cmds, proxy_path, insert_frame, insert_channel,
         # Watchdog + failure-dialog support: when the last subprocess
         # output arrived, and the last few non-noise lines it printed.
         'last_output_time': time.time(), 'error_tail': [],
+        # Set when a failed face step was dropped and the run carried
+        # on as body-only (_face_step_fallback).
+        'face_fallback': None, 'face_fallback_lines': [],
+        # Multi-camera: face steps dropped because that camera's face
+        # capture failed (a camera behind the performer sees no face).
+        'multicam_face_skipped': [],
     })
+    prefixes = list(step_prefixes or [])
 
     def update_progress(idx, pct, status=""):
         overall = offsets[idx] + (pct / 100.0) * norm[idx]
         st['step_progress'] = pct
         st['progress'] = min(overall, 99.9)
         if status:
-            st['status_text'] = status
+            pre = prefixes[idx] if idx < len(prefixes) else ""
+            st['status_text'] = pre + status
 
     # Capture backend override: force USE_ORT for the subprocess when the
     # add-on pref selects a specific backend (NVIDIA off / non-NVIDIA on).
@@ -655,6 +1185,7 @@ def run_mocap_thread(cmds, proxy_path, insert_frame, insert_channel,
             st['current_step'] = step_idx
             update_progress(step_idx, 0.0, "Starting step...")
             print(f"[BlendCap] Running: {' '.join(cmd)}")
+            st['last_cmd'] = ' '.join(cmd)
 
             # CREATE_NO_WINDOW (Windows): output is piped, so a console
             # window for the child is never useful — without the flag,
@@ -727,6 +1258,15 @@ def run_mocap_thread(cmds, proxy_path, insert_frame, insert_channel,
                 return
 
             if proc.returncode != 0:
+                # A body + face capture keeps its body when the face
+                # step fails: drop the face and run the rest.
+                if _face_step_fallback(cmds, step_idx, st, proc.returncode):
+                    print(f"[BlendCap] Face step failed with code "
+                          f"{proc.returncode}; finishing as a body-only "
+                          f"capture.")
+                    update_progress(step_idx, 100.0,
+                                    "No face data, continuing with body")
+                    continue
                 st['return_code'] = proc.returncode
                 st['status_text'] = f"Step {step_idx + 1} failed"
                 print(f"[BlendCap] Step {step_idx + 1} failed with code {proc.returncode}")
@@ -750,6 +1290,31 @@ def run_mocap_thread(cmds, proxy_path, insert_frame, insert_channel,
 # ============================================================
 # BVH EXPORT BACKGROUND LOGIC
 # ============================================================
+def _place_person(rig):
+    """Keep Captured Position (multi-person captures): move the freshly
+    imported rig so that the camera that filmed it stands on the 3D
+    cursor's spot. Every person of a capture exported this way ends up
+    where they stood relative to each other, each on the cursor's
+    floor. The camera's place is what the export recorded and the
+    import has just put on the rig (scene_camera.remember); only the
+    rig's location changes."""
+    from mathutils import Vector
+    from .scene_camera import _BVH_TO_BLENDER, stored
+    data = stored(rig)
+    view = (data or {}).get("views", {}).get("a")
+    if not view:
+        why = (data or {}).get("why") or "the export recorded no camera"
+        print(f"[BlendCap] Keep Captured Position skipped: {why}")
+        return
+    cam = Vector(view["location"])
+    bpy.context.view_layer.update()
+    off = rig.matrix_world.to_3x3() @ (_BVH_TO_BLENDER @ cam)
+    cursor = bpy.context.scene.cursor.location
+    rig.location = (cursor.x - off.x, cursor.y - off.y, cursor.z)
+    print(f"[BlendCap] '{rig.name}' placed {off.length:.2f} m from the camera's "
+          f"spot at the 3D cursor")
+
+
 def monitor_bvh_timer():
     if bvh_state['running']:
         # Mirror monitor_progress_timer: paint the workspace status bar
@@ -773,6 +1338,17 @@ def monitor_bvh_timer():
                 win.workspace.status_text_set(None)
     except Exception:
         pass
+
+    # New BVH files may have landed in the library folder: refresh the
+    # panel's list now instead of waiting for the next draw to notice.
+    try:
+        from .properties import _bvh_library_resync
+        _bvh_library_resync()
+    except Exception:
+        pass
+
+    # one-shot, so a later Bake can never be placed by this Generate
+    placement = bvh_state.pop('placement', None)
 
     if bvh_state['return_code'] == 0:
         # bvh_paths is a list of (final_path, stem) for all completed jobs.
@@ -821,23 +1397,85 @@ def monitor_bvh_timer():
                         bvh_state.get('baked_head_roll_deg', 0.0))
                     imported["_blendcap_baked_height_m"] = float(
                         bvh_state.get('baked_height_m', 0.0))
+                    # Where the capture's camera(s) stood goes onto
+                    # the rig (for the Add Camera button, and for Keep
+                    # Captured Position just below); a camera this rig
+                    # already has is then put back next to it.
+                    try:
+                        from . import scene_camera
+                        cam_job = bvh_state.get('camera')
+                        if cam_job and cam_job.get('stem') == stem:
+                            scene_camera.remember(imported, cam_job)
+                        if placement and placement.get('stem') == stem:
+                            _place_person(imported)
+                        scene_camera.update_camera(imported, stem)
+                    except Exception as cam_err:
+                        print(f"[BlendCap] Camera step failed: {cam_err}")
                 print(f"[BlendCap] BVH saved to library and imported: "
                       f"{final_path}")
             except Exception as e:
                 print(f"[BlendCap] Failed to import {final_path}: {e}")
+                # Used to stop at that print. The export had already run
+                # to 100%, so the user saw a completed progress bar, no
+                # armature, and no error - "nothing happens", the
+                # single most reported ticket. Surface it instead.
+                #
+                # A missing/disabled BVH importer gets its own dialog
+                # (it names the add-on and can switch it back on);
+                # anything else gets the generic one, which always ends
+                # by saying where the file is, because the capture data
+                # survives every one of these failures.
+                if bvh_importer_state() != 'OK':
+                    def _deferred_importer_popup(path=final_path):
+                        try:
+                            bpy.ops.blendcap.bvh_importer_missing(
+                                'INVOKE_DEFAULT', bvh_path=path)
+                        except Exception as err:
+                            print("[BlendCap] Could not show the BVH "
+                                  f"importer dialog: {err}")
+                        return None
+                    bpy.app.timers.register(_deferred_importer_popup,
+                                            first_interval=0.3)
+                else:
+                    folder, name = os.path.split(final_path)
+                    blendcap_state['warnings'] = [
+                        "The capture finished, but the animation couldn't "
+                        "be imported.",
+                        f"  {str(e)[:88]}",
+                        "The BVH file was still saved to:",
+                        f"  {name}",
+                        f"  in {folder}",
+                    ]
+
+                    def _deferred_import_failure_popup():
+                        try:
+                            bpy.ops.blendcap.show_warnings('INVOKE_DEFAULT')
+                        except Exception as err:
+                            print("[BlendCap] Could not show the import "
+                                  f"failure dialog: {err}")
+                        return None
+                    bpy.app.timers.register(_deferred_import_failure_popup,
+                                            first_interval=0.3)
     elif bvh_state['return_code'] == -2:
         print("[BlendCap] BVH export cancelled.")
     else:
         print(f"[BlendCap] BVH Export failed: {bvh_state['error_msg']}")
         # Same failure dialog as the capture path: show the last lines
         # the export subprocess printed instead of console-only output.
-        lines = [f"BVH export failed (exit code {bvh_state['return_code']})."]
-        if bvh_state.get('error_msg'):
-            lines.append(str(bvh_state['error_msg'])[:90])
         tail = [t for t in bvh_state.get('error_tail', []) if t][-5:]
-        if tail:
-            lines.append("Last output:")
-            lines.extend(f"  {t[:90]}" for t in tail)
+        tail = _tail_with_exit_code(tail, bvh_state.get('return_code'))
+        _remember_sac_block(tail)
+        # Same rule as the capture branch: recognised -> the plain
+        # explanation alone; unrecognised -> the raw details.
+        lines = _plain_failure_explanation(tail)
+        if not lines:
+            lines = [
+                f"BVH export failed (exit code {bvh_state['return_code']})."]
+            if bvh_state.get('error_msg'):
+                lines.append(str(bvh_state['error_msg'])[:90])
+            if tail:
+                lines.append("Last output:")
+                lines.extend(f"  {t[:90]}" for t in tail)
         blendcap_state['warnings'] = lines
 
         def _deferred_bvh_failure_popup():
@@ -848,6 +1486,12 @@ def monitor_bvh_timer():
             return None
         bpy.app.timers.register(_deferred_bvh_failure_popup,
                                 first_interval=0.3)
+    # Generate/Reload All (multi-person captures): on to the next person
+    try:
+        from . import people_ui
+        people_ui.queue_advance(bvh_state['return_code'])
+    except Exception as e:
+        print(f"[BlendCap] Generate/Reload All could not continue: {e}")
     return None
 
 

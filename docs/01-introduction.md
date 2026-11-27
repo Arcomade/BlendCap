@@ -19,6 +19,9 @@ New to BlendCap? Work through **Getting started** in order, then dip into the ot
 
 **Capturing**
 - [Capturing](05-capturing.md): turn a video into tracking data, including the capture settings and Preview.
+  - [Multi-Camera Capture](05a-multi-camera-capture.md): capture one performer from up to 4 different angles for a more accurate result.
+  - [Multi-Person Capture](05b-multi-person-capture.md): capture multiple performers from a single video.
+  - [Multi-Camera & Multi-Person](05c-multi-camera-and-multi-person.md): multiple performers, filmed from several camera angles.
 - [Face Capture](06-face-capture.md): facial performance, ARKit blendshapes, and expression controls.
 - [Hand & Finger Tracking](07-hand-tracking.md): how fingers are tracked and the controls that refine them.
 - [Filming Tips](13-filming-tips.md): how to shoot footage that captures cleanly.

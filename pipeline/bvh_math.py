@@ -316,8 +316,9 @@ def smooth_rotations(local_rots, window, polyorder=3):
 
 
 def smooth_positions(positions, sigma, depth_axis=2, skip_axes=()):
-    """Gaussian smoothing on root positions. Depth axis gets 2x sigma.
-    Axes in skip_axes pass through untouched."""
+    """Gaussian smoothing on root positions. Depth axis gets 2x sigma
+    (depth_axis=None: no axis does). Axes in skip_axes pass through
+    untouched."""
     if not HAS_SCIPY or positions.shape[0] < 4:
         return positions
 
@@ -430,6 +431,53 @@ def smooth_face_data(face_data, window_s=0.23, window=None):
 
     # Eye gaze (N, 4)
     _savgol_masked_2d(face_data["eye_gaze"], mask, win, _FACE_SAVGOL_POLY)
+
+
+# A face that is lost for some frames (turned away, hidden, out of
+# the picture) is written at rest on those frames. Without this the
+# expression cut to rest on the frame it was lost and cut back in on
+# the frame it was found; with it the expression fades to rest over
+# FACE_DROPOUT_EASE_S before the dropout and back in after it.
+# Must stay in sync with the ARKit subprocess
+# (pipeline/smooth_face_npz.py routes through this same function).
+FACE_DROPOUT_EASE_S = 0.25
+
+
+def ease_face_dropouts(face_data, ease_s=FACE_DROPOUT_EASE_S):
+    """Fade the blendshapes to zero into each stretch of frames without
+    a face and back up out of it (in-place). Returns how many such
+    stretches the take has.
+
+    Each frame with a face is scaled by a smoothstep of how far it is
+    from the nearest frame without one, reaching 1 at ease_s. The two
+    sides multiply, so a face found for only a few frames between two
+    dropouts never comes fully in. The start and the end of the take
+    are not dropouts: a face that is there on the first frame is there
+    at full strength. Frames without a face are left as they are.
+    ease_s <= 0 disables."""
+    det = np.asarray(face_data["detected"]).astype(bool)
+    n = len(det)
+    if ease_s <= 0 or n == 0 or det.all() or not det.any():
+        return 0
+    fps = float(face_data.get("fps", 30.0))
+    span = max(1, int(round(ease_s * fps))) + 1
+    idx = np.arange(n)
+    far = 10 ** 9
+    since = idx - np.maximum.accumulate(np.where(~det, idx, -far))
+    until = np.minimum.accumulate(np.where(~det, idx, far)[::-1])[::-1] - idx
+
+    def step(d):
+        x = np.clip(d / float(span), 0.0, 1.0)
+        return x * x * (3.0 - 2.0 * x)
+
+    w = step(since) * step(until)
+    bs = face_data["blendshapes"]
+    bs[det] = bs[det] * w[det][:, None]
+    gaps = int((~det[1:] & det[:-1]).sum() + (~det[0]))
+    print(f"       Face dropouts eased: {gaps} stretch"
+          f"{'' if gaps == 1 else 'es'} without a face, "
+          f"{ease_s:.2f} s in and out")
+    return gaps
 
 
 def amplify_face_blendshapes(face_data, region_multipliers, bs_names):

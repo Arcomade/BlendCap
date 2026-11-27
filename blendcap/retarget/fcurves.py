@@ -180,7 +180,7 @@ def _bulk_write_keys(armature_obj, key_accum, primed_channels, prime_frame):
     YIELD_EVERY = 50
 
     if not key_accum:
-        print("[BlendCap] _bulk_write_keys: empty accumulator — nothing to write")
+        print("[BlendCap] _bulk_write_keys: empty accumulator - nothing to write")
         return
 
     # Step 1: prime fcurves — one keyframe_insert per (bone, channel).
@@ -218,7 +218,7 @@ def _bulk_write_keys(armature_obj, key_accum, primed_channels, prime_frame):
         action = armature_obj.animation_data.action
     if action is None:
         print("[BlendCap] _bulk_write_keys: rig has no action after priming "
-              "— no keys written")
+              "- no keys written")
         return
 
     # Index every fcurve once so the bulk-fill loop is O(N) instead of

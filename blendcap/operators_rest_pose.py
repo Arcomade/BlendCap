@@ -93,10 +93,35 @@ v2 (legacy — absolute pose, no rest snapshot):
 import bpy
 import os
 import json
+import math
 
 from mathutils import Matrix, Quaternion, Vector
 
-from .properties import _rest_pose_presets_dir_user
+from .helpers import _filename_error
+from .retarget.name_matching import _detect_rig_prefix, _resolve_against_rig
+from .properties import (_rest_pose_presets_dir_user,
+                         _rest_pose_presets_dir_legacy,
+                         _rest_pose_presets_dir_bundled)
+
+
+def _deletable_rest_pose_path(path):
+    """A preset may be deleted from the user-save folder or from the
+    legacy addon-folder location (read-only leftovers migration
+    couldn't move) - never from bundled/ (shipped presets)."""
+    bundled_dir = _rest_pose_presets_dir_bundled()
+    try:
+        if os.path.commonpath([path, bundled_dir]) == bundled_dir:
+            return False
+    except ValueError:
+        pass
+    for d in (_rest_pose_presets_dir_user(),
+              _rest_pose_presets_dir_legacy()):
+        try:
+            if os.path.commonpath([path, d]) == d:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 # Tolerance for "this bone is at rest" detection at save time. We compare
@@ -166,7 +191,8 @@ def _quats_equivalent(q1, q2, tol=_REST_MATCH_TOL):
     return abs(q1.dot(q2)) >= 1.0 - tol
 
 
-def _resolve_target_quaternion(saved_rest_q, saved_pose_q, live_rest_q):
+def _resolve_target_quaternion(saved_rest_q, saved_pose_q, live_rest_q,
+                               frame_q=None):
     """Pick the right target world rotation for one bone.
 
     Returns the quaternion that should appear as the bone's world pose
@@ -176,20 +202,176 @@ def _resolve_target_quaternion(saved_rest_q, saved_pose_q, live_rest_q):
       directly. Bit-identical to v2 absolute-save behavior.
     - Cross-rig (rests differ): compute the world delta the user
       applied at save time and re-apply it relative to the live rest.
+    - frame_q (see skeleton_fit): the same skeleton sitting TURNED inside
+      its armature (a raw FBX import against one with its transforms
+      applied). The delta was measured in the saved rig's armature frame,
+      so it is carried into this rig's frame first. None = no turn, and
+      the maths above is untouched.
     """
     if _quats_equivalent(saved_rest_q, live_rest_q):
         return saved_pose_q
     delta_q = saved_pose_q @ saved_rest_q.inverted()
+    if frame_q is not None:
+        delta_q = frame_q @ delta_q @ frame_q.inverted()
     return delta_q @ live_rest_q
+
+
+# --- Is this preset for this skeleton? (found live 2026-11-15) -------------
+# Matching by name alone is not enough: a BlendCap pose on a Mixamo rig
+# matches 'Hips', 'Spine', 'LeftArm'... and then applies rotations meant
+# for bones that sit completely differently, which looks like a broken rig.
+# Every v4+ entry stores the bone's REST orientation on the rig it was saved
+# from. On the same skeleton, live_rest @ saved_rest^-1 is the same rotation
+# for every bone (identity, or how the two armatures are turned relative to
+# each other); on a different skeleton it is all over the place.
+# Measured on the user's presets and test rigs:
+#   same skeleton (BlendCap on BlendCap, Mixamo on other Mixamo
+#   characters and imports): 98 to 100 % of matched bones within 45 deg
+#   different skeleton, either way round: 4 to 36 %.
+_SKELETON_MIN_BONES = 3          # fewer than this: nothing to judge by
+_SKELETON_AGREE_DEG = 45.0
+_SKELETON_AGREE_SHARE = 2.0 / 3.0
+# A turn this large between the two armature frames is an import
+# convention (90 or 180 deg). Different characters of one skeleton differ
+# by 10 to 20 deg bone by bone, which is NOT a turn of the whole frame and
+# must leave the old maths alone.
+_FRAME_TURN_MIN_DEG = 30.0
+
+
+def _angle_deg(q1, q2):
+    a = q1.rotation_difference(q2).angle
+    if a > math.pi:
+        a = 2.0 * math.pi - a
+    return math.degrees(a)
+
+
+def skeleton_fit(bones, resolved, src_rig, fmt):
+    """(share of matched bones whose rest agrees, frame turn quaternion,
+    frame turn in degrees). Share is None when it can't be judged (old
+    preset formats with no rest data, or under three matched bones); the
+    quaternion is None unless the whole armature frame is turned by at
+    least _FRAME_TURN_MIN_DEG."""
+    if fmt < 4:
+        return None, None, 0.0
+    turns = []
+    for preset_name, bone_name in resolved.items():
+        entry = bones.get(preset_name)
+        if not isinstance(entry, dict):
+            continue
+        rest = entry.get("rest")
+        if not rest or len(rest) != 4:
+            continue
+        live = src_rig.pose.bones[bone_name].bone.matrix_local.to_quaternion()
+        turns.append(live @ Quaternion(rest).inverted())
+    n = len(turns)
+    if n < _SKELETON_MIN_BONES:
+        return None, None, 0.0
+    # The turn most bones share: the one with the smallest median distance
+    # to all the others (a medoid, so a few odd bones can't drag it).
+    best = None
+    for cand in turns:
+        d = sorted(_angle_deg(cand, t) for t in turns)
+        key = (d[n // 2], sum(d))
+        if best is None or key < best[0]:
+            best = (key, d, cand)
+    _key, dists, frame_q = best
+    share = sum(1 for x in dists if x <= _SKELETON_AGREE_DEG) / n
+    turn_deg = _angle_deg(frame_q, Quaternion())
+    if turn_deg < _FRAME_TURN_MIN_DEG:
+        return share, None, turn_deg
+    return share, frame_q, turn_deg
+
+
+WRONG_SKELETON_PREVIEW = ("This rest pose was made for a different skeleton "
+                          "than the current Source Rig, so it cannot be "
+                          "applied.")
+WRONG_SKELETON_APPLY = ("This rest pose was made for a different skeleton "
+                        "than the current Source Rig. Pick another rest "
+                        "pose or untick Use Custom Rest Pose, then apply "
+                        "again.")
+
+
+# What the most recent load matched: {'total': bones in the preset,
+# 'matched': found on the rig, 'renamed': of those, found under another
+# namespace, 'rig_prefix': the prefix that resolved them}. Read by the
+# Preview operator and the Apply operator for their messages.
+LAST_LOAD_STATS = None
+
+
+def _namespace_of(name):
+    """'mixamorig:' for 'mixamorig:Hips', '' for 'Hips'. Only a colon
+    counts: it is what Mixamo, Maya-style and Blender-linked rigs use for
+    a namespace, and unlike '_' or '.' it never sits inside a plain bone
+    name ('Left_Arm')."""
+    i = name.rfind(':')
+    return name[:i + 1] if i >= 0 else ""
+
+
+def resolve_preset_bones(names, src_rig):
+    """{preset bone name: bone name on src_rig} for every preset bone that
+    can be found on the rig, and the rig prefix used ('' when none).
+
+    A name that exists on the rig as written always wins, so a preset used
+    on the rig it was saved from behaves exactly as before. Only the names
+    left over are looked up without their namespace: the same Mixamo
+    skeleton shows up as 'mixamorig:Hips', 'mixamorig1:Hips' (several
+    characters in one file) or plain 'Hips', and a preset saved from any
+    one of them used to do nothing on the others, without saying so
+    (support item 33b). The rig's own prefix comes from the detection the
+    retarget maps already use (_detect_rig_prefix)."""
+    rig_bones = src_rig.pose.bones
+    out = {n: n for n in names if n in rig_bones}
+    if len(out) == len(names):
+        return out, ""
+    shorts = {n: n[len(_namespace_of(n)):] for n in names}
+    counts = {}
+    for n in names:
+        ns = _namespace_of(n)
+        if ns:
+            counts[ns] = counts.get(ns, 0) + 1
+    preset_ns = max(counts, key=lambda k: counts[k]) if counts else ""
+    rig_prefix = _detect_rig_prefix(
+        src_rig, [s for s in shorts.values() if s], fallback_prefix=preset_ns)
+    used = set(out.values())
+    used_prefix = ""
+    for n in names:
+        if n in out or not shorts[n]:
+            continue
+        found = _resolve_against_rig(shorts[n], src_rig, rig_prefix)
+        if found in rig_bones and found not in used:
+            out[n] = found
+            used.add(found)
+            # The prefix the rig really carries for this bone ('' on a
+            # rig with plain names), for the console line.
+            used_prefix = found[:len(found) - len(shorts[n])]
+    return out, used_prefix
+
+
+def match_summary(stats):
+    """A few words for the status bar, or '' when every bone matched under
+    its own name (nothing worth saying)."""
+    if not stats or not stats.get('total'):
+        return ""
+    m, t = stats['matched'], stats['total']
+    renamed = stats.get('renamed', 0)
+    if m == t:
+        if not renamed:
+            return ""
+        return f"all {t} bones matched by name, ignoring the namespace"
+    line = f"{m} of {t} preset bones matched the source rig"
+    if renamed:
+        line += ", ignoring the namespace"
+    return line
 
 
 def load_rest_pose_preset_to_override(preset_path, src_rig):
     """Load a saved preset and convert it to a source_rest_override dict.
 
     Returns {bone_name: 4x4 mathutils.Matrix in armature-local space},
-    matching the dict format that `_matrix_bake_pairs_iter` consumes.
-    Bones listed in the JSON but absent from src_rig are silently
-    skipped.
+    matching the dict format that `_matrix_bake_pairs_iter` consumes,
+    keyed by the bone's name ON src_rig (see resolve_preset_bones for how
+    a preset saved under another namespace is matched). Bones that can't
+    be found on src_rig are skipped; LAST_LOAD_STATS says how many.
 
     Translation / scale handling:
       - v5 entries with "loc" and/or "scale" use those values, so
@@ -204,9 +386,38 @@ def load_rest_pose_preset_to_override(preset_path, src_rig):
     bones = data.get("bones", {})
     fmt = int(data.get("format_version", 0))
 
+    global LAST_LOAD_STATS
+    resolved, rig_prefix = resolve_preset_bones(list(bones.keys()), src_rig)
+    share, frame_q, turn_deg = skeleton_fit(bones, resolved, src_rig, fmt)
+    wrong = share is not None and share < _SKELETON_AGREE_SHARE
+    LAST_LOAD_STATS = {
+        'total': len(bones),
+        'matched': len(resolved),
+        'renamed': sum(1 for k, v in resolved.items() if k != v),
+        'rig_prefix': rig_prefix,
+        # Made for another skeleton: nothing is returned, and the two
+        # callers say so (WRONG_SKELETON_PREVIEW / _APPLY).
+        'wrong_skeleton': wrong,
+        'rest_agree_share': share,
+        'frame_turn_deg': turn_deg if frame_q is not None else 0.0,
+    }
+    if wrong:
+        print(f"[BlendCap] rest pose preset refused: only "
+              f"{share * 100:.0f}% of its {len(resolved)} matched bones sit "
+              f"at rest the way they do on '{src_rig.name}' (needs "
+              f"{_SKELETON_AGREE_SHARE * 100:.0f}%). It was saved from a "
+              f"different skeleton.")
+        return {}
+    if frame_q is not None:
+        print(f"[BlendCap] rest pose preset: '{src_rig.name}' sits turned "
+              f"{turn_deg:.0f} deg inside its armature compared with the "
+              f"rig the preset was saved from; rotations are carried "
+              f"across, saved positions and scales are not used.")
+
     out = {}
-    for bone_name, entry in bones.items():
-        if bone_name not in src_rig.pose.bones:
+    for preset_name, entry in bones.items():
+        bone_name = resolved.get(preset_name)
+        if bone_name is None:
             continue
         pb = src_rig.pose.bones[bone_name]
         rest_m = pb.bone.matrix_local
@@ -227,12 +438,18 @@ def load_rest_pose_preset_to_override(preset_path, src_rig):
                     Quaternion(saved_rest),
                     Quaternion(saved_pose),
                     live_rest_q,
+                    frame_q,
                 )
             # v5: pull translation + scale if present. Absent fields
             # silently fall back to defaults above so v4 presets load
             # unchanged.
             saved_loc = entry.get("loc")
             saved_scale = entry.get("scale")
+            if frame_q is not None:
+                # Positions and scales saved in an armature frame that is
+                # turned (and, on a raw Mixamo import, 100x larger) can't
+                # be carried over by a rotation; leave the live rest's.
+                saved_loc = saved_scale = None
             if saved_loc and len(saved_loc) == 3:
                 target_loc = Vector(saved_loc)
             if saved_scale and len(saved_scale) == 3:
@@ -315,15 +532,23 @@ class BLENDCAP_OT_save_rest_pose(bpy.types.Operator):
     def draw(self, context):
         layout = self.layout
         # Red field whenever the current name maps to an existing
-        # preset file. No checkbox / inline error label -- just a
-        # visual cue. execute() saves unconditionally.
+        # preset file or can't be a file name at all; unusable names
+        # also get an inline label saying why (execute() refuses them
+        # with the same message).
+        err = _filename_error(self._sanitized_name())
         row = layout.row()
-        row.alert = self._collides()
+        row.alert = err is not None or self._collides()
         row.prop(self, "preset_name")
+        if err:
+            warn = layout.row()
+            warn.alert = True
+            warn.label(text=err, icon='ERROR')
 
     def _sanitized_name(self):
-        name = (self.preset_name or "").strip().replace('/', '_').replace('\\', '_')
-        return name or "Untitled Pose"
+        # No character substitution here: names with characters the
+        # filesystem can't take are REFUSED with a readable message
+        # (_filename_error) instead of silently mangled.
+        return (self.preset_name or "").strip() or "Untitled Pose"
 
     def _collides(self):
         path = os.path.join(_rest_pose_presets_dir_user(),
@@ -337,6 +562,10 @@ class BLENDCAP_OT_save_rest_pose(bpy.types.Operator):
             return {'CANCELLED'}
 
         name = self._sanitized_name()
+        err = _filename_error(name)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
         path = os.path.join(_rest_pose_presets_dir_user(), f"{name}.json")
 
         # Overwrite confirmation: when the target file already exists
@@ -370,7 +599,7 @@ class BLENDCAP_OT_save_rest_pose(bpy.types.Operator):
 
         if not bones_out:
             self.report({'WARNING'},
-                        "No posed bones detected — every bone is at rest. "
+                        "No posed bones detected - every bone is at rest. "
                         "Pose at least one bone in Pose Mode before saving.")
             return {'CANCELLED'}
 
@@ -450,11 +679,7 @@ class BLENDCAP_OT_delete_rest_pose_preset(bpy.types.Operator):
         path = props.custom_rest_pose_preset
         if not path or path.startswith('__'):
             return False
-        user_dir = _rest_pose_presets_dir_user()
-        try:
-            return os.path.commonpath([path, user_dir]) == user_dir
-        except ValueError:
-            return False
+        return _deletable_rest_pose_path(path)
 
     def invoke(self, context, event):
         return context.window_manager.invoke_confirm(self, event)
@@ -465,12 +690,7 @@ class BLENDCAP_OT_delete_rest_pose_preset(bpy.types.Operator):
         if not path or path.startswith('__'):
             self.report({'ERROR'}, "No custom preset selected")
             return {'CANCELLED'}
-        user_dir = _rest_pose_presets_dir_user()
-        try:
-            in_user = os.path.commonpath([path, user_dir]) == user_dir
-        except ValueError:
-            in_user = False
-        if not in_user:
+        if not _deletable_rest_pose_path(path):
             self.report({'ERROR'}, "Bundled presets cannot be deleted")
             return {'CANCELLED'}
         if not os.path.isfile(path):
@@ -517,6 +737,96 @@ def _world_rotation_to_pose_basis(pb, target_world_q):
             @ target_world_q)
 
 
+# --- Rest pose presets outside retargeting: the library's save dialogs ------
+# Save BVH / Save FBX can put a rest pose on an extra first frame. The file
+# they write is always BlendCap's own skeleton, so only presets saved from
+# that skeleton can be used there.
+WRONG_SKELETON_EXPORT = ("This rest pose was made for a different skeleton "
+                         "than BlendCap's own, so it cannot be added to the "
+                         "file.")
+_BLENDCAP_REST = {}      # bone name -> rest orientation of BlendCap's skeleton
+_FIT_CACHE = {}          # (path, modified time) -> fits BlendCap's skeleton
+
+
+def _blendcap_rest_quats():
+    """{bone name: rest orientation} of BlendCap's own skeleton, read once
+    from the bundled T-POSE preset (every v4+ entry stores the rest it
+    was saved over)."""
+    if _BLENDCAP_REST:
+        return _BLENDCAP_REST
+    try:
+        path = os.path.join(_rest_pose_presets_dir_bundled(), "T-POSE.json")
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for name, entry in data.get("bones", {}).items():
+            rest = entry.get("rest") if isinstance(entry, dict) else None
+            if rest and len(rest) == 4:
+                _BLENDCAP_REST[name] = Quaternion(rest)
+    except Exception as e:
+        print(f"[BlendCap] bundled T-POSE preset not readable: {e}")
+    return _BLENDCAP_REST
+
+
+def preset_fits_blendcap(path):
+    """True when a rest pose preset was saved from BlendCap's own skeleton:
+    the same test as skeleton_fit, against the rest orientations the
+    bundled T-POSE preset carries, so it needs no rig in the scene. Used
+    to build the save dialogs' list; the save judges again on the real
+    rig. Presets too old to say (before format 4) do not fit."""
+    try:
+        key = (os.path.normcase(path), os.path.getmtime(path))
+    except OSError:
+        return False
+    hit = _FIT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ok = False
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if int(data.get("format_version", 0)) >= 4:
+            ref = _blendcap_rest_quats()
+            angles = []
+            for name, entry in data.get("bones", {}).items():
+                short = name[len(_namespace_of(name)):]
+                rest = entry.get("rest") if isinstance(entry, dict) else None
+                if short in ref and rest and len(rest) == 4:
+                    angles.append(_angle_deg(ref[short], Quaternion(rest)))
+            if len(angles) >= _SKELETON_MIN_BONES:
+                agree = sum(1 for a in angles if a <= _SKELETON_AGREE_DEG)
+                ok = agree / len(angles) >= _SKELETON_AGREE_SHARE
+    except Exception:
+        ok = False
+    _FIT_CACHE[key] = ok
+    return ok
+
+
+def pose_rig_from_preset(rig, preset_path):
+    """Pose `rig` the way Preview Selected Pose does (rotations only), for
+    a caller that keys the result itself. The rig's pose must already be
+    cleared. Returns (bones posed, error text or None)."""
+    override = load_rest_pose_preset_to_override(preset_path, rig)
+    if (LAST_LOAD_STATS or {}).get('wrong_skeleton'):
+        return 0, WRONG_SKELETON_EXPORT
+    posed = 0
+    for pb in _topological_pose_bones(rig):
+        if pb.name not in override:
+            continue
+        q = _world_rotation_to_pose_basis(
+            pb, override[pb.name].to_quaternion())
+        mode = pb.rotation_mode
+        if mode == 'QUATERNION':
+            pb.rotation_quaternion = q
+        elif mode == 'AXIS_ANGLE':
+            axis, angle = q.to_axis_angle()
+            pb.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+        else:
+            pb.rotation_euler = q.to_euler(mode)
+        bpy.context.view_layer.update()
+        posed += 1
+    return posed, None
+
+
 class BLENDCAP_OT_preview_rest_pose_preset(bpy.types.Operator):
     bl_idname = "blendcap.preview_rest_pose_preset"
     bl_label = "Preview Selected Pose"
@@ -547,6 +857,17 @@ class BLENDCAP_OT_preview_rest_pose_preset(bpy.types.Operator):
         if not preset_path or preset_path.startswith('__') \
                 or not os.path.isfile(preset_path):
             self.report({'ERROR'}, "No preset selected")
+            return {'CANCELLED'}
+
+        # Judge the preset before anything on the rig is touched: the
+        # preview below starts by clearing the rig's whole pose.
+        try:
+            load_rest_pose_preset_to_override(preset_path, src)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to load preset: {e}")
+            return {'CANCELLED'}
+        if (LAST_LOAD_STATS or {}).get('wrong_skeleton'):
+            self.report({'ERROR'}, WRONG_SKELETON_PREVIEW)
             return {'CANCELLED'}
 
         ts = scene.tool_settings
@@ -624,14 +945,21 @@ class BLENDCAP_OT_preview_rest_pose_preset(bpy.types.Operator):
         finally:
             ts.use_keyframe_insert_auto = prev_auto_key
 
+        stats = LAST_LOAD_STATS or {}
+        total = stats.get('total', 0)
         if applied == 0:
             self.report({'WARNING'},
-                        "Preset has no bones matching the source rig. "
-                        "Nothing to preview.")
+                        f"0 of {total} bones in this preset match the "
+                        f"source rig. Nothing to preview.")
             return {'CANCELLED'}
 
+        # Say so when only part of the preset landed, or when it was
+        # matched under another namespace; a full same-name match keeps
+        # the short message.
+        note = match_summary(stats)
         self.report({'INFO'},
                     f"Previewing {applied} bones from "
-                    f"{os.path.basename(preset_path)} — scrub the "
-                    f"timeline to dismiss.")
+                    f"{os.path.basename(preset_path)}"
+                    + (f" ({note})" if note else "")
+                    + " - scrub the timeline to dismiss.")
         return {'FINISHED'}

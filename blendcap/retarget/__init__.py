@@ -83,6 +83,7 @@ from .preset_io import (
     _sanitize_preset_filename,
     _retarget_maps_dir_shipped,
     _retarget_maps_dir_user,
+    _retarget_maps_dir_legacy_config,
     _list_presets_in,
     _load_retarget_map,
     _save_retarget_map,
@@ -96,6 +97,7 @@ from .name_matching import (
     _smart_strip,
     _normalize_bone_name,
     _auto_match_pairs,
+    _auto_match_pairs_spatial,
 )
 
 from .bone_ordering import _ordered_bones_for_add_all
@@ -134,27 +136,56 @@ from .bake_ik import (
 # (GC'ing them corrupts dropdown labels). Keep a module-level cache.
 
 _COMBINED_PRESET_ITEMS_CACHE = []
-
-
+_COMBINED_PRESET_SIG = {'sig': None}
 def get_combined_preset_items(self, context):
-    # Read presets from both folders, categorize each by FILENAME (not
-    # by folder) against SHIPPED_PRESET_FILENAMES. Custom maps now save
-    # alongside the shipped ones in the addon's retarget_maps/ folder,
-    # but the user dir is still read so legacy custom maps saved there
-    # before the change continue to show up.
+    # Read presets from every location, categorize each by FILENAME
+    # (not by folder) against SHIPPED_PRESET_FILENAMES. Custom maps
+    # save into the extension user folder now; the addon's own
+    # retarget_maps/ (pre-1.0.6 save home, migrated out of at
+    # register) and the old CONFIG dir are still read so nothing
+    # already saved disappears. Dedupe by filename with the new home
+    # winning, so a leftover migration couldn't move doesn't list
+    # twice.
+    #
+    # This callback runs on every redraw of the retarget panel and the
+    # build below opens and parses every preset JSON for its display
+    # name - so it only runs when the folders actually changed
+    # (helpers.dir_tree_signature: one listing per folder, no opens).
+    from ..helpers import preset_read_dirs, dir_tree_signature
+    # ORDER MATTERS for the filename dedupe below: the save home comes
+    # first so a custom preset just saved there wins over a same-named
+    # file left in the addon's retarget_maps/ (a hand-copied or
+    # un-migrated custom). Standard presets are only ever taken from
+    # the shipped folder, whatever its position. Scanning the shipped
+    # folder first hid the freshly saved file and the dropdown refused
+    # its path (traceback reported 2026-09-21).
+    sources = (
+        *((d, "Custom") for d in preset_read_dirs("retarget_maps")),
+        (_retarget_maps_dir_legacy_config(), "Custom"),
+        (_retarget_maps_dir_shipped(), "Standard"))
+    sig = dir_tree_signature([d for d, _k in sources], '.json')
+    if sig == _COMBINED_PRESET_SIG['sig'] and _COMBINED_PRESET_ITEMS_CACHE:
+        return _COMBINED_PRESET_ITEMS_CACHE
+    _COMBINED_PRESET_SIG['sig'] = sig
+
     standard = []
     custom = []
-    seen_paths = set()
-    for directory, kind in ((_retarget_maps_dir_shipped(), "Standard"),
-                            (_retarget_maps_dir_user(), "Custom")):
+    seen_names = set()
+    for directory, kind in sources:
         for path, name, tip in _list_presets_in(directory, kind):
-            if path in seen_paths:
+            base = os.path.basename(path)
+            if base in SHIPPED_PRESET_FILENAMES:
+                # Shipped names list once, from the shipped folder.
+                if kind == "Standard":
+                    standard.append((path, name, tip))
                 continue
-            seen_paths.add(path)
-            if os.path.basename(path) in SHIPPED_PRESET_FILENAMES:
-                standard.append((path, name, tip))
-            else:
-                custom.append((path, name, tip))
+            # Anything else is a custom, wherever it sits (a custom
+            # left inside the addon folder stays listed until the
+            # startup window or the prefs Move button moves it).
+            if base in seen_names:
+                continue
+            seen_names.add(base)
+            custom.append((path, name, tip))
     standard.sort(key=lambda t: t[1].lower())
     custom.sort(key=lambda t: t[1].lower())
 
@@ -758,5 +789,24 @@ def _populate_pairs_from_map(scene, map_dict):
         # VISIBLY when you assign a target rig with no preset loaded
         # (registration._on_target_rig_change), so this only removes the
         # silent override of a chosen preset.
+
+        # Advanced > Mute Limits and Drivers / Include Unmapped Bones.
+        # They are not panel values but what is muted on the TARGET RIG,
+        # so they are set on that rig, here at the end, when the pair
+        # table (which says which bones the mute is for) is in place.
+        # With no target rig yet nothing happens: picking one re-fires
+        # this load (registration._on_target_rig_change).
+        # A preset WITHOUT the key leaves the rig alone: every bundled
+        # preset and every preset saved before 1.1.0, which therefore
+        # behave exactly as they did (the user, 2026-11-27: "if a preset
+        # is saved with no value, then just leave the box alone").
+        mc = map_dict.get("mute_conflicts")
+        if isinstance(mc, dict) and tgt_rig is not None:
+            try:
+                from .. import rig_conflicts
+                rig_conflicts.apply_preset_state(tgt_rig, scene, mc)
+            except Exception as exc:
+                print(f"[BlendCap] Preset's Mute Limits and Drivers state "
+                      f"not applied: {exc}")
     finally:
         _LOADING_PRESET = False
